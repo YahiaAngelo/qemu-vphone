@@ -1119,6 +1119,8 @@ static void adp_v4_update_disp_bh(void *opaque)
                            adp->console, PIXMAN_OP_SRC);
         }
     }
+    qemu_log_mask(LOG_UNIMP, "adp: frame at %" PRId64 " us\n",
+                  g_get_monotonic_time());
     qatomic_inc(&adp->stat_frames);
 
     qatomic_or(&adp->int_status, R_CONTROL_INT_FRAME_PROCESSED_MASK);

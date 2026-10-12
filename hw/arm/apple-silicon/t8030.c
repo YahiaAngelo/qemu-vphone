@@ -2410,6 +2410,19 @@ static bool t8030_agxemu_write(void *opaque, uint64_t addr, const void *buf,
                                MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
 }
 
+// Guest RAM is one host mapping: hand out pointers into it so that textures
+// are sampled in place.
+static const uint8_t *t8030_agxemu_map(void *opaque, uint64_t addr, size_t len)
+{
+    MachineState *machine = opaque;
+
+    if (addr < DRAM_BASE || addr - DRAM_BASE + len > machine->ram_size) {
+        return NULL;
+    }
+    return (const uint8_t *)memory_region_get_ram_ptr(machine->ram) +
+           (addr - DRAM_BASE);
+}
+
 static void t8030_agxemu_log(void *opaque, const char *line)
 {
     qemu_log_mask(LOG_UNIMP, "agxemu: %s\n", line);
@@ -2434,6 +2447,8 @@ static AgxEmu *t8030_agxemu(T8030GfxRegFile *rf)
         AgxEmuHost host = {
             .read_phys = t8030_agxemu_read,
             .write_phys = t8030_agxemu_write,
+            .opaque = MACHINE(t8030),
+            .map_phys = t8030_agxemu_map,
             .log = t8030_agxemu_log,
             .thread_start = t8030_agxemu_thread_start,
             .thread_stop = t8030_agxemu_thread_stop,
@@ -2624,6 +2639,7 @@ static void t8030_sgx_job(T8030GfxRegFile *rf, bool fragment, uint32_t events,
                           hwaddr slot_reg)
 {
     AppleT8030MachineState *t8030 = rf->t8030;
+    int64_t t0 = g_get_monotonic_time();
 
     t8030_sgx_capture_kick(rf, fragment);
 #ifdef CONFIG_AGXEMU
@@ -2646,6 +2662,10 @@ static void t8030_sgx_job(T8030GfxRegFile *rf, bool fragment, uint32_t events,
         }
     }
 #endif
+    qemu_log_mask(LOG_UNIMP,
+                  "sgx: %s job at %" PRId64 " us, took %.1f ms\n",
+                  fragment ? "3D" : "TA", t0,
+                  (g_get_monotonic_time() - t0) / 1000.0);
     t8030_sgx_raise_events(rf, events, slot_reg);
 }
 

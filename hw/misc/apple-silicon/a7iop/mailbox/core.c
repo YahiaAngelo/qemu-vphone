@@ -252,6 +252,11 @@ static void apple_a7iop_mailbox_send(AppleA7IOPMailbox *s,
 
     QEMU_LOCK_GUARD(&s->lock);
 
+    if (qemu_loglevel_mask(LOG_UNIMP) && !strncmp(s->role, "GFX", 3)) {
+        qemu_log("gfx-mbox: send %s %016" PRIx64 " at %" PRId64 " us\n",
+                 s->role, (uint64_t)ldq_le_p(msg->data),
+                 g_get_monotonic_time());
+    }
     trace_apple_a7iop_mailbox_send(s->role, ldq_le_p(msg->data),
                                    ldq_le_p(msg->data + sizeof(uint64_t)));
 
@@ -316,6 +321,11 @@ static AppleA7IOPMessage *apple_a7iop_mailbox_recv(AppleA7IOPMailbox *s)
 
     QTAILQ_REMOVE(&s->inbox, msg, next);
     stl_le_p(msg->data + 0xC, CTRL_COUNT(s->count));
+    if (qemu_loglevel_mask(LOG_UNIMP) && !strncmp(s->role, "GFX", 3)) {
+        qemu_log("gfx-mbox: recv %s %016" PRIx64 " at %" PRId64 " us\n",
+                 s->role, (uint64_t)ldq_le_p(msg->data),
+                 g_get_monotonic_time());
+    }
     trace_apple_a7iop_mailbox_recv(s->role, ldq_le_p(msg->data),
                                    ldq_le_p(msg->data + sizeof(uint64_t)));
     s->count--;
