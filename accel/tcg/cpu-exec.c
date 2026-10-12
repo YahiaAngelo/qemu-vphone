@@ -229,7 +229,18 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
-        goto hit;
+        if (likely(jc->array[hash].gen == jc->gen)) {
+            goto hit;
+        }
+        /*
+         * From before a TLB flush: still right if the pc maps to the code
+         * the TB was made from. (A TB over two pages goes the long way.)
+         */
+        if (tb_page_addr1(tb) == -1 &&
+            tb_page_addr0(tb) == get_page_addr_code(cpu_env(cpu), s.pc)) {
+            jc->array[hash].gen = jc->gen;
+            goto hit;
+        }
     }
 
     tb = tb_htable_lookup(cpu, s);
@@ -238,6 +249,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     }
 
     jc->array[hash].pc = s.pc;
+    jc->array[hash].gen = jc->gen;
     qatomic_set(&jc->array[hash].tb, tb);
 
 hit:
@@ -933,6 +945,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
                 jc->array[h].pc = s.pc;
+                jc->array[h].gen = jc->gen;
                 qatomic_set(&jc->array[h].tb, tb);
             }
 

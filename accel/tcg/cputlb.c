@@ -386,7 +386,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    tcg_stale_jmp_cache(cpu);
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -732,11 +732,11 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
     /*
-     * If the length is larger than the jump cache size, then it will take
-     * longer to clear each entry individually than it will to clear it all.
+     * For more than a few pages it takes longer to clear each page's
+     * entries than to put the whole cache in doubt.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
-        tcg_flush_jmp_cache(cpu);
+    if (d.len >= (TARGET_PAGE_SIZE * 2 * TB_JMP_PAGE_SIZE)) {
+        tcg_stale_jmp_cache(cpu);
         return;
     }
 

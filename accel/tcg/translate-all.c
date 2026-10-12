@@ -620,3 +620,22 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         qatomic_set(&jc->array[i].tb, NULL);
     }
 }
+
+/*
+ * After a TLB flush on @cpu, by @cpu itself: the entries of its jump cache
+ * may no longer be right for their pc, but most still are. Start a new
+ * generation instead of emptying the cache; tb_lookup() checks an older
+ * entry against the current mappings before it uses it again.
+ */
+void tcg_stale_jmp_cache(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+    if (unlikely(++jc->gen == 0)) {
+        /* wrapped: an entry could pass for current again */
+        tcg_flush_jmp_cache(cpu);
+    }
+}
