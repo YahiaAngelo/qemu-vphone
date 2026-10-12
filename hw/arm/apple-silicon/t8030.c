@@ -2682,10 +2682,12 @@ static uint64_t t8030_sgx_regs_read(void *opaque, hwaddr addr, unsigned size)
         // (Not reached while jobs complete inside their kick.)
         v = ++rf->t8030->gfx_progress_count;
     }
-    qemu_log_mask(LOG_UNIMP,
-                  "sgx.regs[%u]: read  (size %u, offset 0x%06" HWADDR_PRIx
-                  ") = 0x%" PRIx64 "\n",
-                  rf->idx, size, addr, v);
+    if (rf->t8030->gfx_log_regs) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgx.regs[%u]: read  (size %u, offset 0x%06" HWADDR_PRIx
+                      ") = 0x%" PRIx64 "\n",
+                      rf->idx, size, addr, v);
+    }
     return v;
 }
 
@@ -2695,10 +2697,12 @@ static void t8030_sgx_regs_write(void *opaque, hwaddr addr, uint64_t data,
     T8030GfxRegFile *rf = opaque;
     uint8_t *p = (uint8_t *)rf->t8030->gfx_reg_data[rf->idx] + addr;
 
-    qemu_log_mask(LOG_UNIMP,
-                  "sgx.regs[%u]: write (size %u, offset 0x%06" HWADDR_PRIx
-                  ") = 0x%" PRIx64 "\n",
-                  rf->idx, size, addr, data);
+    if (rf->t8030->gfx_log_regs) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgx.regs[%u]: write (size %u, offset 0x%06" HWADDR_PRIx
+                      ") = 0x%" PRIx64 "\n",
+                      rf->idx, size, addr, data);
+    }
     if (rf->base + addr == SGX_PWR_STATE) {
         data &= ~(uint64_t)SGX_PWR_STATE_BUSY;
     } else if (rf->base + addr == SGX_CTX_CMD ||
@@ -3878,6 +3882,7 @@ PROP_STR_GETTER_SETTER(gfx_capture_dir);
 PROP_GETTER_SETTER(bool, gfx_null_render);
 PROP_GETTER_SETTER(bool, gfx_render);
 PROP_GETTER_SETTER(bool, gfx_render_sync);
+PROP_GETTER_SETTER(bool, gfx_log_regs);
 PROP_VISIT_GETTER_SETTER(uint32, gfx_capture_max);
 PROP_VISIT_GETTER_SETTER(uint32, gfx_capture_skip);
 PROP_VISIT_GETTER_SETTER(uint32, gfx_capture_burst);
@@ -4080,6 +4085,13 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
         klass, "gfx-render-sync",
         "Debug: keep the global lock while a job is drawn, stalling the "
         "whole guest meanwhile");
+    object_class_property_add_bool(klass, "gfx-log-regs",
+                                   t8030_get_gfx_log_regs,
+                                   t8030_set_gfx_log_regs);
+    object_class_property_set_description(
+        klass, "gfx-log-regs",
+        "Debug: log every access to the GPU's registers (with -d unimp); "
+        "over a thousand lines a frame");
     object_class_property_add_bool(klass, "gfx-null-render",
                                    t8030_get_gfx_null_render,
                                    t8030_set_gfx_null_render);

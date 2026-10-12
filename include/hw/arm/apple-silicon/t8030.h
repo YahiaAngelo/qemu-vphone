@@ -84,6 +84,7 @@ typedef struct {
     DeviceState *touch;
     bool gfx_render;
     bool gfx_render_sync;
+    bool gfx_log_regs;
     uint64_t gfx_progress_count;
     char *gfx_capture_dir;
     uint32_t gfx_capture_count;
