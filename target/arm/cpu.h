@@ -637,6 +637,8 @@ typedef struct CPUArchState {
         uint64_t sprr_config_el[4];
         uint64_t mprr_el_br_el1[4][2];
         uint64_t mprr_s3_6_c15_c3_5;
+        /* S3_6_C15_C3_0 when sprr_cfg.unified_perms is set */
+        uint64_t c3_0;
     } sprr;
 
     struct {
@@ -817,6 +819,18 @@ typedef struct CPUArchState {
 
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
+
+    /*
+     * Newer SPRR layout (M1/A14 and later, the vresearch101 CPU): one
+     * permission table per EL, S3_6_C15_C1_5 for EL0 and S3_6_C15_C1_6 for
+     * EL1, both translation ranges alike; S3_6_C15_C3_0 is then a separate
+     * register. el1_perm_reset is the EL1 table at reset. Configuration, so
+     * kept across resets.
+     */
+    struct {
+        bool unified_perms;
+        uint64_t el1_perm_reset;
+    } sprr_cfg;
 
     /* Fields after this point are preserved across CPU reset. */
 

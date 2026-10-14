@@ -489,14 +489,26 @@ static inline int arm_current_el(CPUARMState *env)
 /* Return true if the processor is in GXF state */
 static inline bool arm_is_guarded(CPUARMState *env)
 {
-    return arm_feature(env, ARM_FEATURE_GXF) && (arm_current_el(env) > 0) &&
-           (env->gxf.gxf_status_el[arm_current_el(env)] & 1);
+    int el = arm_current_el(env);
+
+    /* EL0 is guarded (GL0, where TXM runs) only in the M1-style layout */
+    if (el == 0 && !env->sprr_cfg.unified_perms) {
+        return false;
+    }
+    return arm_feature(env, ARM_FEATURE_GXF) &&
+           (env->gxf.gxf_status_el[el] & 1);
 }
 
 /* Return true if the processor has SPRR enabled */
 static inline bool arm_is_sprr_enabled(CPUARMState *env)
 {
-    return env->sprr.sprr_config_el[arm_current_el(env)] & 1;
+    int el = arm_current_el(env);
+
+    /* In the M1-style layout SPRR_CONFIG_EL1 governs EL0 as well */
+    if (el == 0 && env->sprr_cfg.unified_perms) {
+        el = 1;
+    }
+    return env->sprr.sprr_config_el[el] & 1;
 }
 
 static inline bool arm_cpu_data_is_big_endian_a32(CPUARMState *env,

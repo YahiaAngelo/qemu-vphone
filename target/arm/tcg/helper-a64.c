@@ -33,6 +33,7 @@
 #include "accel/tcg/probe.h"
 #include "exec/target_page.h"
 #include "exec/tlb-flags.h"
+#include "exec/cputlb.h"
 #include "qemu/int128.h"
 #include "qemu/atomic128.h"
 #include "fpu/softfloat.h"
@@ -639,8 +640,9 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     uint32_t spsr;
     int new_el;
     bool return_to_aa64;
+    bool from_guarded = arm_is_guarded(env);
 
-    if (arm_is_guarded(env)) {
+    if (from_guarded) {
         spsr = env->gxf.spsr_gl[cur_el];
     } else {
         spsr = env->banked_spsr[spsr_idx];
@@ -732,6 +734,17 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
         pstate_write(env, spsr);
         if (!arm_singlestep_active(env)) {
             env->pstate &= ~PSTATE_SS;
+        }
+        /*
+         * M1-style GXF: an eret from a guarded level to EL0 enters GL0
+         * (TXM); any other eret to EL0 leaves it. EL0 has one MMU index for
+         * both, so flush it when that changes.
+         */
+        if (env->sprr_cfg.unified_perms && new_el == 0 &&
+            (env->gxf.gxf_status_el[0] & 1) != from_guarded) {
+            env->gxf.gxf_status_el[0] =
+                (env->gxf.gxf_status_el[0] & ~1ULL) | from_guarded;
+            tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
         }
         aarch64_restore_sp(env, new_el);
         helper_rebuild_hflags_a64(env, new_el);

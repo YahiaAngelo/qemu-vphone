@@ -26,6 +26,16 @@
 
 void apple_a13_init_gxf(AppleA13State *cpu);
 
+/*
+ * The GXF and SPRR system registers for any ARMCPU with ARM_FEATURE_GXF:
+ * apple_gxf_define_cpregs() before realize, apple_gxf_define_override_cpregs()
+ * (the GL-banked versions of standard EL1 registers) after it.
+ */
+void apple_gxf_define_cpregs(ARMCPU *cpu);
+void apple_gxf_define_override_cpregs(ARMCPU *cpu);
+/* The GL1-banked registers at the M1 encodings (S3_6_C15_C10_n) as well */
+void apple_gxf_define_m1_gl_cpregs(ARMCPU *cpu);
+
 void apple_a13_init_gxf_override(AppleA13State *cpu);
 
 #endif

@@ -171,8 +171,62 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
     // Visual also accidentally found it on his own "TPRO regions should not be writable on entry to dyld"
 
     raw_write(env, ri, perm);
+    if (env->sprr_cfg.unified_perms) {
+        env->sprr.sprr_el_br_el1[0][1] = perm;
+    }
 
     tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+}
+
+/* S3_6_C15_C1_6: EL0/BR1 table, or the EL1 table in the unified layout */
+static uint64_t sprr_c1_6_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return env->sprr_cfg.unified_perms ? env->sprr.sprr_el_br_el1[1][0]
+                                   : env->sprr.sprr_el_br_el1[0][1];
+}
+
+static void sprr_c1_6_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                            uint64_t value)
+{
+    if (env->sprr_cfg.unified_perms) {
+        env->sprr.sprr_el_br_el1[1][0] = value;
+        env->sprr.sprr_el_br_el1[1][1] = value;
+    } else {
+        env->sprr.sprr_el_br_el1[0][1] = value;
+    }
+    tlb_flush(env_cpu(env));
+}
+
+static void sprr_c1_6_reset(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    env->sprr.sprr_el_br_el1[0][1] = 0;
+    env->sprr.sprr_el_br_el1[1][0] =
+        env->sprr_cfg.unified_perms ? env->sprr_cfg.el1_perm_reset : 0;
+    env->sprr.sprr_el_br_el1[1][1] = env->sprr.sprr_el_br_el1[1][0];
+}
+
+/* S3_6_C15_C3_0: EL1/BR1 table, or a register of its own when unified */
+static uint64_t sprr_c3_0_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return env->sprr_cfg.unified_perms ? env->sprr.c3_0
+                                   : env->sprr.sprr_el_br_el1[1][1];
+}
+
+static void sprr_c3_0_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                            uint64_t value)
+{
+    if (env->sprr_cfg.unified_perms) {
+        env->sprr.c3_0 = value;
+    } else {
+        env->sprr.sprr_el_br_el1[1][1] = value;
+        tlb_flush(env_cpu(env));
+    }
+}
+
+static void sprr_c3_0_reset(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    /* the EL1 table itself is reset with S3_6_C15_C1_6 */
+    env->sprr.c3_0 = 0;
 }
 
 static uint64_t gxf_cpreg_raw_read(CPUARMState *env, const ARMCPRegInfo *ri)
@@ -540,8 +594,10 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 1,
         .opc2 = 6,
         .access = PL1_RW | PL0_R,
-        .resetvalue = 0,
-        .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[0][1]),
+        .type = ARM_CP_NO_RAW,
+        .readfn = sprr_c1_6_read,
+        .writefn = sprr_c1_6_write,
+        .resetfn = sprr_c1_6_reset,
     },
     {
         .name = "SPRR_EL1BR0_EL1",
@@ -566,10 +622,10 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 3,
         .opc2 = 0,
         .access = PL1_RW,
-        .resetvalue = 0,
-        .readfn = raw_read,
-        .writefn = raw_write,
-        .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[1][1]),
+        .type = ARM_CP_NO_RAW,
+        .readfn = sprr_c3_0_read,
+        .writefn = sprr_c3_0_write,
+        .resetfn = sprr_c3_0_reset,
     },
     {
         .name = "MPRR_EL0BR0_EL1",
@@ -644,16 +700,70 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
     },
 };
 
+void apple_gxf_define_override_cpregs(ARMCPU *cpu)
+{
+    if (arm_feature(&cpu->env, ARM_FEATURE_GXF)) {
+        define_arm_cp_regs(cpu, apple_a13_gxf_cp_override_reginfo);
+    }
+}
+
+/*
+ * The GL1-banked registers at their M1-and-later encodings,
+ * S3_6_C15_C10_<n> (SP, TPIDR, VBAR, SPSR, ASPSR, ESR, ELR, FAR for n = 0..7,
+ * as in Asahi Linux's m1n1), sharing the A13 definitions' state and banking.
+ */
+void apple_gxf_define_m1_gl_cpregs(ARMCPU *cpu)
+{
+    if (!arm_feature(&cpu->env, ARM_FEATURE_GXF)) {
+        return;
+    }
+    for (int i = 0; i < ARRAY_SIZE(apple_a13_gxf_cp_reginfo); i++) {
+        const ARMCPRegInfo *a13 = &apple_a13_gxf_cp_reginfo[i];
+        ARMCPRegInfo m1 = *a13;
+
+        if (a13->opc1 == 6 && a13->crn == 15 && a13->crm == 9) {
+            m1.crm = 10;
+        } else if (a13->opc1 == 6 && a13->crn == 15 && a13->crm == 8 &&
+                   a13->opc2 == 3) {
+            m1.crm = 10;
+            m1.opc2 = 4;
+        } else {
+            continue;
+        }
+        /*
+         * The A13 entries bank between the GL and EL1 copies by security
+         * state, which on a CPU without EL3 always selects the EL1 copy.
+         * These encodings name the GL1 register outright.
+         */
+        if (m1.bank_fieldoffsets[0]) {
+            m1.fieldoffset = m1.bank_fieldoffsets[0];
+            m1.bank_fieldoffsets[0] = 0;
+            m1.bank_fieldoffsets[1] = 0;
+            m1.raw_readfn = NULL;
+            m1.raw_writefn = NULL;
+            m1.readfn = NULL;
+            m1.writefn = NULL;
+        }
+        /* SP_GL1 included: a GL1 handler saves it from EL1 */
+        m1.access = PL1_RW;
+        m1.name = g_strdup_printf("%s_M1", a13->name);
+        define_one_arm_cp_reg(cpu, &m1);
+    }
+}
+
+void apple_gxf_define_cpregs(ARMCPU *cpu)
+{
+    if (arm_feature(&cpu->env, ARM_FEATURE_GXF)) {
+        define_arm_cp_regs(cpu, apple_a13_gxf_cp_reginfo);
+    }
+}
+
 void apple_a13_init_gxf_override(AppleA13State *cpu)
 {
-    if (arm_feature(&cpu->parent_obj.env, ARM_FEATURE_GXF)) {
-        define_arm_cp_regs(&cpu->parent_obj, apple_a13_gxf_cp_override_reginfo);
-    }
+    apple_gxf_define_override_cpregs(&cpu->parent_obj);
 }
 
 void apple_a13_init_gxf(AppleA13State *cpu)
 {
-    if (arm_feature(&cpu->parent_obj.env, ARM_FEATURE_GXF)) {
-        define_arm_cp_regs(&cpu->parent_obj, apple_a13_gxf_cp_reginfo);
-    }
+    apple_gxf_define_cpregs(&cpu->parent_obj);
 }

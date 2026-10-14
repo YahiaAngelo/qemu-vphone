@@ -1473,7 +1473,13 @@ static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
          * We make the IMPDEF choices that SCR_EL3.SIF and Realm EL2&0
          * do not affect EPAN.
          */
-        if (user_rw && regime_is_pan(env, mmu_idx)) {
+        if (env->sprr_cfg.unified_perms && arm_is_sprr_enabled(env)) {
+            /*
+             * M1-style SPRR: the AP/XN bits index the permission tables;
+             * what EL0 may do with a page is not known from them, so the
+             * PAN/EPAN rules derived from them do not apply.
+             */
+        } else if (user_rw && regime_is_pan(env, mmu_idx)) {
             prot_rw = 0;
         } else if (cpu_isar_feature(aa64_pan3, cpu) && is_aa64 &&
                    regime_is_pan(env, mmu_idx) &&
@@ -1537,8 +1543,18 @@ static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
     }
 
     if (is_aa64) {
+        /*
+         * M1-style SPRR: the AP bits are an index into the permission table,
+         * not permissions, so "EL0 can write it" is not known from them and
+         * the implicit "user-writable is privileged-execute-never" rule does
+         * not apply.
+         */
         if (regime_has_2_ranges(mmu_idx) && !is_user) {
-            xn = pxn || (user_rw & PAGE_WRITE);
+            if (env->sprr_cfg.unified_perms && arm_is_sprr_enabled(env)) {
+                xn = pxn;
+            } else {
+                xn = pxn || (user_rw & PAGE_WRITE);
+            }
         }
     } else if (arm_feature(env, ARM_FEATURE_V7)) {
         switch (regime_el(env, mmu_idx)) {
