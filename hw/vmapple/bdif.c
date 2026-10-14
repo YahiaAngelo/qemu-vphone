@@ -189,7 +189,18 @@ static void vblk_cmd(uint64_t devid, BlockBackend *blk, uint64_t gp_addr,
         }
         break;
     case VBLK_DATA_FLAGS_WRITE:
-        /* Not needed, iBoot only reads */
+        /* iBoot saves NVRAM through the aux device */
+        dma_result = dma_memory_read(&address_space_memory, req.data.addr, buf,
+                                     req.data.len, MEMTXATTRS_UNSPECIFIED);
+        if (dma_result != MEMTX_OK) {
+            goto out;
+        }
+        r = blk_pwrite(blk, off, req.data.len, buf, 0);
+        trace_bdif_vblk_write(devid == DEVID_AUX ? "aux" : "root",
+                              req.data.addr, off, req.data.len, r);
+        if (r >= 0) {
+            ret = VBLK_RET_SUCCESS;
+        }
         break;
     default:
         break;
@@ -245,6 +256,21 @@ static void bdif_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 }
 
+static void bdif_realize(DeviceState *dev, Error **errp)
+{
+    VMAppleBdifState *s = VMAPPLE_BDIF(dev);
+    BlockBackend *blks[] = { s->aux, s->root };
+
+    /* iBoot saves NVRAM to the aux device, so both can be written */
+    for (int i = 0; i < ARRAY_SIZE(blks); i++) {
+        if (blks[i] && blk_supports_write_perm(blks[i]) &&
+            blk_set_perm(blks[i], BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                         BLK_PERM_ALL, errp) < 0) {
+            return;
+        }
+    }
+}
+
 static const Property bdif_properties[] = {
     DEFINE_PROP_DRIVE("aux", VMAppleBdifState, aux),
     DEFINE_PROP_DRIVE("root", VMAppleBdifState, root),
@@ -255,6 +281,7 @@ static void bdif_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->desc = "VMApple Backdoor Interface";
+    dc->realize = bdif_realize;
     device_class_set_props(dc, bdif_properties);
 }
 

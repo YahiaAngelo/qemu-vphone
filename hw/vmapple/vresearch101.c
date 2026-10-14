@@ -74,6 +74,7 @@ struct VResearchMachineState {
     uint64_t ecid;
     char *gfx_device;
     char *sep_rom;
+    char *serial;
 
     /* SEP coprocessor: its own core and address space */
     ARMCPU *sep_cpu;
@@ -191,6 +192,15 @@ static void create_bdif(VResearchMachineState *vms)
     qdev_prop_set_drive(DEVICE(bdif), "root", blk_by_legacy_dinfo(di_root));
 
     sysbus_realize_and_unref(bdif_sb, &error_fatal);
+
+    /*
+     * The backdoor interface's USB slot (device 0x10 at 0x30100000) is the
+     * virtual USB device controller AVPBooter's DFU mode uses.
+     */
+    sysbus_create_simple(TYPE_VMAPPLE_VUSB, -1, NULL);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(object_resolve_type_unambiguous(
+                                TYPE_VMAPPLE_VUSB, &error_fatal)),
+                            0, vms->memmap[VR_BDOOR].base + 0x100000, 1);
 }
 
 static void create_pvpanic(VResearchMachineState *vms)
@@ -220,6 +230,11 @@ static void create_cfg(VResearchMachineState *vms)
     qdev_prop_set_uint64(vms->cfg, "ecid", vms->ecid);
     qdev_prop_set_uint64(vms->cfg, "ram-size", machine->ram_size);
     qdev_prop_set_uint32(vms->cfg, "rnd", rnd);
+    /* BDID 0x90 (vresearch101ap), as the DFU identity and iBoot report it */
+    qdev_prop_set_uint32(vms->cfg, "board-id", 0x90);
+    if (vms->serial) {
+        qdev_prop_set_string(vms->cfg, "serial", vms->serial);
+    }
 
     sysbus_realize_and_unref(cfg, &error_fatal);
 }
@@ -268,6 +283,45 @@ static void create_aes(VResearchMachineState *vms)
 
 
 
+
+/*
+ * avp-rtc ("avp,rtc"): register layout not known yet. Storage that logs each
+ * access with the CPU and PC, to learn who uses it and how.
+ */
+#define AVP_RTC_SIZE 0x1000
+
+static uint8_t avp_rtc_regs[AVP_RTC_SIZE];
+
+static uint64_t avp_rtc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t val = ldn_le_p(&avp_rtc_regs[addr], size);
+    CPUState *cs = current_cpu;
+
+    qemu_log_mask(LOG_UNIMP, "avp-rtc: read%u 0x%03" HWADDR_PRIx " -> 0x%"
+                  PRIx64 " cpu%d pc 0x%" PRIx64 "\n", size, addr, val,
+                  cs ? cs->cpu_index : -1, cs ? cpu_env(cs)->pc : 0);
+    return val;
+}
+
+static void avp_rtc_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    CPUState *cs = current_cpu;
+
+    qemu_log_mask(LOG_UNIMP, "avp-rtc: write%u 0x%03" HWADDR_PRIx " <- 0x%"
+                  PRIx64 " cpu%d pc 0x%" PRIx64 "\n", size, addr, val,
+                  cs ? cs->cpu_index : -1, cs ? cpu_env(cs)->pc : 0);
+    stn_le_p(&avp_rtc_regs[addr], size, val);
+}
+
+static const MemoryRegionOps avp_rtc_ops = {
+    .read = avp_rtc_read,
+    .write = avp_rtc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 8,
+};
+
 /*
  * Devices vresearch101 has and vmapple does not. Their register interfaces
  * are not known yet; map them as logged holes (-d unimp) so the guest's
@@ -275,8 +329,12 @@ static void create_aes(VResearchMachineState *vms)
  */
 static void create_avp_stubs(VResearchMachineState *vms)
 {
-    create_unimplemented_device("avp-rtc", vms->memmap[VR_AVP_RTC].base,
-                                vms->memmap[VR_AVP_RTC].size);
+    MemoryRegion *rtc = g_new0(MemoryRegion, 1);
+
+    memory_region_init_io(rtc, NULL, &avp_rtc_ops, NULL, "avp-rtc",
+                          vms->memmap[VR_AVP_RTC].size);
+    memory_region_add_subregion(get_system_memory(), vms->memmap[VR_AVP_RTC].base,
+                                rtc);
     create_unimplemented_device("avp-ctrr", vms->memmap[VR_AVP_CTRR].base,
                                 vms->memmap[VR_AVP_CTRR].size);
 }
@@ -829,6 +887,19 @@ static void vresearch_set_sep_rom(Object *obj, const char *value, Error **errp)
     vms->sep_rom = g_strdup(value);
 }
 
+static char *vresearch_get_serial(Object *obj, Error **errp)
+{
+    return g_strdup(VRESEARCH_MACHINE(obj)->serial);
+}
+
+static void vresearch_set_serial(Object *obj, const char *value, Error **errp)
+{
+    VResearchMachineState *vms = VRESEARCH_MACHINE(obj);
+
+    g_free(vms->serial);
+    vms->serial = g_strdup(value);
+}
+
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -855,6 +926,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
                                   vresearch_set_gfx_device);
     object_class_property_set_description(oc, "gfx-device",
         "Paravirtual GPU device type (apple-gfx-mmio, or none)");
+    object_class_property_add_str(oc, "serial", vresearch_get_serial,
+                                  vresearch_set_serial);
+    object_class_property_set_description(oc, "serial",
+        "Serial number reported to the guest (the Mac VM's, for a copied VM)");
     object_class_property_add_str(oc, "sep-rom", vresearch_get_sep_rom,
                                   vresearch_set_sep_rom);
     object_class_property_set_description(oc, "sep-rom",

@@ -26,7 +26,7 @@ typedef struct VMAppleCfg {
     uint32_t nr_cpus;         /* 0x004 */
     uint32_t unk1;            /* 0x008 */
     uint32_t unk2;            /* 0x00c */
-    uint32_t unk3;            /* 0x010 */
+    uint32_t board_id;        /* 0x010 */
     uint32_t unk4;            /* 0x014 */
     uint64_t ecid;            /* 0x018 */
     uint64_t ram_size;        /* 0x020 */
@@ -125,7 +125,6 @@ static void vmapple_cfg_realize(DeviceState *dev, Error **errp)
     s->cfg.version = 2;
     s->cfg.unk1 = 1;
     s->cfg.unk2 = 1;
-    s->cfg.unk3 = 0x20;
     s->cfg.unk4 = 0;
     s->cfg.unk5 = 1;
     s->cfg.unk6 = 1;
@@ -159,6 +158,8 @@ static const Property vmapple_cfg_properties[] = {
     DEFINE_PROP_UINT32("run_installer1", VMAppleCfgState, cfg.run_installer1, 0),
     DEFINE_PROP_UINT32("run_installer2", VMAppleCfgState, cfg.run_installer2, 0),
     DEFINE_PROP_UINT32("rnd", VMAppleCfgState, cfg.rnd, 0),
+    /* iBoot's board ID: 0x20 for vmapple, 0x90 for vresearch101 */
+    DEFINE_PROP_UINT32("board-id", VMAppleCfgState, cfg.board_id, 0x20),
     DEFINE_PROP_MACADDR("mac-en0", VMAppleCfgState, cfg.mac_en0),
     DEFINE_PROP_MACADDR("mac-en1", VMAppleCfgState, cfg.mac_en1),
     DEFINE_PROP_MACADDR("mac-wifi0", VMAppleCfgState, cfg.mac_wifi0),
