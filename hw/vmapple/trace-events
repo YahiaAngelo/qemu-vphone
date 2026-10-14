@@ -19,3 +19,6 @@ aes_dump_data(const char *desc, const char *hex) "%s%s"
 bdif_read(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
 bdif_write(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
 bdif_vblk_read(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
+
+# vpiop.c
+vpiop_msg(const char *from, const char *to, uint64_t w0, uint64_t w1) "%s -> %s 0x%016" PRIx64 " 0x%016" PRIx64

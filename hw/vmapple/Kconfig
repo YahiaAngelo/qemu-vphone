@@ -32,3 +32,25 @@ config VMAPPLE
     select VMAPPLE_CFG
     select MAC_PVG_MMIO
     select VMAPPLE_VIRTIO_BLK
+
+config VRESEARCH101
+    bool
+    depends on ARM
+    default y if ARM
+    imply PCI_DEVICES
+    imply MAC_PVG_MMIO
+    select ARM_GICV3
+    select PLATFORM_BUS
+    select PCI_EXPRESS
+    select PCI_EXPRESS_GENERIC_BRIDGE
+    select PL011 # UART
+    select PL031 # RTC
+    select PL061 # GPIO
+    select GPIO_KEY
+    select PVPANIC_MMIO
+    select UNIMP
+    select USB_XHCI_PCI
+    select VMAPPLE_AES
+    select VMAPPLE_BDIF
+    select VMAPPLE_CFG
+    select VMAPPLE_VIRTIO_BLK

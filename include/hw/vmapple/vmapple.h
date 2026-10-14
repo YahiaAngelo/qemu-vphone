@@ -20,4 +20,6 @@
 
 #define TYPE_VMAPPLE_VIRTIO_BLK_PCI "vmapple-virtio-blk-pci"
 
+#define TYPE_VMAPPLE_VPIOP "vresearch-vpiop"
+
 #endif /* HW_VMAPPLE_VMAPPLE_H */
