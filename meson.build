@@ -715,8 +715,6 @@ elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
   host_dsosuf = '.dylib'
-  pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
-                   required: get_option('pvg'))
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
@@ -730,6 +728,14 @@ elif host_os == 'openbsd'
     # Disable OpenBSD W^X if available
     emulator_link_args = cc.get_supported_link_arguments('-Wl,-z,wxneeded')
   endif
+endif
+
+# The paravirtualized GPU device (apple-gfx) runs on libreims_vgpu, a
+# replacement for ParavirtualizedGraphics.framework, found through pkg-config
+# (configure with PKG_CONFIG_PATH=<reims-vgpu>/target/dist-*/lib/pkgconfig).
+if host_os in ['darwin', 'linux']
+  pvg = dependency('reims-vgpu', method: 'pkg-config', static: true,
+                   required: get_option('pvg'))
 endif
 
 ###############################################
@@ -3183,9 +3189,11 @@ foreach target : target_dirs
     target_kconfig += 'CONFIG_' + config_target['TARGET_ARCH'].to_upper() + '=y'
     target_kconfig += 'CONFIG_TARGET_BIG_ENDIAN=' + config_target['TARGET_BIG_ENDIAN']
 
-    # PVG is not cross-architecture.  Use accelerator_targets as a proxy to
-    # figure out which target can support PVG on this host
-    if pvg.found() and target in accelerator_targets.get('CONFIG_HVF', [])
+    # PVG serves the targets this host accelerates, and, since the library
+    # takes the guest's page size per device, arm64 guests under TCG on Linux.
+    if pvg.found() and (target in accelerator_targets.get('CONFIG_HVF', []) or
+                        target in accelerator_targets.get('CONFIG_KVM', []) or
+                        (host_os == 'linux' and target == 'aarch64-softmmu'))
       target_kconfig += 'CONFIG_MAC_PVG=y'
     endif
 
@@ -4487,7 +4495,7 @@ if host_os == 'freebsd'
   summary_info += {'libinotify-kqueue': inotify}
 endif
 if host_os == 'darwin'
-  summary_info += {'ParavirtualizedGraphics support': pvg}
+  summary_info += {'reims-vgpu (PVG) support': pvg}
 endif
 summary_info += {'valgrind':          valgrind}
 summary(summary_info, bool_yn: true, section: 'Dependencies')

@@ -135,7 +135,7 @@ config MAC_PVG_MMIO
     bool
     depends on MAC_PVG && AARCH64
 
+# apple-gfx-pci is not carried in this tree (x86 macOS guests only)
 config MAC_PVG_PCI
     bool
     depends on MAC_PVG && PCI
-    default y if PCI_DEVICES
