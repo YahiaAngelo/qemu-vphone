@@ -27,3 +27,5 @@ vpiop_msg(const char *from, const char *to, uint64_t w0, uint64_t w1) "%s -> %s 
 # vusb.c
 vusb_read(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u -> 0x%" PRIx64
 vusb_write(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u <- 0x%" PRIx64
+vusb_tx(uint32_t len, uint8_t code, uint8_t ep) "to host: %u bytes, code %u ep 0x%02x"
+vusb_rx(uint32_t len, uint32_t plen, uint8_t ep, uint8_t type) "from host: %u bytes, payload %u ep 0x%02x type %u"
