@@ -385,6 +385,43 @@ void process_queued_cpu_work(CPUState *cpu)
     qemu_cond_broadcast(&qemu_work_cond);
 }
 
+/*
+ * vphone-linux: run @cpu's queued work while the item at the head of its queue is not
+ * exclusive, from inside its execution loop (a TLB flush barrier's wait, cputlb.c). Answers
+ * false where an exclusive item waits at the head, which only the loop's exit runs.
+ */
+bool process_queued_cpu_work_nonexclusive(CPUState *cpu)
+{
+    struct qemu_work_item *wi;
+
+    qemu_mutex_lock(&cpu->work_mutex);
+    while (!QSIMPLEQ_EMPTY(&cpu->work_list)) {
+        wi = QSIMPLEQ_FIRST(&cpu->work_list);
+        if (wi->exclusive) {
+            qemu_mutex_unlock(&cpu->work_mutex);
+            return false;
+        }
+        QSIMPLEQ_REMOVE_HEAD(&cpu->work_list, node);
+        qemu_mutex_unlock(&cpu->work_mutex);
+        wi->func(cpu, wi->data);
+        qemu_mutex_lock(&cpu->work_mutex);
+        if (wi->free) {
+            g_free(wi);
+        } else {
+            qatomic_store_release(&wi->done, true);
+        }
+    }
+    qemu_mutex_unlock(&cpu->work_mutex);
+    qemu_cond_broadcast(&qemu_work_cond);
+    return true;
+}
+
+/* vphone-linux: whether a thread waits to start, or is in, an exclusive section. */
+bool cpu_exclusive_pending(void)
+{
+    return qatomic_read(&pending_cpus) != 0;
+}
+
 /* Add a breakpoint.  */
 int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
                           CPUBreakpoint **breakpoint)

@@ -22,6 +22,8 @@ bdif_vblk_read(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, in
 bdif_vblk_write(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
 
 # vpiop.c
+vpiop_reg_read(const char *side, uint64_t addr, uint64_t val) "%s 0x%03" PRIx64 " -> 0x%" PRIx64
+vpiop_reg_write(const char *side, uint64_t addr, uint64_t val) "%s 0x%03" PRIx64 " <- 0x%" PRIx64
 vpiop_msg(const char *from, const char *to, uint64_t w0, uint64_t w1) "%s -> %s 0x%016" PRIx64 " 0x%016" PRIx64
 
 # vusb.c
@@ -29,3 +31,6 @@ vusb_read(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u -
 vusb_write(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u <- 0x%" PRIx64
 vusb_tx(uint32_t len, uint8_t code, uint8_t ep) "to host: %u bytes, code %u ep 0x%02x"
 vusb_rx(uint32_t len, uint32_t plen, uint8_t ep, uint8_t type) "from host: %u bytes, payload %u ep 0x%02x type %u"
+
+# sep-storage.c
+sep_storage_request(uint32_t type, uint64_t sector, int ndesc, uint8_t status) "type %u sector %" PRIu64 " descs %d status %u"

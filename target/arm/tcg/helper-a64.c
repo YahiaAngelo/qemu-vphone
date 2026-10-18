@@ -810,6 +810,61 @@ void HELPER(gexit)(CPUARMState *env)
 {
     int cur_el = arm_current_el(env);
     uint32_t spsr = env->gxf.spsr_gl[cur_el];
+    bool return_to_gl = (env->gxf.aspsr_gl[cur_el] & 1) != 0;
+    static unsigned gxf_exit_text_count;
+    static unsigned gxf_sptm_text_count;
+    static unsigned gxf_exit_callback_count;
+
+    if (env_cpu(env)->cpu_index == 0) {
+        char text[256] = { 0 };
+        unsigned n = __atomic_add_fetch(&gxf_exit_text_count, 1,
+                                        __ATOMIC_RELAXED);
+
+        cpu_memory_rw_debug(env_cpu(env), env->xregs[1], (uint8_t *)text,
+                            sizeof(text) - 1, false);
+        if (n <= 8 ||
+            (env->xregs[0] == 4 &&
+             __atomic_add_fetch(&gxf_exit_callback_count, 1,
+                                __ATOMIC_RELAXED) <= 32) ||
+            (g_str_has_prefix(text, "[SPTM]") &&
+             __atomic_add_fetch(&gxf_sptm_text_count, 1,
+                                __ATOMIC_RELAXED) <= 32)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                      "gxf: exit snapshot n=%u pc=%016" PRIx64
+                      " elr=%016" PRIx64 " x0=%016" PRIx64
+                      " x1=%016" PRIx64 " x2=%016" PRIx64
+                      " x3=%016" PRIx64 " x4=%016" PRIx64
+                      " x5=%016" PRIx64 " x6=%016" PRIx64
+                      " x7=%016" PRIx64 " x19=%016" PRIx64
+                      " x20=%016" PRIx64 " x21=%016" PRIx64
+                      " x22=%016" PRIx64 " x29=%016" PRIx64
+                      " x30=%016" PRIx64 " sp=%016" PRIx64
+                      " spsr=%08x aspsr=%016" PRIx64
+                      " status=%016" PRIx64 " x1text=%.*s\n",
+                      n, env->pc,
+                      env->gxf.elr_gl[cur_el], env->xregs[0], env->xregs[1],
+                      env->xregs[2], env->xregs[3], env->xregs[4],
+                      env->xregs[5], env->xregs[6], env->xregs[7],
+                      env->xregs[19], env->xregs[20], env->xregs[21],
+                      env->xregs[22], env->xregs[29], env->xregs[30],
+                      env->xregs[31], spsr, env->gxf.aspsr_gl[cur_el],
+                      env->gxf.gxf_status_el[cur_el], (int)sizeof(text), text);
+        }
+    }
+
+    qemu_log_mask(CPU_LOG_INT,
+                  "GXF exit cpu%d EL%d pc=%016" PRIx64
+                  " pstate=%x spsr=%x sp=%016" PRIx64
+                  " sp0=%016" PRIx64 " sp1=%016" PRIx64
+                  " gl1=%016" PRIx64 " aspsr=%016" PRIx64
+                  " elr=%016" PRIx64 " x0=%016" PRIx64
+                  " x1=%016" PRIx64 " x2=%016" PRIx64 "\n",
+                  env_cpu(env)->cpu_index, cur_el, env->pc,
+                  pstate_read(env), spsr, env->xregs[31],
+                  env->sp_el[0], env->sp_el[1], env->gxf.sp_gl[1],
+                  env->gxf.aspsr_gl[cur_el],
+                  env->gxf.elr_gl[cur_el], env->xregs[0], env->xregs[1],
+                  env->xregs[2]);
 
     aarch64_save_sp(env, cur_el);
 
@@ -824,10 +879,20 @@ void HELPER(gexit)(CPUARMState *env)
         env->pstate &= ~PSTATE_SS;
     }
 
-    env->gxf.gxf_status_el[cur_el] &= ~1;
+    /* ASPSR_GL[0] selects whether GEXIT returns to GL or the ordinary EL. */
+    env->gxf.gxf_status_el[cur_el] =
+        (env->gxf.gxf_status_el[cur_el] & ~1ULL) | return_to_gl;
     aarch64_restore_sp(env, cur_el);
     env->pc = env->gxf.elr_gl[cur_el];
     helper_rebuild_hflags_a64(env, cur_el);
+    qemu_log_mask(CPU_LOG_INT,
+                  "GXF return cpu%d EL%d pc=%016" PRIx64
+                  " pstate=%x sp=%016" PRIx64
+                  " sp0=%016" PRIx64 " sp1=%016" PRIx64
+                  " gl1=%016" PRIx64 "\n",
+                  env_cpu(env)->cpu_index, cur_el, env->pc,
+                  pstate_read(env), env->xregs[31],
+                  env->sp_el[0], env->sp_el[1], env->gxf.sp_gl[1]);
     qemu_log_mask(CPU_LOG_INT, "Guarded execution exit from AArch64 GL%d to "
                       "AArch64 EL%d PC 0x%" PRIx64 "\n",
                       cur_el, cur_el, env->pc);

@@ -22,6 +22,8 @@
 
 #define TYPE_VMAPPLE_VPIOP "vresearch-vpiop"
 
+#define TYPE_VMAPPLE_SEP_STORAGE "vresearch-sep-storage"
+
 #define TYPE_VMAPPLE_VUSB "vresearch-vusb"
 
 #endif /* HW_VMAPPLE_VMAPPLE_H */

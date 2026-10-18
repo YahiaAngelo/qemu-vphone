@@ -29,6 +29,7 @@
 #include "qemu/guest-random.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
+#include "qapi/qapi-types-virtio.h"
 #include "hw/boards.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
@@ -54,6 +55,7 @@
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "system/block-backend-global-state.h"
 
 struct VResearchMachineState {
     MachineState parent;
@@ -73,6 +75,7 @@ struct VResearchMachineState {
     MemoryRegion ecam_alias;
     uint64_t ecid;
     char *gfx_device;
+    char *gfx_modes;
     char *sep_rom;
     char *serial;
 
@@ -82,6 +85,10 @@ struct VResearchMachineState {
     MemoryRegion sep_sys_alias;
     MemoryRegion sep_rom_mr;
     MemoryRegion sep_sram_mr;
+    MemoryRegion sep_tz0_mr;
+    MemoryRegion sep_vstd_mr;
+    MemoryRegion cfg_rnd;
+    DeviceState *sep_gic;
 };
 
 #define TYPE_VRESEARCH_MACHINE   MACHINE_TYPE_NAME("vresearch101")
@@ -97,6 +104,7 @@ enum {
     VR_MEM,
     VR_GIC_DIST,
     VR_GIC_REDIST,
+    VR_GIC_MSI,
     VR_UART,
     VR_RTC,
     VR_PCIE,
@@ -126,6 +134,7 @@ static const MemMapEntry memmap[] = {
 
     [VR_GIC_DIST] =           { 0x10000000, 0x00010000 },
     [VR_GIC_REDIST] =         { 0x10010000, 0x00400000 },
+    [VR_GIC_MSI] =            { 0x1fff0000, 0x00010000 },
 
     [VR_UART] =               { 0x20010000, 0x00010000 },
     [VR_RTC] =                { 0x20050000, 0x00001000 },
@@ -182,7 +191,6 @@ static void create_bdif(VResearchMachineState *vms)
         error_report("No root device. Please specify one as virtio drive.");
         exit(1);
     }
-
     /* PV backdoor device */
     bdif = qdev_new(TYPE_VMAPPLE_BDIF);
     bdif_sb = SYS_BUS_DEVICE(bdif);
@@ -214,6 +222,33 @@ static void create_pvpanic(VResearchMachineState *vms)
     sysbus_realize_and_unref(pvpanic, &error_fatal);
 }
 
+/*
+ * cfg+0x38 ("rnd") is an entropy source: sepOS's TRNG app reads it over and
+ * over (through its ACFG object at 0x400000), so a fixed value fails its
+ * health checks and everything that needs SEP entropy stalls. Return fresh
+ * random bits on every read.
+ */
+static uint64_t cfg_rnd_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t val = 0;
+
+    qemu_guest_getrandom_nofail(&val, size);
+    return val;
+}
+
+static void cfg_rnd_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+}
+
+static const MemoryRegionOps cfg_rnd_ops = {
+    .read = cfg_rnd_read,
+    .write = cfg_rnd_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+};
+
 static void create_cfg(VResearchMachineState *vms)
 {
     SysBusDevice *cfg;
@@ -237,6 +272,12 @@ static void create_cfg(VResearchMachineState *vms)
     }
 
     sysbus_realize_and_unref(cfg, &error_fatal);
+
+    memory_region_init_io(&vms->cfg_rnd, OBJECT(vms), &cfg_rnd_ops, NULL,
+                          "cfg-rnd", 8);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        vms->memmap[VR_CONFIG].base + 0x38,
+                                        &vms->cfg_rnd, 1);
 }
 
 static void create_gfx(VResearchMachineState *vms)
@@ -262,6 +303,16 @@ static void create_gfx(VResearchMachineState *vms)
 
     /* mmio/irq 0 = gfx window, mmio/irq 1 = IOSurface mapper window */
     gfx = SYS_BUS_DEVICE(qdev_new(vms->gfx_device));
+    if (vms->gfx_modes && *vms->gfx_modes) {
+        /* "1290x2796@60" or several, '/'-separated: the device's display-modes */
+        g_auto(GStrv) modes = g_strsplit(vms->gfx_modes, "/", -1);
+        QList *list = qlist_new();
+
+        for (int i = 0; modes[i]; i++) {
+            qlist_append_str(list, modes[i]);
+        }
+        qdev_prop_set_array(DEVICE(gfx), "display-modes", list);
+    }
     sysbus_mmio_map(gfx, 0, vms->memmap[VR_APV_GFX].base);
     sysbus_mmio_map(gfx, 1, vms->memmap[VR_APV_IOSFC].base);
     sysbus_connect_irq(gfx, 0, qdev_get_gpio_in(vms->gic, irq_gfx));
@@ -342,8 +393,9 @@ static void create_avp_stubs(VResearchMachineState *vms)
 
 /*
  * SEP mailbox: mmio 0 is the AP's bank, mmio 1 the SEP's, both at the same
- * physical address in their own address spaces. INTIDs 0x35 and 0x34 in the
- * ADT: inbox not empty, outbox empty.
+ * physical address in their own address spaces. The ADT lists INTIDs 0x35
+ * and 0x34 (edge); XNU's AppleSEPManager enables only 0x34 and takes SEP
+ * replies there, so 0x34 is inbox not empty and 0x35 outbox empty.
  */
 static void create_vpiop(VResearchMachineState *vms)
 {
@@ -354,9 +406,9 @@ static void create_vpiop(VResearchMachineState *vms)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, vms->memmap[VR_SEP].base);
     sysbus_connect_irq(sbd, 0,
-                       qdev_get_gpio_in(vms->gic, vms->irqmap[VR_SEP] + 1));
-    sysbus_connect_irq(sbd, 1,
                        qdev_get_gpio_in(vms->gic, vms->irqmap[VR_SEP]));
+    sysbus_connect_irq(sbd, 1,
+                       qdev_get_gpio_in(vms->gic, vms->irqmap[VR_SEP] + 1));
 }
 
 /*
@@ -438,17 +490,33 @@ static void define_impdef_sink(ARMCPU *cpu)
     }
 }
 
+/* timebase-frequency in the ADT's cpu nodes */
+#define VR_TIMEBASE_HZ 24000000
+
 #define SEP_ROM_BASE   0x02000000
 #define SEP_ROM_SIZE   0x00080000
 #define SEP_SRAM_BASE  0x04000000
 #define SEP_SRAM_SIZE  0x00800000
+/* TZ0: the SEP's private DRAM, where AVPSEPBooter loads sepOS */
+#define SEP_TZ0_BASE   0x06000000
+#define SEP_TZ0_SIZE   0x02000000
+/*
+ * SEPD's resource table (in the sepOS image) names its storage endpoint's
+ * register window VSTR at 0x30020000 and its request buffer VSTD at
+ * 0x8000000, 16 KiB each.
+ */
+#define SEP_VSTR_BASE  0x30020000
+#define SEP_VSTD_BASE  0x08000000
+#define SEP_VSTD_SIZE  0x00004000
 
 /*
  * The SEP core. AVPSEPBooter is position independent; its page tables put
  * the ROM at 0x2000000 (read-only) and its working memory at 0x4000000,
- * and map the mailbox at the AP's physical 0x30250000 and AP memory from
- * 0x6000000 up. Model that as a container holding the private ROM and SRAM
- * over an alias of the whole system address space.
+ * and map the mailbox at the AP's physical 0x30250000 and AP memory at its
+ * own physical addresses. Its region table puts TZ0, 32 MiB the platform
+ * provides for sepOS (the AP's "boot TZ0" message carries no address), at
+ * 0x6000000. Model that as a container holding the private ROM, SRAM and
+ * TZ0 over an alias of the whole system address space.
  */
 static void create_sep(VResearchMachineState *vms)
 {
@@ -492,14 +560,57 @@ static void create_sep(VResearchMachineState *vms)
                            SEP_SRAM_SIZE, &error_fatal);
     memory_region_add_subregion(&vms->sep_mem, SEP_SRAM_BASE,
                                 &vms->sep_sram_mr);
+    memory_region_init_ram(&vms->sep_tz0_mr, NULL, "sep-tz0",
+                           SEP_TZ0_SIZE, &error_fatal);
+    memory_region_add_subregion(&vms->sep_mem, SEP_TZ0_BASE,
+                                &vms->sep_tz0_mr);
+    {
+        /* SEP storage, backed by the VM bundle's SEPStorage */
+        DeviceState *st = qdev_new(TYPE_VMAPPLE_SEP_STORAGE);
+        BlockBackend *blk = blk_by_name("sep-storage");
+
+        if (blk) {
+            qdev_prop_set_drive(st, "drive", blk);
+        } else {
+            warn_report("No sep-storage drive; sepOS will panic in SEPD/VSTR");
+        }
+        object_property_set_link(OBJECT(st), "dma-memory",
+                                 OBJECT(&vms->sep_mem), &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(st), &error_fatal);
+        memory_region_add_subregion(&vms->sep_mem, SEP_VSTR_BASE,
+                                    sysbus_mmio_get_region(
+                                        SYS_BUS_DEVICE(st), 0));
+        memory_region_init_ram(&vms->sep_vstd_mr, NULL, "sep-vstd",
+                               SEP_VSTD_SIZE, &error_fatal);
+        memory_region_add_subregion(&vms->sep_mem, SEP_VSTD_BASE,
+                                    &vms->sep_vstd_mr);
+    }
+    {
+        /*
+         * sepOS maps a SEP-only device at 0x30220000 that this model does
+         * not implement yet; log its accesses (-d unimp).
+         */
+        DeviceState *unimp = qdev_new(TYPE_UNIMPLEMENTED_DEVICE);
+
+        qdev_prop_set_string(unimp, "name", "sep-dev-30220000");
+        qdev_prop_set_uint64(unimp, "size", 0x10000);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(unimp), &error_fatal);
+        memory_region_add_subregion(&vms->sep_mem, 0x30220000,
+                                    sysbus_mmio_get_region(
+                                        SYS_BUS_DEVICE(unimp), 0));
+    }
     memory_region_add_subregion(&vms->sep_mem, vms->memmap[VR_SEP].base,
                                 sysbus_mmio_get_region(
                                     SYS_BUS_DEVICE(vms->vpiop), 1));
 
     cpu = object_new(ms->cpu_type);
     CPU(cpu)->cpu_index = ms->smp.cpus;
-    /* Its own cluster, so no AP's MPIDR collides with it */
-    object_property_set_int(cpu, "mp-affinity", 0x10000, &error_fatal);
+    /*
+     * Affinity 0: the SEP is the only core on its private GIC, and sepOS
+     * leaves IROUTER of its low SPIs (the mailbox's 0x34/0x35) at 0. PSCI
+     * lookups by MPIDR still find AP core 0 first (it is created first).
+     */
+    object_property_set_int(cpu, "mp-affinity", 0, &error_fatal);
     if (object_property_find(cpu, "has_el3")) {
         object_property_set_bool(cpu, "has_el3", false, &error_fatal);
     }
@@ -507,6 +618,7 @@ static void create_sep(VResearchMachineState *vms)
         object_property_set_bool(cpu, "has_el2", false, &error_fatal);
     }
     object_property_set_uint(cpu, "rvbar", SEP_ROM_BASE, &error_fatal);
+    object_property_set_uint(cpu, "cntfrq", VR_TIMEBASE_HZ, &error_fatal);
     object_property_set_link(cpu, "memory", OBJECT(&vms->sep_mem),
                              &error_abort);
     qdev_realize(DEVICE(cpu), NULL, &error_fatal);
@@ -543,7 +655,6 @@ static void create_gic(VResearchMachineState *vms)
     redist_region_count = qlist_new();
     qlist_append_int(redist_region_count, redist0_count);
     qdev_prop_set_array(vms->gic, "redist-region-count", redist_region_count);
-
     gicbusdev = SYS_BUS_DEVICE(vms->gic);
     sysbus_realize_and_unref(gicbusdev, &error_fatal);
     sysbus_mmio_map(gicbusdev, 0, vms->memmap[VR_GIC_DIST].base);
@@ -562,8 +673,77 @@ static void create_gic(VResearchMachineState *vms)
                                                arm_gic_ppi_index(i, 27)));
 
         sysbus_connect_irq(gicbusdev, i, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        /* XNU puts the timer PPIs in group 0, so they arrive as FIQs. */
         sysbus_connect_irq(gicbusdev, i + smp_cpus,
                            qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+    }
+}
+
+/*
+ * sepOS brings up its own GICv3 at the same physical addresses as the AP's
+ * (distributor 0x10000000, redistributor 0x10010000) in the SEP's address
+ * space, so give the SEP core a private one there.
+ */
+static void create_sep_gic(VResearchMachineState *vms)
+{
+    MachineState *ms = MACHINE(vms);
+    DeviceState *cpudev = DEVICE(vms->sep_cpu);
+    SysBusDevice *gicbusdev;
+    QList *redist_region_count;
+    static const int timer_ppi[] = {
+        [GTIMER_PHYS] = 30, [GTIMER_VIRT] = 27,
+        [GTIMER_HYP] = 26, [GTIMER_SEC] = 29,
+    };
+
+    if (!vms->sep_cpu) {
+        return;
+    }
+    vms->sep_gic = qdev_new(gicv3_class_name());
+    qdev_prop_set_uint32(vms->sep_gic, "revision", 3);
+    qdev_prop_set_uint32(vms->sep_gic, "num-cpu", 1);
+    qdev_prop_set_uint32(vms->sep_gic, "first-cpu-index", ms->smp.cpus);
+    qdev_prop_set_uint32(vms->sep_gic, "num-irq", NUM_IRQS + 32);
+    redist_region_count = qlist_new();
+    qlist_append_int(redist_region_count, 1);
+    qdev_prop_set_array(vms->sep_gic, "redist-region-count",
+                        redist_region_count);
+    gicbusdev = SYS_BUS_DEVICE(vms->sep_gic);
+    sysbus_realize_and_unref(gicbusdev, &error_fatal);
+    memory_region_add_subregion(&vms->sep_mem, vms->memmap[VR_GIC_DIST].base,
+                                sysbus_mmio_get_region(gicbusdev, 0));
+    memory_region_add_subregion(&vms->sep_mem, vms->memmap[VR_GIC_REDIST].base,
+                                sysbus_mmio_get_region(gicbusdev, 1));
+
+    for (int t = 0; t < ARRAY_SIZE(timer_ppi); t++) {
+        qdev_connect_gpio_out(cpudev, t,
+                              qdev_get_gpio_in(vms->sep_gic,
+                                               arm_gic_ppi_index(0,
+                                                                 timer_ppi[t])));
+    }
+    sysbus_connect_irq(gicbusdev, 0, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+    sysbus_connect_irq(gicbusdev, 1, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+
+    /* sepOS enables the mailbox's INTIDs 0x34/0x35 on its own GIC too */
+    sysbus_connect_irq(SYS_BUS_DEVICE(vms->vpiop), 2,
+                       qdev_get_gpio_in(vms->sep_gic, vms->irqmap[VR_SEP]));
+    sysbus_connect_irq(SYS_BUS_DEVICE(vms->vpiop), 3,
+                       qdev_get_gpio_in(vms->sep_gic,
+                                        vms->irqmap[VR_SEP] + 1));
+}
+
+static void create_gic_msi(VResearchMachineState *vms)
+{
+    const uint32_t base_spi = 32;
+    const uint32_t num_spi = 64;
+    DeviceState *dev = qdev_new("arm-gicv2m");
+
+    qdev_prop_set_uint32(dev, "base-spi", base_spi);
+    qdev_prop_set_uint32(dev, "num-spi", num_spi);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, vms->memmap[VR_GIC_MSI].base);
+    for (uint32_t i = 0; i < num_spi; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           qdev_get_gpio_in(vms->gic, base_spi + i));
     }
 }
 
@@ -705,8 +885,47 @@ static void create_pcie(VResearchMachineState *vms)
         qdev_realize_and_unref(usb_controller, BUS(pci->bus), &error_fatal);
         usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
                                                           &error_fatal));
-        usb_create_simple(usb_bus, "usb-kbd");
+        USBDevice *usb, *hub;
+
+        usb = USB_DEVICE(qdev_new("usb-kbd"));
+        qdev_prop_set_string(DEVICE(usb), "port", "1");
+        usb_realize_and_unref(usb, usb_bus, &error_fatal);
+
+        /*
+         * Keep the keyboard on root port 1. Put the touchscreen on a
+         * non-removable downstream port of a hub on root port 2: iOS
+         * enumerates the HID digitizer only when it is behind this hub.
+         * The USB HID path delivers pointer/touch reports, but does not set
+         * IOHID's Built-In property; backboardd may still reject it as an
+         * external pointing device (the VZ VirtIO HID bridge remains the
+         * eventual native-input implementation).
+         */
+        hub = USB_DEVICE(qdev_new("usb-hub"));
+        qdev_prop_set_string(DEVICE(hub), "port", "2");
+        qdev_prop_set_uint32(DEVICE(hub), "nonremovable", 1);
+        usb_realize_and_unref(hub, usb_bus, &error_fatal);
+
+        usb = USB_DEVICE(qdev_new("usb-touchscreen"));
+        qdev_prop_set_string(DEVICE(usb), "port", "2.1");
+        usb_realize_and_unref(usb, usb_bus, &error_fatal);
+
     }
+}
+
+static void create_root_virtio_blk(VResearchMachineState *vms)
+{
+    BlockBackend *blk = blk_by_name("root-pci");
+    DeviceState *dev;
+
+    if (!blk) {
+        warn_report("No root-pci block backend; the guest will not see its root disk");
+        return;
+    }
+
+    dev = qdev_new(TYPE_VMAPPLE_VIRTIO_BLK_PCI);
+    qdev_prop_set_drive(dev, "drive", blk);
+    qdev_prop_set_enum(dev, "variant", VM_APPLE_VIRTIO_BLK_VARIANT_ROOT);
+    qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
 }
 
 static void vresearch_reset(void *opaque)
@@ -753,6 +972,8 @@ static void mach_vresearch_init(MachineState *machine)
         }
         object_property_set_int(cpu, "psci-conduit", QEMU_PSCI_CONDUIT_HVC,
                                 &error_fatal);
+        /* The ADT's timebase-frequency; sepOS asserts CNTFRQ == 24 MHz */
+        object_property_set_uint(cpu, "cntfrq", VR_TIMEBASE_HZ, &error_fatal);
 
         /* Secondary CPUs start in PSCI powered-down state */
         if (n > 0) {
@@ -772,7 +993,7 @@ static void mach_vresearch_init(MachineState *machine)
         ARM_CPU(cpu)->env.sprr_cfg.unified_perms = true;
         ARM_CPU(cpu)->env.sprr_cfg.el1_perm_reset = 0x2020a52a302abaf5ULL;
         qdev_realize(DEVICE(cpu), NULL, &error_fatal);
-        apple_gxf_define_override_cpregs(ARM_CPU(cpu));
+        apple_gxf_define_m1_override_cpregs(ARM_CPU(cpu));
         define_impdef_sink(ARM_CPU(cpu));
         object_unref(cpu);
     }
@@ -781,6 +1002,7 @@ static void mach_vresearch_init(MachineState *machine)
                                 machine->ram);
 
     create_gic(vms);
+    create_gic_msi(vms);
     create_bdif(vms);
     create_pvpanic(vms);
     create_aes(vms);
@@ -796,10 +1018,12 @@ static void mach_vresearch_init(MachineState *machine)
     create_uart(vms, sysmem, serial_hd(0));
     create_rtc(vms);
     create_pcie(vms);
+    create_root_virtio_blk(vms);
     create_gpio_devices(vms, sysmem);
 
     vresearch_firmware_init(vms, sysmem);
     create_sep(vms);
+    create_sep_gic(vms);
     create_cfg(vms);
 
     vms->powerdown_notifier.notify = vresearch_powerdown_req;
@@ -874,6 +1098,20 @@ static void vresearch_set_gfx_device(Object *obj, const char *value,
     vms->gfx_device = g_strdup(value);
 }
 
+static char *vresearch_get_gfx_modes(Object *obj, Error **errp)
+{
+    return g_strdup(VRESEARCH_MACHINE(obj)->gfx_modes);
+}
+
+static void vresearch_set_gfx_modes(Object *obj, const char *value,
+                                    Error **errp)
+{
+    VResearchMachineState *vms = VRESEARCH_MACHINE(obj);
+
+    g_free(vms->gfx_modes);
+    vms->gfx_modes = g_strdup(value);
+}
+
 static char *vresearch_get_sep_rom(Object *obj, Error **errp)
 {
     return g_strdup(VRESEARCH_MACHINE(obj)->sep_rom);
@@ -909,7 +1147,28 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     mc->block_default_type = IF_VIRTIO;
     mc->no_cdrom = 1;
     mc->pci_allow_0_address = true;
+    /*
+     * QEMU's target page size. XNU, SPTM and iOS userland use the 16 KiB
+     * translation granule, so 16 KiB target pages (VPHONE_TARGET_PAGE_BITS=14)
+     * need one softmmu TLB fill and page walk per guest page instead of four.
+     * The size is fixed in qemu_create_machine() before machine properties
+     * are applied, hence an environment variable. A guest mapping smaller
+     * than the target page still works: cputlb re-walks it on every access.
+     */
     mc->minimum_page_bits = 12;
+    {
+        const char *pb = getenv("VPHONE_TARGET_PAGE_BITS");
+
+        if (pb && *pb) {
+            int bits = atoi(pb);
+
+            if (bits >= 12 && bits <= 16) {
+                mc->minimum_page_bits = bits;
+            } else {
+                error_report("VPHONE_TARGET_PAGE_BITS=%s ignored (12..16)", pb);
+            }
+        }
+    }
     mc->possible_cpu_arch_ids = vresearch_possible_cpu_arch_ids;
     mc->cpu_index_to_instance_props = vresearch_cpu_index_to_props;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("apple-gxf");
@@ -926,6 +1185,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
                                   vresearch_set_gfx_device);
     object_class_property_set_description(oc, "gfx-device",
         "Paravirtual GPU device type (apple-gfx-mmio, or none)");
+    object_class_property_add_str(oc, "gfx-modes", vresearch_get_gfx_modes,
+                                  vresearch_set_gfx_modes);
+    object_class_property_set_description(oc, "gfx-modes",
+        "The GPU's display modes, '/'-separated, e.g. 1290x2796@60");
     object_class_property_add_str(oc, "serial", vresearch_get_serial,
                                   vresearch_set_serial);
     object_class_property_set_description(oc, "serial",

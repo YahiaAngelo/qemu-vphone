@@ -1029,6 +1029,8 @@ void free_queued_cpu_work(CPUState *cpu);
  * @cpu: The CPU which work queue to process.
  */
 void process_queued_cpu_work(CPUState *cpu);
+bool process_queued_cpu_work_nonexclusive(CPUState *cpu);
+bool cpu_exclusive_pending(void);
 
 /**
  * cpu_exec_start:

@@ -35,6 +35,8 @@ void apple_gxf_define_cpregs(ARMCPU *cpu);
 void apple_gxf_define_override_cpregs(ARMCPU *cpu);
 /* The GL1-banked registers at the M1 encodings (S3_6_C15_C10_n) as well */
 void apple_gxf_define_m1_gl_cpregs(ARMCPU *cpu);
+/* M1-style: of the overrides, only VBAR_EL1 (EL1 registers stay unbanked) */
+void apple_gxf_define_m1_override_cpregs(ARMCPU *cpu);
 
 void apple_a13_init_gxf_override(AppleA13State *cpu);
 

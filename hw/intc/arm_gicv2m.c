@@ -71,6 +71,7 @@ static uint64_t gicv2m_read(void *opaque, hwaddr offset,
 {
     ARMGICv2mState *s = (ARMGICv2mState *)opaque;
     uint32_t val;
+    static unsigned log_count;
 
     if (size != 4) {
         qemu_log_mask(LOG_GUEST_ERROR, "gicv2m_read: bad size %u\n", size);
@@ -81,6 +82,12 @@ static uint64_t gicv2m_read(void *opaque, hwaddr offset,
     case V2M_MSI_TYPER:
         val = (s->base_spi + 32) << 16;
         val |= s->num_spi;
+        val |= 0x80000000;
+        if (__atomic_fetch_add(&log_count, 1, __ATOMIC_RELAXED) < 64) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "gicv2m: MSI_TYPER read base_spi=%u num_spi=%u"
+                          " value=%08x\n", s->base_spi, s->num_spi, val);
+        }
         return val;
     case V2M_MSI_IIDR:
         /* We don't have any valid implementor so we leave that field as zero
@@ -115,6 +122,14 @@ static void gicv2m_write(void *opaque, hwaddr offset,
         int spi;
 
         spi = (value & 0x3ff) - (s->base_spi + 32);
+        static unsigned msi_write_log_count;
+        if (__atomic_fetch_add(&msi_write_log_count, 1,
+                               __ATOMIC_RELAXED) < 64) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "gicv2m: MSI_SETSPI_NS write value=%08" PRIx64
+                          " spi_index=%d base_spi=%u num_spi=%u\n",
+                          value, spi, s->base_spi, s->num_spi);
+        }
         if (spi >= 0 && spi < s->num_spi) {
             gicv2m_set_irq(s, spi);
         }

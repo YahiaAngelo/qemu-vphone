@@ -1815,7 +1815,7 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     int32_t stride;
     int addrsize, inputsize, outputsize;
     uint64_t tcr = regime_tcr(env, mmu_idx);
-    int ap, xn, pxn;
+    int ap = 0, xn = 0, pxn = 0;
     uint32_t el = regime_el(env, mmu_idx);
     uint64_t descaddrmask;
     bool aarch64 = arm_el_is_aa64(env, el);
@@ -2252,9 +2252,28 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
             prot_rw = ((os_perm & 2) ? PAGE_READ : 0) |
                       ((os_perm & 1) ? PAGE_WRITE : 0);
             xn = pxn = 1;
+        } else if (arm_is_sprr_enabled(env) && env->sprr_cfg.unified_perms) {
+            /*
+             * M1-style SPRR: the permission index comes from the leaf
+             * descriptor's own AP/UXN/PXN. Table-level XN/PXN (folded into
+             * xn/pxn above) only take away execute permission.
+             */
+            int leaf_ap = extract64(new_descriptor, 6, 2);
+            int leaf_xn = extract64(new_descriptor, 54, 1);
+            int leaf_pxn = extract64(new_descriptor, 53, 1);
+            int sprr_prot = pte_to_sprr_prot(env, leaf_ap, leaf_xn, leaf_pxn);
+            bool table_xn = (xn && !leaf_xn) || (pxn && !leaf_pxn);
+
+            prot_rw = sprr_prot & (PAGE_READ | PAGE_WRITE);
+            xn = pxn = !(sprr_prot & PAGE_EXEC) || table_xn;
+            ap = leaf_ap;
         } else if (arm_is_sprr_enabled(env)) {
             prot_rw = pte_to_sprr_prot(env, ap, xn, pxn) & (PAGE_READ | PAGE_WRITE);
             xn = pxn = !(pte_to_sprr_prot(env, ap, xn, pxn) & PAGE_EXEC);
+            if (!arm_is_guarded(env) &&
+                (((ap << 2) | (xn << 1) | pxn) & 0xf) == 0xb) {
+                prot_rw |= PAGE_WRITE;
+            }
         } else {
             prot_rw = simple_ap_to_rw_prot_is_user(ap, false);
         }
@@ -2324,6 +2343,45 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     }
 
     if (ptw->in_prot_check & ~result->f.prot) {
+        if (access_type == MMU_DATA_STORE) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "arm-ptw: write permission fault va=%016" PRIx64
+                          " level=%d desc=%016" PRIx64 " attrs=%016" PRIx64
+                          " ap=%d xn=%d pxn=%d sprr=%d guarded=%d"
+                          " perm=%016" PRIx64 " el0perm=%016" PRIx64
+                          " prot=%x need=%x"
+                          " pc=%016" PRIx64 " sp=%016" PRIx64
+                          " sp_el1=%016" PRIx64 " sp_gl1=%016" PRIx64
+                          " pstate=%x x0=%016" PRIx64 " x1=%016" PRIx64
+                          " x2=%016" PRIx64 " x3=%016" PRIx64 "\n",
+                          address, level, descriptor, attrs, ap, xn, pxn,
+                          arm_is_sprr_enabled(env), arm_is_guarded(env),
+                          env->sprr.sprr_el_br_el1[el][el],
+                          env->sprr.sprr_el_br_el1[0][0],
+                           result->f.prot, ptw->in_prot_check, env->pc,
+                           env->xregs[31], env->sp_el[1], env->gxf.sp_gl[1],
+                           pstate_read(env), env->xregs[0], env->xregs[1],
+                           env->xregs[2], env->xregs[3]);
+            if (level == 3 && ptw->out_host) {
+                uint64_t index = extract64(address, 12, stride + 3);
+                int first = -(int)MIN(index, 16ULL);
+
+                for (int i = first; i <= 16; i++) {
+                    uint64_t neighbor = ldq_le_p((uint8_t *)ptw->out_host + i * 8);
+                    uint64_t va = (address & ~0xfffULL) + (int64_t)i * 0x1000;
+
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "arm-ptw: neighbor va=%016" PRIx64
+                                  " pte=%016" PRIx64 " pa=%016" PRIx64
+                                  " ap=%u UXN=%u PXN=%u\n",
+                                  va, neighbor,
+                                  neighbor & (uint64_t)0x0000fffffffff000ULL,
+                                  (unsigned)extract64(neighbor, 6, 2),
+                                  (unsigned)extract64(neighbor, 54, 1),
+                                  (unsigned)extract64(neighbor, 53, 1));
+                }
+            }
+        }
         fi->type = ARMFault_Permission;
         goto do_fault;
     }
@@ -2361,6 +2419,21 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
         result->cacheattrs.shareability = extract32(attrs, 8, 2);
     }
 
+    if (address >= 0xfffffe7000000000ULL &&
+        address < 0xfffffe8000000000ULL) {
+        static unsigned high_va_log_count;
+        if (__atomic_fetch_add(&high_va_log_count, 1,
+                               __ATOMIC_RELAXED) < 64) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "arm-ptw: high-kernel-va va=%016" PRIx64
+                          " pa=%016" PRIx64 " desc=%016" PRIx64
+                          " attrs=%016" PRIx64 " ap=%u xn=%u pxn=%u"
+                          " level=%d access=%d prot=%x pc=%016" PRIx64
+                          " mmu=%d\n",
+                          address, descaddr, descriptor, attrs, ap, xn, pxn,
+                          level, access_type, result->f.prot, env->pc, mmu_idx);
+        }
+    }
     result->f.phys_addr = descaddr;
     result->f.lg_page_size = ctz64(page_size);
     return false;

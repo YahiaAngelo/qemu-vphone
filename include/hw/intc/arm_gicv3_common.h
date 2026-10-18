@@ -230,6 +230,8 @@ struct GICv3State {
     uint32_t nb_redist_regions; /* number of redist regions */
 
     uint32_t num_cpu;
+    /* The CPUs this GIC serves are first_cpu_index .. + num_cpu - 1 */
+    uint32_t first_cpu_index;
     uint32_t num_irq;
     uint32_t revision;
     uint32_t maint_irq;

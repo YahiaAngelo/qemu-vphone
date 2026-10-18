@@ -350,6 +350,8 @@ void tlb_destroy(CPUState *cpu)
  * where all queued work will be finished before execution starts
  * again.
  */
+static void tlb_flush_queue(CPUState *dst, run_on_cpu_func fn, run_on_cpu_data data);
+
 static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
                              run_on_cpu_data d)
 {
@@ -357,7 +359,7 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
 
     CPU_FOREACH(cpu) {
         if (cpu != src) {
-            async_run_on_cpu(cpu, fn, d);
+            tlb_flush_queue(cpu, fn, d);
         }
     }
 }
@@ -416,14 +418,131 @@ void tlb_flush(CPUState *cpu)
     tlb_flush_by_mmuidx(cpu, ALL_MMUIDX_BITS);
 }
 
+/*
+ * vphone-linux: how a broadcast TLB flush (the ARM TLBI ...IS family) synchronizes, by
+ * QEMU_TLB_UNSYNCED:
+ *   unset or 0  QEMU's: the source CPU's part runs in an exclusive section, which stops every
+ *               vCPU, so no CPU runs past the flush with a stale entry;
+ *   1           every part is ordinary queued work: no stop, but another vCPU may use a stale
+ *               entry for the moment its part waits in its queue;
+ *   2           a barrier: the other parts are queued, the source flushes at once and then waits
+ *               until every other part ran (running its own queued work meanwhile, so two
+ *               flushing CPUs cannot wait on each other), with no global stop. The wait gives up
+ *               after a millisecond, or at once where an exclusive section is pending, as one
+ *               it would otherwise deadlock against.
+ * XNU broadcasts TLB invalidations so often that the exclusive sections of mode 0 serialize the
+ * vCPUs.
+ */
+static int tlb_flush_mode(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *v = getenv("QEMU_TLB_UNSYNCED");
+        mode = v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+    }
+    return mode;
+}
+
+typedef struct TLBFlushBarrier {
+    int pending;
+    int refs;
+} TLBFlushBarrier;
+
+typedef struct TLBFlushBarrierWork {
+    TLBFlushBarrier *barrier;
+    run_on_cpu_func fn;
+    run_on_cpu_data data;
+} TLBFlushBarrierWork;
+
+static __thread TLBFlushBarrier *tlb_barrier;
+
+static void tlb_barrier_unref(TLBFlushBarrier *b)
+{
+    if (qatomic_fetch_dec(&b->refs) == 1) {
+        g_free(b);
+    }
+}
+
+static void tlb_barrier_work(CPUState *cpu, run_on_cpu_data d)
+{
+    TLBFlushBarrierWork *w = d.host_ptr;
+
+    w->fn(cpu, w->data);
+    qatomic_dec(&w->barrier->pending);
+    tlb_barrier_unref(w->barrier);
+    g_free(w);
+}
+
+/* Starts a synced flush's barrier, in mode 2. */
+static void tlb_barrier_begin(void)
+{
+    if (tlb_flush_mode() == 2) {
+        tlb_barrier = g_new0(TLBFlushBarrier, 1);
+        tlb_barrier->refs = 1;
+    }
+}
+
+/* Queues @fn on @dst, a part of a synced flush, counted by the barrier where one is open. */
+static void tlb_flush_queue(CPUState *dst, run_on_cpu_func fn, run_on_cpu_data data)
+{
+    TLBFlushBarrier *b = tlb_barrier;
+
+    if (b) {
+        TLBFlushBarrierWork *w = g_new(TLBFlushBarrierWork, 1);
+
+        w->barrier = b;
+        w->fn = fn;
+        w->data = data;
+        qatomic_inc(&b->pending);
+        qatomic_inc(&b->refs);
+        async_run_on_cpu(dst, tlb_barrier_work, RUN_ON_CPU_HOST_PTR(w));
+    } else {
+        async_run_on_cpu(dst, fn, data);
+    }
+}
+
+/* Runs the source CPU's part of a synced flush, the flush's last step. */
+static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
+                             run_on_cpu_data data)
+{
+    TLBFlushBarrier *b = tlb_barrier;
+    int64_t deadline;
+
+    switch (tlb_flush_mode()) {
+    case 1:
+        async_run_on_cpu(src_cpu, fn, data);
+        return;
+    case 2:
+        tlb_barrier = NULL;
+        fn(src_cpu, data);
+        if (!b) {
+            return;
+        }
+        deadline = get_clock() + 1000000;
+        while (qatomic_read(&b->pending) > 0) {
+            if (cpu_exclusive_pending() || get_clock() > deadline ||
+                !process_queued_cpu_work_nonexclusive(src_cpu)) {
+                break;
+            }
+            cpu_relax();
+        }
+        tlb_barrier_unref(b);
+        return;
+    default:
+        async_safe_run_on_cpu(src_cpu, fn, data);
+    }
+}
+
 void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 {
     const run_on_cpu_func fn = tlb_flush_by_mmuidx_async_work;
 
     tlb_debug("mmu_idx: 0x%"PRIx32"\n", idxmap);
 
+    tlb_barrier_begin();
     flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
-    async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
+    tlb_flush_on_src(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
 }
 
 void tlb_flush_all_cpus_synced(CPUState *src_cpu)
@@ -618,6 +737,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 
     /* This should already be page aligned */
     addr &= TARGET_PAGE_MASK;
+    tlb_barrier_begin();
 
     /*
      * Allocate memory to hold addr+idxmap only when needed.
@@ -626,7 +746,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     if (idxmap < TARGET_PAGE_SIZE) {
         flush_all_helper(src_cpu, tlb_flush_page_by_mmuidx_async_1,
                          RUN_ON_CPU_TARGET_PTR(addr | idxmap));
-        async_safe_run_on_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_1,
+        tlb_flush_on_src(src_cpu, tlb_flush_page_by_mmuidx_async_1,
                               RUN_ON_CPU_TARGET_PTR(addr | idxmap));
     } else {
         CPUState *dst_cpu;
@@ -638,7 +758,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
                 d = g_new(TLBFlushPageByMMUIdxData, 1);
                 d->addr = addr;
                 d->idxmap = idxmap;
-                async_run_on_cpu(dst_cpu, tlb_flush_page_by_mmuidx_async_2,
+                tlb_flush_queue(dst_cpu, tlb_flush_page_by_mmuidx_async_2,
                                  RUN_ON_CPU_HOST_PTR(d));
             }
         }
@@ -646,7 +766,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
         d = g_new(TLBFlushPageByMMUIdxData, 1);
         d->addr = addr;
         d->idxmap = idxmap;
-        async_safe_run_on_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_2,
+        tlb_flush_on_src(src_cpu, tlb_flush_page_by_mmuidx_async_2,
                               RUN_ON_CPU_HOST_PTR(d));
     }
 }
@@ -674,7 +794,24 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
      * If @len is larger than the tlb size, then it will take longer to
      * test all of the entries in the TLB than it will to flush it all.
      */
-    if (mask < f->mask || len > f->mask) {
+    /*
+     * vphone (VPHONE_TLB_RANGE_PAGES=1): compare the range's page count with
+     * the TLB's entry count. Upstream compares the byte length with the
+     * table's byte size (entries * 32), so a range of only a few target
+     * pages (XNU's TLBI RVAE1IS on any multi-page unmap) flushes the whole
+     * mmu_idx, and the refills dominate. Pays off with 16 KiB target pages
+     * (VPHONE_TARGET_PAGE_BITS=14); at 4 KiB, 16 KiB guest pages count as
+     * large pages and escalate to full flushes anyway.
+     */
+    static int range_pages = -1;
+    if (unlikely(range_pages < 0)) {
+        const char *e = getenv("VPHONE_TLB_RANGE_PAGES");
+        range_pages = e && *e && *e != '0';
+    }
+    if (mask < f->mask ||
+        (range_pages ? (len >> TARGET_PAGE_BITS) >
+                       (f->mask >> CPU_TLB_ENTRY_BITS)
+                     : len > f->mask)) {
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
                   midx, addr, mask, len);
@@ -819,6 +956,7 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
         return;
     }
 
+    tlb_barrier_begin();
     /* This should already be page aligned */
     d.addr = addr & TARGET_PAGE_MASK;
     d.len = len;
@@ -829,13 +967,13 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     CPU_FOREACH(dst_cpu) {
         if (dst_cpu != src_cpu) {
             p = g_memdup(&d, sizeof(d));
-            async_run_on_cpu(dst_cpu, tlb_flush_range_by_mmuidx_async_1,
+            tlb_flush_queue(dst_cpu, tlb_flush_range_by_mmuidx_async_1,
                              RUN_ON_CPU_HOST_PTR(p));
         }
     }
 
     p = g_memdup(&d, sizeof(d));
-    async_safe_run_on_cpu(src_cpu, tlb_flush_range_by_mmuidx_async_1,
+    tlb_flush_on_src(src_cpu, tlb_flush_range_by_mmuidx_async_1,
                           RUN_ON_CPU_HOST_PTR(p));
 }
 

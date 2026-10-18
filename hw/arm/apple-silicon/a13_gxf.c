@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "exec/cputlb.h"
 #include "hw/arm/apple-silicon/a13_gxf.h"
 #include "target/arm/cpregs.h"
@@ -54,18 +55,13 @@ static void tpidr_el1_write(CPUARMState *env, const ARMCPRegInfo *ri,
 
 static uint64_t vbar_el1_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
-    if (arm_is_guarded(env)) {
-        return env->gxf.vbar_gl[1];
-    }
     return raw_read(env, ri);
 }
 
 static void vbar_el1_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
-    if (arm_is_guarded(env)) {
-        env->gxf.vbar_gl[1] = value & ~0x1FULL;
-    } else if (!(env->cp15.vmsa_lock_el1 & VMSA_LOCK_VBAR_EL1)) {
+    if (!(env->cp15.vmsa_lock_el1 & VMSA_LOCK_VBAR_EL1)) {
         raw_write(env, ri, value & ~0x1FULL);
     }
 }
@@ -148,6 +144,16 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
     // maybe use uint64_t for mask/umask?
     uint64_t perm = raw_read(env, ri);
     uint32_t mask = env->sprr.mprr_el_br_el1[0][0];
+    static unsigned logged;
+
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sprr: C1_5 write cpu%d el=%d pc=%016" PRIx64
+                      " value=%016" PRIx64 " old=%016" PRIx64
+                      " guarded=%d\n", env_cpu(env)->cpu_index,
+                      arm_current_el(env), env->pc, value, perm,
+                      arm_is_guarded(env));
+    }
     if (arm_current_el(env)) {
         raw_write(env, ri, value);
         return;
@@ -188,6 +194,15 @@ static uint64_t sprr_c1_6_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void sprr_c1_6_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
+    static unsigned logged;
+
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sprr: C1_6 write cpu%d pc=%016" PRIx64
+                      " value=%016" PRIx64 " unified=%d guarded=%d\n",
+                      env_cpu(env)->cpu_index, env->pc, value,
+                      env->sprr_cfg.unified_perms, arm_is_guarded(env));
+    }
     if (env->sprr_cfg.unified_perms) {
         env->sprr.sprr_el_br_el1[1][0] = value;
         env->sprr.sprr_el_br_el1[1][1] = value;
@@ -215,6 +230,15 @@ static uint64_t sprr_c3_0_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void sprr_c3_0_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
+    static unsigned logged;
+
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sprr: C3_0 write cpu%d pc=%016" PRIx64
+                      " value=%016" PRIx64 " unified=%d guarded=%d\n",
+                      env_cpu(env)->cpu_index, env->pc, value,
+                      env->sprr_cfg.unified_perms, arm_is_guarded(env));
+    }
     if (env->sprr_cfg.unified_perms) {
         env->sprr.c3_0 = value;
     } else {
@@ -704,6 +728,27 @@ void apple_gxf_define_override_cpregs(ARMCPU *cpu)
 {
     if (arm_feature(&cpu->env, ARM_FEATURE_GXF)) {
         define_arm_cp_regs(cpu, apple_a13_gxf_cp_override_reginfo);
+    }
+}
+
+/*
+ * On M1-and-later cores, GL code names its own exception registers through
+ * S3_6_C15_C10_<n>, and the standard TPIDR/SPSR/ELR/ESR/FAR_EL1 encodings
+ * reach the EL1 registers even while guarded: SPTM's interrupt path copies
+ * ESR_GL1 to ESR_EL1 and sets ELR_EL1 to XNU's return handler before GEXIT.
+ * Only the VBAR_EL1 override applies to them.
+ */
+void apple_gxf_define_m1_override_cpregs(ARMCPU *cpu)
+{
+    if (!arm_feature(&cpu->env, ARM_FEATURE_GXF)) {
+        return;
+    }
+    for (int i = 0; i < ARRAY_SIZE(apple_a13_gxf_cp_override_reginfo); i++) {
+        const ARMCPRegInfo *ri = &apple_a13_gxf_cp_override_reginfo[i];
+
+        if (!strcmp(ri->name, "VBAR")) {
+            define_one_arm_cp_reg(cpu, ri);
+        }
     }
 }
 

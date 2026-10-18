@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "hw/boards.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "internals.h"
 #include "cpu-features.h"
@@ -351,6 +353,18 @@ bool arm_cpu_tlb_fill_align(CPUState *cs, CPUTLBEntryFull *out, vaddr address,
                               &res, fi)) {
         res.f.extra.arm.pte_attrs = res.cacheattrs.attrs;
         res.f.extra.arm.shareability = res.cacheattrs.shareability;
+        if (cs->cpu_index == current_machine->smp.cpus &&
+            arm_current_el(&cpu->env) == 0 && access_type != MMU_INST_FETCH) {
+            /* Diagnostic: SEP-core EL0 data translations */
+            static unsigned sep_tlb_log;
+            if (__atomic_fetch_add(&sep_tlb_log, 1, __ATOMIC_RELAXED) < 50000) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sep-tlb: va=%016" PRIx64 " pa=%016" PRIx64
+                              " acc=%d pc=%016" PRIx64 "\n",
+                              (uint64_t)address, (uint64_t)res.f.phys_addr,
+                              access_type, cpu->env.pc);
+            }
+        }
         *out = res.f;
         return true;
     }

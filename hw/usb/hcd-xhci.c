@@ -2285,6 +2285,10 @@ static TRBCCode xhci_configure_slot(XHCIState *xhci, unsigned int slotid,
     slot_ctx[0] &= ~(SLOT_CONTEXT_ENTRIES_MASK << SLOT_CONTEXT_ENTRIES_SHIFT);
     slot_ctx[0] |= islot_ctx[0] & (SLOT_CONTEXT_ENTRIES_MASK <<
                                    SLOT_CONTEXT_ENTRIES_SHIFT);
+    /* vphone-linux: the hub fields (Hub, MTT, Number of Ports, TT Think Time) */
+    slot_ctx[0] = (slot_ctx[0] & ~(3u << 25)) | (islot_ctx[0] & (3u << 25));
+    slot_ctx[1] = (slot_ctx[1] & ~(0xffu << 24)) | (islot_ctx[1] & (0xffu << 24));
+    slot_ctx[2] = (slot_ctx[2] & ~(3u << 16)) | (islot_ctx[2] & (3u << 16));
     DPRINTF("xhci: output slot context: %08x %08x %08x %08x\n",
             slot_ctx[0], slot_ctx[1], slot_ctx[2], slot_ctx[3]);
 
@@ -2334,6 +2338,10 @@ static TRBCCode xhci_evaluate_slot(XHCIState *xhci, unsigned int slotid,
         /* update interrupter target field */
         xhci->slots[slotid-1].intr = get_field(islot_ctx[2], TRB_INTR);
         set_field(&slot_ctx[2], xhci->slots[slotid-1].intr, TRB_INTR);
+        /* vphone-linux: the hub fields (Hub, MTT, Number of Ports, TT Think Time) */
+        slot_ctx[0] = (slot_ctx[0] & ~(3u << 25)) | (islot_ctx[0] & (3u << 25));
+        slot_ctx[1] = (slot_ctx[1] & ~(0xffu << 24)) | (islot_ctx[1] & (0xffu << 24));
+        slot_ctx[2] = (slot_ctx[2] & ~(3u << 16)) | (islot_ctx[2] & (3u << 16));
 
         DPRINTF("xhci: output slot context: %08x %08x %08x %08x\n",
                 slot_ctx[0], slot_ctx[1], slot_ctx[2], slot_ctx[3]);
@@ -2636,6 +2644,21 @@ static void xhci_port_update(XHCIPort *port, int is_detach)
     port->portsc = PORTSC_PP;
     if (!is_detach && xhci_port_have_device(port)) {
         port->portsc |= PORTSC_CCS;
+        /*
+         * vphone-linux: VPHONE_XHCI_NONREMOVABLE (bit n = root port n, hex or
+         * decimal) reports the device as non-removable (Device Removable,
+         * PORTSC bit 30), as on a built-in port.
+         */
+        {
+            static long nonremovable = -1;
+            if (nonremovable < 0) {
+                const char *e = getenv("VPHONE_XHCI_NONREMOVABLE");
+                nonremovable = e ? strtol(e, NULL, 0) : 0;
+            }
+            if (nonremovable & (1L << port->portnr)) {
+                port->portsc |= PORTSC_DR;
+            }
+        }
         switch (port->uport->dev->speed) {
         case USB_SPEED_LOW:
             port->portsc |= PORTSC_SPEED_LOW;

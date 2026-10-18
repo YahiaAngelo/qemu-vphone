@@ -67,6 +67,14 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
     /* Initialize the cpu we are turning on */
     cpu_reset(target_cpu_state);
     arm_emulate_firmware_reset(target_cpu_state, info->target_el);
+    if (arm_feature(&target_cpu->env, ARM_FEATURE_GXF)) {
+        /*
+         * An Apple core started by CPU_ON runs SPTM's GENTER path with FP/SIMD
+         * in use before anything writes CPACR_EL1: start it with FP enabled,
+         * as Virtualization.framework does.
+         */
+        target_cpu->env.cp15.cpacr_el1 |= R_CPACR_EL1_FPEN_MASK;
+    }
     target_cpu_state->halted = 0;
 
     /* We check if the started CPU is now at the correct level */

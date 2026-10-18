@@ -12,11 +12,15 @@
  *   0x018  IRQ_EN   bit 4 inbox not empty, bit 5 outbox empty
  *   0x01c  INBOX    bit 17 empty, bit 16 full, 7:0 count
  *   0x020  OUTBOX   bit 17 empty, bit 16 full, 7:0 count
+ *
+ * XNU's AppleVPIOP (getMailboxBulk) instead takes the inbox level from
+ * INBOX bits 23:20, and from bits 23:20 of each message's last word as it
+ * reads it (1 = this is the last one), so the AP bank provides both.
  *   0x100  inbox message (16 bytes), popped by reading its last word
  *   0x200  outbox message (16 bytes), pushed by writing its last word
  *
  * One side's outbox is the other side's inbox. The SEP waits with WFE and
- * polls; the AP gets level interrupts (inbox not empty, outbox empty).
+ * polls; the AP gets interrupts for inbox not empty and outbox empty.
  */
 
 #include "qemu/osdep.h"
@@ -79,6 +83,13 @@ struct VPIOPState {
     VPIOPSide side[SIDE_COUNT];
     qemu_irq irq_inbox;
     qemu_irq irq_outbox;
+    /* edge generation state for the AP's combined line */
+    bool ap_inbox_pending;
+    bool ap_outbox_pending;
+    uint32_t ap_inbox_seen;
+    /* the same pair for the SEP's own GIC */
+    qemu_irq sep_irq_inbox;
+    qemu_irq sep_irq_outbox;
 };
 
 static const char *side_name(int side)
@@ -91,10 +102,41 @@ static void vpiop_update_irq(VPIOPState *s)
     VPIOPSide *ap = &s->side[SIDE_AP];
     VPIOPQueue *ap_out = &s->side[SIDE_SEP].inbox;
 
-    qemu_set_irq(s->irq_inbox,
-                 (ap->irq_en & IRQ_EN_INBOX) && ap->inbox.count != 0);
-    qemu_set_irq(s->irq_outbox,
-                 (ap->irq_en & IRQ_EN_OUTBOX) && ap_out->count == 0);
+    bool inbox = (ap->irq_en & IRQ_EN_INBOX) && ap->inbox.count != 0;
+    bool outbox = (ap->irq_en & IRQ_EN_OUTBOX) && ap_out->count == 0;
+
+    /*
+     * XNU enables only the first ADT line (INTID 0x34), configured edge,
+     * and takes both "reply waiting" and "room to send" there (it turns
+     * IRQ_EN_OUTBOX on around each send). Give every new event its own
+     * edge (a message arriving, or either condition becoming true) so it
+     * is never hidden behind a line that is already high.
+     */
+    if ((inbox && (!s->ap_inbox_pending ||
+                   ap->inbox.count > s->ap_inbox_seen)) ||
+        (outbox && !s->ap_outbox_pending)) {
+        qemu_set_irq(s->irq_inbox, 0);
+    }
+    qemu_set_irq(s->irq_inbox, inbox || outbox);
+    qemu_set_irq(s->irq_outbox, outbox);
+    s->ap_inbox_pending = inbox;
+    s->ap_outbox_pending = outbox;
+    s->ap_inbox_seen = ap->inbox.count;
+
+    VPIOPSide *sep = &s->side[SIDE_SEP];
+    VPIOPQueue *sep_out = &s->side[SIDE_AP].inbox;
+
+    qemu_set_irq(s->sep_irq_inbox,
+                 (sep->irq_en & IRQ_EN_INBOX) && sep->inbox.count != 0);
+    qemu_set_irq(s->sep_irq_outbox,
+                 (sep->irq_en & IRQ_EN_OUTBOX) && sep_out->count == 0);
+}
+
+#define QUEUE_LEVEL_SHIFT    20
+
+static uint32_t queue_level(VPIOPQueue *q)
+{
+    return MIN(q->count, 0xf) << QUEUE_LEVEL_SHIFT;
 }
 
 static uint32_t queue_status(VPIOPQueue *q)
@@ -125,6 +167,13 @@ static void vpiop_push(VPIOPState *s, int from)
     memcpy(q->msg[(q->head + q->count) % VPIOP_FIFO_DEPTH], src->out_msg,
            VPIOP_MSG_SIZE);
     q->count++;
+    if (from == SIDE_AP) {
+        /* Diagnostic: is the SEP set up to be woken for this message? */
+        qemu_log_mask(LOG_GUEST_ERROR, "vpiop: ap->sep queued (count %u) "
+                      "sep irq_en=0x%x ctrl=0x%x status=0x%x\n", q->count,
+                      s->side[SIDE_SEP].irq_en, s->side[SIDE_SEP].ctrl,
+                      s->side[SIDE_SEP].status);
+    }
     memset(src->out_msg, 0, VPIOP_MSG_SIZE);
 }
 
@@ -147,14 +196,22 @@ static uint64_t vpiop_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case REG_INBOX:
         val = queue_status(&me->inbox);
+        if (b->side == SIDE_AP) {
+            val |= queue_level(&me->inbox);
+        }
         break;
     case REG_OUTBOX:
         val = queue_status(&s->side[!b->side].inbox);
         break;
     case REG_INBOX_MSG ... REG_INBOX_MSG + VPIOP_MSG_SIZE - 1:
         if (me->inbox.count) {
-            uint8_t *msg = me->inbox.msg[me->inbox.head];
+            uint8_t msg[VPIOP_MSG_SIZE];
 
+            memcpy(msg, me->inbox.msg[me->inbox.head], VPIOP_MSG_SIZE);
+            if (b->side == SIDE_AP) {
+                stl_le_p(msg + 12, ldl_le_p(msg + 12) |
+                                   queue_level(&me->inbox));
+            }
             val = ldn_le_p(msg + (addr - REG_INBOX_MSG), size);
             /* reading the last word pops the message */
             if (addr + size == REG_INBOX_MSG + VPIOP_MSG_SIZE) {
@@ -172,6 +229,9 @@ static uint64_t vpiop_read(void *opaque, hwaddr addr, unsigned size)
                       side_name(b->side), addr);
         break;
     }
+    if (b->side == SIDE_AP) {
+        trace_vpiop_reg_read(side_name(b->side), addr, val);
+    }
     return val;
 }
 
@@ -181,6 +241,9 @@ static void vpiop_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     VPIOPState *s = b->s;
     VPIOPSide *me = &s->side[b->side];
 
+    if (b->side == SIDE_AP) {
+        trace_vpiop_reg_write(side_name(b->side), addr, val);
+    }
     switch (addr) {
     case REG_CTRL:
         me->ctrl = val;
@@ -190,6 +253,10 @@ static void vpiop_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         me->status &= ~(val & 0xf);
         break;
     case REG_IRQ_EN:
+        if (b->side == SIDE_SEP && val != me->irq_en && val != 0 && val != 0x10) {
+            qemu_log_mask(LOG_GUEST_ERROR, "vpiop: sep irq_en 0x%x -> 0x%"
+                          PRIx64 "\n", me->irq_en, val);
+        }
         me->irq_en = val;
         break;
     case REG_OUTBOX_MSG ... REG_OUTBOX_MSG + VPIOP_MSG_SIZE - 1:
@@ -222,6 +289,8 @@ static void vpiop_reset(DeviceState *dev)
     VPIOPState *s = VPIOP(dev);
 
     memset(s->side, 0, sizeof(s->side));
+    s->ap_inbox_pending = s->ap_outbox_pending = false;
+    s->ap_inbox_seen = 0;
     vpiop_update_irq(s);
 }
 
@@ -241,6 +310,8 @@ static void vpiop_init(Object *obj)
     }
     sysbus_init_irq(sbd, &s->irq_inbox);
     sysbus_init_irq(sbd, &s->irq_outbox);
+    sysbus_init_irq(sbd, &s->sep_irq_inbox);
+    sysbus_init_irq(sbd, &s->sep_irq_outbox);
 }
 
 static const VMStateDescription vmstate_vpiop_queue = {

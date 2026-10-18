@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/boards.h"
 #include "qemu/log.h"
 #include "trace.h"
 #include "cpu.h"
@@ -3214,6 +3215,18 @@ static CPAccessResult sp_el0_access(CPUARMState *env, const ARMCPRegInfo *ri,
     return CP_ACCESS_OK;
 }
 
+static void sp_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                         uint64_t value)
+{
+    qemu_log_mask(CPU_LOG_INT,
+                  "SP_EL0 write cpu%d EL%d pc=%016" PRIx64
+                  " old=%016" PRIx64 " new=%016" PRIx64
+                  " pstate=%x guarded=%d\n",
+                  env_cpu(env)->cpu_index, arm_current_el(env), env->pc,
+                  env->sp_el[0], value, pstate_read(env), arm_is_guarded(env));
+    raw_write(env, ri, value);
+}
+
 static uint64_t spsel_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     return env->pstate & PSTATE_SP;
@@ -3485,11 +3498,11 @@ static const ARMCPRegInfo v8_cp_reginfo[] = {
      * state field when SPSel indicates that it's being used as the stack
      * pointer.
      */
-    { .name = "SP_EL0", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 0, .crn = 4, .crm = 1, .opc2 = 0,
-      .access = PL1_RW, .accessfn = sp_el0_access,
-      .type = ARM_CP_ALIAS,
-      .fieldoffset = offsetof(CPUARMState, sp_el[0]) },
+     { .name = "SP_EL0", .state = ARM_CP_STATE_AA64,
+       .opc0 = 3, .opc1 = 0, .crn = 4, .crm = 1, .opc2 = 0,
+       .access = PL1_RW, .accessfn = sp_el0_access,
+       .type = ARM_CP_ALIAS, .writefn = sp_el0_write,
+       .fieldoffset = offsetof(CPUARMState, sp_el[0]) },
     { .name = "SP_EL1", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 4, .crn = 4, .crm = 1, .opc2 = 0,
       .nv2_redirect_offset = 0x240,
@@ -8605,6 +8618,8 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     unsigned int old_mode;
     unsigned int cur_el = arm_current_el(env);
     int rt;
+    static unsigned gxf_abort_event_log;
+    static unsigned gxf_enter_event_log;
 
     if (arm_is_guarded(env)) {
         addr = env->gxf.vbar_gl[new_el];
@@ -8653,6 +8668,62 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
         addr += 0x200;
     }
 
+    if (cs->cpu_index > 0 && cs->cpu_index < current_machine->smp.cpus) {
+        /* Diagnostic: secondary AP cores' first exceptions (SMP bring-up) */
+        static unsigned ap2_exc_log;
+        if (__atomic_fetch_add(&ap2_exc_log, 1, __ATOMIC_RELAXED) < 60) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ap-exc: cpu%d excp=%d pc=%016" PRIx64 " el=%u->%u"
+                          " syn=%08x va=%016" PRIx64 " guarded=%d sctlr=%016"
+                          PRIx64 " lr=%016" PRIx64 "\n",
+                          cs->cpu_index, cs->exception_index, env->pc, cur_el,
+                          new_el, env->exception.syndrome,
+                          env->exception.vaddress, arm_is_guarded(env),
+                          env->cp15.sctlr_el[1], env->xregs[30]);
+        }
+    }
+    if (cs->cpu_index == current_machine->smp.cpus) {
+        /* Diagnostic: every exception the vresearch101 SEP core takes */
+        static unsigned sep_exc_log;
+        if (__atomic_fetch_add(&sep_exc_log, 1, __ATOMIC_RELAXED) < 200000) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sep-exc: excp=%d pc=%016" PRIx64 " el=%u->%u"
+                          " syn=%08x va=%016" PRIx64 " lr=%016" PRIx64
+                          " x0=%016" PRIx64 " x1=%016" PRIx64
+                          " x2=%016" PRIx64 " x3=%016" PRIx64
+                          " x19=%016" PRIx64 " x20=%016" PRIx64 "\n",
+                          cs->exception_index, env->pc, cur_el, new_el,
+                          env->exception.syndrome, env->exception.vaddress,
+                          env->xregs[30], env->xregs[0], env->xregs[1],
+                          env->xregs[2], env->xregs[3], env->xregs[19],
+                          env->xregs[20]);
+        }
+    }
+    if (cs->exception_index == EXCP_UDEF &&
+        env->pc >= 0xffffffff00000000ULL && cs->cpu_index != 0) {
+        /* Diagnostic: sepOS undefined instruction; dump its x20 struct */
+        static unsigned sepos_udef_log;
+        if (__atomic_fetch_add(&sepos_udef_log, 1, __ATOMIC_RELAXED) < 2) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sepos-udef: cpu%d pc=%016" PRIx64 " x20=%016"
+                          PRIx64 " syn=%08x\n", cs->cpu_index, env->pc,
+                          env->xregs[20], env->exception.syndrome);
+            for (int o = 0; o < 0x400; o += 8) {
+                uint64_t v = 0;
+                MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+                cpu_memory_rw_debug(cs, env->xregs[20] + o, &v, 8, false);
+                if (v >= 0xffff000000000000ULL) {
+                    hwaddr pa = cpu_get_phys_page_attrs_debug(
+                        cs, v & ~0xfffULL, &attrs);
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "sepos-udef: [x20+%#x]=%016" PRIx64
+                                  " pa=%016" PRIx64 "\n", o, v,
+                                  pa == -1 ? pa : pa | (v & 0xfff));
+                }
+            }
+        }
+    }
     switch (cs->exception_index) {
     case EXCP_GPC:
         qemu_log_mask(CPU_LOG_INT, "...with MFAR 0x%" PRIx64 "\n",
@@ -8661,10 +8732,51 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     case EXCP_GXF_ABORT:
         addr = env->gxf.gxf_abort_el[new_el];
         genter = true;
+        if (cs->cpu_index == 0 &&
+            __atomic_fetch_add(&gxf_abort_event_log, 1,
+                               __ATOMIC_RELAXED) < 32) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "gxf: abort event pc=%016" PRIx64
+                          " el=%u guarded=%d x0=%016" PRIx64
+                          " x16=%016" PRIx64 " syndrome=%08x\n",
+                          env->pc, cur_el, arm_is_guarded(env), env->xregs[0],
+                          env->xregs[16], env->exception.syndrome);
+        }
         /* fall through */
     EXC_ABORT:
     case EXCP_PREFETCH_ABORT:
     case EXCP_DATA_ABORT:
+        if (env->pc >= 0x02000000 && env->pc < 0x02080000) {
+            /* Diagnostic: aborts in the vresearch101 SEP ROM */
+            MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+            hwaddr pa = cpu_get_phys_page_attrs_debug(
+                cs, env->exception.vaddress, &attrs);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sep-abort: cpu%d excp=%d pc=%016" PRIx64
+                          " va=%016" PRIx64 " pa=%016" PRIx64
+                          " esr=%08x\n", cs->cpu_index, cs->exception_index,
+                          env->pc, env->exception.vaddress, pa,
+                          env->exception.syndrome);
+        }
+        if (cs->exception_index == EXCP_DATA_ABORT &&
+            cs->cpu_index == 0 && env->exception.vaddress >= 0xfffffe0000000000ULL) {
+            static unsigned high_va_abort_log;
+            if (__atomic_fetch_add(&high_va_abort_log, 1,
+                                   __ATOMIC_RELAXED) < 32) {
+                MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+                hwaddr pa = cpu_get_phys_page_attrs_debug(
+                    cs, env->exception.vaddress, &attrs);
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "arm-exception: data abort pc=%016" PRIx64
+                              " va=%016" PRIx64 " pa=%016" PRIx64
+                              " esr=%08x secure=%u space=%u user=%u memory=%u"
+                              " pstate=%08x guarded=%d\n",
+                              env->pc, env->exception.vaddress, pa,
+                              env->exception.syndrome, attrs.secure,
+                              attrs.space, attrs.user, attrs.memory,
+                              pstate_read(env), arm_is_guarded(env));
+            }
+        }
         /*
          * FEAT_DoubleFault allows synchronous external aborts taken to EL3
          * to be taken to the SError vector entrypoint.
@@ -8749,6 +8861,24 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     case EXCP_GENTER:
         addr = env->gxf.gxf_enter_el[new_el];
         genter = true;
+        env->gxf.esr_gl[new_el] = env->exception.syndrome;
+        if (cs->cpu_index == 0 && (env->xregs[16] >> 48) != 0 &&
+            __atomic_fetch_add(&gxf_enter_event_log, 1,
+                               __ATOMIC_RELAXED) < 32) {
+            uint32_t insn = 0;
+
+            cpu_memory_rw_debug(cs, env->pc - 4, (uint8_t *)&insn,
+                                sizeof(insn), false);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "gxf: tagged enter pc=%016" PRIx64
+                          " insn=%08x el=%u guarded=%d x0=%016" PRIx64
+                          " x1=%016" PRIx64 " x4=%016" PRIx64
+                          " x16=%016" PRIx64 " rd=%u syndrome=%08x\n",
+                          env->pc, insn, cur_el, arm_is_guarded(env),
+                          env->xregs[0], env->xregs[1], env->xregs[4],
+                          env->xregs[16], env->exception.syndrome & 0xffff,
+                          env->exception.syndrome);
+        }
         break;
     case EXCP_VSERR:
         addr += 0x180;
@@ -8766,6 +8896,17 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 
     if (is_a64(env)) {
         old_mode = pstate_read(env);
+        if (genter || arm_is_guarded(env)) {
+            qemu_log_mask(CPU_LOG_INT,
+                          "GXF enter cpu%d EL%d pc=%016" PRIx64
+                          " pstate=%x sp=%016" PRIx64
+                          " sp0=%016" PRIx64 " sp1=%016" PRIx64
+                          " gl1=%016" PRIx64 " elr=%016" PRIx64
+                          " abort=%d\n",
+                          cs->cpu_index, cur_el, env->pc, old_mode, env->xregs[31],
+                          env->sp_el[0], env->sp_el[1], env->gxf.sp_gl[1],
+                          env->gxf.elr_gl[new_el], genter);
+        }
         aarch64_save_sp(env, arm_current_el(env));
 
         if (genter || arm_is_guarded(env)) {
@@ -8855,6 +8996,15 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     env->gxf.gxf_status_el[new_el] |= genter;
     env->aarch64 = true;
     aarch64_restore_sp(env, new_el);
+    if (genter) {
+        qemu_log_mask(CPU_LOG_INT,
+                      "GXF handler cpu%d EL%d pc=%016" PRIx64
+                      " pstate=%x sp=%016" PRIx64
+                      " sp0=%016" PRIx64 " sp1=%016" PRIx64
+                      " gl1=%016" PRIx64 "\n",
+                      cs->cpu_index, new_el, env->pc, pstate_read(env), env->xregs[31],
+                      env->sp_el[0], env->sp_el[1], env->gxf.sp_gl[1]);
+    }
 
     if (tcg_enabled()) {
         helper_rebuild_hflags_a64(env, new_el);

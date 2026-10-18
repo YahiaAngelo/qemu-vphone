@@ -47,6 +47,7 @@ struct USBHubState {
     USBEndpoint *intr;
     uint32_t num_ports;
     bool port_power;
+    uint32_t nonremovable;  /* bit n: port n+1's device is not removable */
     QEMUTimer *port_timer;
     USBHubPort ports[MAX_PORTS];
 };
@@ -183,7 +184,13 @@ static bool usb_hub_port_set(USBHubPort *port, uint16_t status)
         return false;
     }
     port->wPortStatus |= status;
-    return usb_hub_port_change(port, status);
+    /*
+     * C_PORT_ENABLE reports a port the hub disabled on an error (USB 2.0
+     * 11.24.2.7.2.2), never one a reset enabled: that completion is C_PORT_RESET.
+     * iOS's hub driver takes a C_PORT_ENABLE after the reset as an error and
+     * resets and re-addresses the device again, without end (vphone-linux).
+     */
+    return usb_hub_port_change(port, status & ~PORT_STAT_ENABLE);
 }
 
 static bool usb_hub_port_clear(USBHubPort *port, uint16_t status)
@@ -500,7 +507,8 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
             /* fill DeviceRemovable bits */
             limit = DIV_ROUND_UP(s->num_ports + 1, 8) + 7;
             for (n = 7; n < limit; n++) {
-                data[n] = 0x00;
+                /* bit 0 is reserved; bit p is port p */
+                data[n] = ((uint64_t)s->nonremovable << 1) >> ((n - 7) * 8);
                 var_hub_size++;
             }
 
@@ -668,6 +676,7 @@ static const VMStateDescription vmstate_usb_hub = {
 static const Property usb_hub_properties[] = {
     DEFINE_PROP_UINT32("ports", USBHubState, num_ports, 8),
     DEFINE_PROP_BOOL("port-power", USBHubState, port_power, false),
+    DEFINE_PROP_UINT32("nonremovable", USBHubState, nonremovable, 0),
 };
 
 static void usb_hub_class_initfn(ObjectClass *klass, const void *data)

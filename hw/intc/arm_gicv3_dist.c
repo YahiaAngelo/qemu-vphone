@@ -895,6 +895,11 @@ MemTxResult gicv3_dist_write(void *opaque, hwaddr offset, uint64_t data,
     GICv3State *s = (GICv3State *)opaque;
     bool r;
 
+    if (s->first_cpu_index) {
+        /* Diagnostic: the vresearch101 SEP core's private GIC */
+        qemu_log_mask(LOG_GUEST_ERROR, "sep-gicd: write 0x%04" HWADDR_PRIx
+                      " <- 0x%" PRIx64 " size %u\n", offset, data, size);
+    }
     switch (size) {
     case 1:
         r = gicd_writeb(s, offset, data, attrs);

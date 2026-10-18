@@ -17,6 +17,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "kvm-consts.h"
@@ -80,6 +81,11 @@ void arm_handle_psci_call(ARMCPU *cpu)
         param[i] = is_a64(env) ? env->xregs[i] : env->regs[i];
     }
 
+    /* Diagnostic: every PSCI call (vresearch101 SMP bring-up) */
+    qemu_log_mask(LOG_GUEST_ERROR, "psci: cpu%d fn=0x%" PRIx64 " x1=0x%" PRIx64
+                  " x2=0x%" PRIx64 " x3=0x%" PRIx64 " pc=0x%" PRIx64 "\n",
+                  CPU(cpu)->cpu_index, param[0], param[1], param[2], param[3],
+                  env->pc);
     if ((param[0] & QEMU_PSCI_0_2_64BIT) && !is_a64(env)) {
         ret = QEMU_PSCI_RET_NOT_SUPPORTED;
         goto err;

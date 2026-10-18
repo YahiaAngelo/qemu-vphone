@@ -35,6 +35,7 @@ struct AppleGFXMMIOState {
     RvgIOSurfaceDevice *pgiosfc;
     /* log2 of the guest's page size; arm64 guests use 16 KiB pages */
     uint32_t guest_page_shift;
+    bool process_isolation;
 };
 
 /*
@@ -151,7 +152,7 @@ static void apple_gfx_mmio_realize(DeviceState *dev, Error **errp)
         .struct_size = sizeof(config),
         /* The IOSurface device made below maps the guest's IOSurfaces. */
         .use_iosurface_mapper = true,
-        .process_isolation = true,
+        .process_isolation = s->process_isolation,
         .callbacks = &callbacks,
         .guest_page_shift = s->guest_page_shift,
     };
@@ -208,6 +209,13 @@ static const Property apple_gfx_mmio_properties[] = {
      * The library's default is its own build's page size; on an x86_64 host
      * that would be 4 KiB, while every guest of this arm64 device uses 16.
      */
+    /*
+     * Each user task in its own host process, as on macOS. On Linux that needs
+     * every guest RAM range mapped in whole guest pages; turn it off to run
+     * the tasks in QEMU's process.
+     */
+    DEFINE_PROP_BOOL("process-isolation", AppleGFXMMIOState,
+                     process_isolation, true),
     DEFINE_PROP_UINT32("guest-page-shift", AppleGFXMMIOState,
                        guest_page_shift, 14),
 };

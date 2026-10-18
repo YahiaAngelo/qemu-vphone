@@ -43,6 +43,10 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
+    bool touch;     /* usb-touchscreen: a HID Touch Screen over the tablet's events */
+    bool vmapple_tablet;
+    uint8_t vmapple_multiplier;
+    uint8_t vmapple_smooth;
 };
 
 #define TYPE_USB_HID "usb-hid"
@@ -424,6 +428,234 @@ static const USBDesc desc_tablet2 = {
     .msos = &desc_msos_suspend,
 };
 
+/*
+ * usb-touchscreen (vphone-linux): one finger of a HID Touch Screen (Digitizer 0x0D/0x04), which
+ * an iOS guest's generic HID event driver takes as a display-integrated digitizer. Its report:
+ * tip switch and in range (bits 0 and 1), X and Y over 0..0x7fff, from the tablet's events
+ * (button 1 down is the finger touching).
+ */
+static const uint8_t qemu_touch_hid_report_descriptor[] = {
+    0x05, 0x0d,         /* Usage Page (Digitizer) */
+    0x09, 0x04,         /* Usage (Touch Screen) */
+    0xa1, 0x01,         /* Collection (Application) */
+    0x09, 0x22,         /*   Usage (Finger) */
+    0xa1, 0x02,         /*   Collection (Logical) */
+    0x09, 0x42,         /*     Usage (Tip Switch) */
+    0x09, 0x32,         /*     Usage (In Range) */
+    0x15, 0x00,         /*     Logical Minimum (0) */
+    0x25, 0x01,         /*     Logical Maximum (1) */
+    0x75, 0x01,         /*     Report Size (1) */
+    0x95, 0x02,         /*     Report Count (2) */
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
+    0x75, 0x06,         /*     Report Size (6) */
+    0x95, 0x01,         /*     Report Count (1) */
+    0x81, 0x03,         /*     Input (Constant) */
+    0x05, 0x01,         /*     Usage Page (Generic Desktop) */
+    0x09, 0x30,         /*     Usage (X) */
+    0x09, 0x31,         /*     Usage (Y) */
+    0x15, 0x00,         /*     Logical Minimum (0) */
+    0x26, 0xff, 0x7f,   /*     Logical Maximum (0x7fff) */
+    0x75, 0x10,         /*     Report Size (16) */
+    0x95, 0x02,         /*     Report Count (2) */
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
+    0xc0,               /*   End Collection */
+    0xc0,               /* End Collection */
+};
+
+static const USBDescIface desc_iface_touch = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceProtocol            = 0x00,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            .data = (uint8_t[]) {
+                0x09, USB_DT_HID, 0x11, 0x01, 0x00, 0x01, USB_DT_REPORT,
+                sizeof(qemu_touch_hid_report_descriptor), 0,
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 8,
+            .bInterval             = 4,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_touch = {
+    .bcdUSB                        = 0x0200,
+    .bMaxPacketSize0               = 64,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_TABLET,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_touch,
+        },
+    },
+};
+
+static const USBDesc desc_touch = {
+    .id = {
+        .idVendor          = 0x0627,
+        .idProduct         = 0x0002,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_TABLET,
+        .iSerialNumber     = STR_SERIAL_TABLET,
+    },
+    .full = &desc_device_touch,
+    .high = &desc_device_touch,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+/*
+ * The absolute USB pointer exposed by Virtualization.framework. The iOS
+ * AppleVirtualPlatformHIDEventDriver personality matches this HID identity.
+ * This USB device does not itself set the IOHID "Built-In" property, so it is
+ * an experiment rather than a proven replacement for the VirtIO HID bridge.
+ * Keep it separate from usb-touchscreen: it is a mouse-class pointer, not a
+ * USB digitizer.
+ */
+static const uint8_t vmapple_tablet_hid_report_descriptor[] = {
+    0x05, 0x01,             /* Usage Page (Generic Desktop) */
+    0x09, 0x02,             /* Usage (Mouse) */
+    0xa1, 0x01,             /* Collection (Application) */
+    0x85, 0x01,             /*   Report ID (1) */
+    0x09, 0x01,             /*   Usage (Pointer) */
+    0xa1, 0x00,             /*   Collection (Physical) */
+    0x05, 0x09,             /*     Usage Page (Button) */
+    0x19, 0x01,             /*     Usage Minimum (1) */
+    0x29, 0x03,             /*     Usage Maximum (3) */
+    0x15, 0x00,             /*     Logical Minimum (0) */
+    0x25, 0x01,             /*     Logical Maximum (1) */
+    0x95, 0x03,             /*     Report Count (3) */
+    0x75, 0x01,             /*     Report Size (1) */
+    0x81, 0x02,             /*     Input (Data, Variable, Absolute) */
+    0x95, 0x01,             /*     Report Count (1) */
+    0x75, 0x05,             /*     Report Size (5) */
+    0x81, 0x01,             /*     Input (Constant) */
+    0x05, 0x01,             /*     Usage Page (Generic Desktop) */
+    0x09, 0x30,             /*     Usage (X) */
+    0x09, 0x31,             /*     Usage (Y) */
+    0x15, 0x00,             /*     Logical Minimum (0) */
+    0x26, 0xff, 0x7f,       /*     Logical Maximum (0x7fff) */
+    0x75, 0x10,             /*     Report Size (16) */
+    0x95, 0x02,             /*     Report Count (2) */
+    0x81, 0x02,             /*     Input (Data, Variable, Absolute) */
+    0xa1, 0x02,             /*     Collection (Logical) */
+    0x85, 0x02,             /*       Report ID (2) */
+    0x09, 0x48,             /*       Usage (Resolution Multiplier) */
+    0x95, 0x01,             /*       Report Count (1) */
+    0x75, 0x08,             /*       Report Size (8) */
+    0x15, 0x00,             /*       Logical Minimum (0) */
+    0x25, 0x01,             /*       Logical Maximum (1) */
+    0x35, 0x01,             /*       Physical Minimum (1) */
+    0x45, 0x78,             /*       Physical Maximum (120) */
+    0xb1, 0x02,             /*       Feature (Data, Variable, Absolute) */
+    0x85, 0x01,             /*       Report ID (1) */
+    0x09, 0x38,             /*       Usage (Wheel) */
+    0x35, 0x00,             /*       Physical Minimum (0) */
+    0x45, 0x00,             /*       Physical Maximum (0) */
+    0x16, 0x01, 0x80,       /*       Logical Minimum (-0x7fff) */
+    0x26, 0xff, 0x7f,       /*       Logical Maximum (0x7fff) */
+    0x75, 0x10,             /*       Report Size (16) */
+    0x95, 0x01,             /*       Report Count (1) */
+    0x81, 0x06,             /*       Input (Data, Variable, Relative) */
+    0x05, 0x0c,             /*       Usage Page (Consumer) */
+    0x0a, 0x38, 0x02,       /*       Usage (AC Pan) */
+    0x81, 0x06,             /*       Input (Data, Variable, Relative) */
+    0x06, 0x61, 0xff,       /*       Usage Page (0xff61, vendor-defined) */
+    0x09, 0x02,             /*       Usage (2): vertical smooth scroll */
+    0x09, 0x01,             /*       Usage (1): horizontal smooth scroll */
+    0x75, 0x20,             /*       Report Size (32) */
+    0x95, 0x02,             /*       Report Count (2) */
+    0x81, 0x06,             /*       Input (Data, Variable, Relative) */
+    0x09, 0x03,             /*       Usage (3): scroll phases */
+    0x75, 0x10,             /*       Report Size (16) */
+    0x95, 0x01,             /*       Report Count (1) */
+    0x81, 0x02,             /*       Input (Data, Variable, Absolute) */
+    0x85, 0x03,             /*       Report ID (3) */
+    0x09, 0x04,             /*       Usage (4): smooth scrolling enabled */
+    0x95, 0x01,             /*       Report Count (1) */
+    0x75, 0x01,             /*       Report Size (1) */
+    0xb1, 0x02,             /*       Feature (Data, Variable, Absolute) */
+    0x95, 0x01,             /*       Report Count (1) */
+    0x75, 0x07,             /*       Report Size (7) */
+    0xb1, 0x01,             /*       Feature (Constant) */
+    0xc0,                   /*     End Collection */
+    0xc0,                   /*   End Collection */
+    0xc0,                   /* End Collection */
+};
+
+static const USBDescIface desc_iface_vmapple_tablet = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            .data = (uint8_t[]) {
+                0x09, USB_DT_HID, 0x11, 0x01, 0x00, 0x01, USB_DT_REPORT,
+                sizeof(vmapple_tablet_hid_report_descriptor), 0,
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 20,
+            .bInterval             = 4,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_vmapple_tablet = {
+    .bcdUSB                        = 0x0200,
+    .bMaxPacketSize0               = 64,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_TABLET,
+            .bmAttributes          = USB_CFG_ATT_ONE,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_vmapple_tablet,
+        },
+    },
+};
+
+static const USBDesc desc_vmapple_tablet = {
+    .id = {
+        .idVendor          = 0x05ac,
+        .idProduct         = 0x8106,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_TABLET,
+        .iSerialNumber     = STR_SERIAL_TABLET,
+    },
+    .full = &desc_device_vmapple_tablet,
+    .high = &desc_device_vmapple_tablet,
+    .str  = desc_strings,
+};
+
+#define VMAPPLE_TABLET_REPORT_INPUT       1
+#define VMAPPLE_TABLET_REPORT_MULTIPLIER  2
+#define VMAPPLE_TABLET_REPORT_SMOOTH      3
+#define VMAPPLE_TABLET_REPORT_SIZE        20
+
 static const USBDesc desc_keyboard = {
     .id = {
         .idVendor          = 0x0627,
@@ -570,7 +802,14 @@ static void usb_hid_handle_reset(USBDevice *dev)
     USBHIDState *us = USB_HID(dev);
 
     hid_reset(&us->hid);
+    if (us->vmapple_tablet) {
+        us->vmapple_multiplier = 0;
+        us->vmapple_smooth = 0;
+    }
 }
+
+static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len);
+static int usb_vmapple_tablet_poll(USBHIDState *us, uint8_t *buf, int len);
 
 static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
@@ -593,6 +832,14 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                 memcpy(data, qemu_mouse_hid_report_descriptor,
                        sizeof(qemu_mouse_hid_report_descriptor));
                 p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
+            } else if (us->vmapple_tablet) {
+                memcpy(data, vmapple_tablet_hid_report_descriptor,
+                       sizeof(vmapple_tablet_hid_report_descriptor));
+                p->actual_length = sizeof(vmapple_tablet_hid_report_descriptor);
+            } else if (us->touch) {
+                memcpy(data, qemu_touch_hid_report_descriptor,
+                       sizeof(qemu_touch_hid_report_descriptor));
+                p->actual_length = sizeof(qemu_touch_hid_report_descriptor);
             } else if (hs->kind == HID_TABLET) {
                 memcpy(data, qemu_tablet_hid_report_descriptor,
                        sizeof(qemu_tablet_hid_report_descriptor));
@@ -608,14 +855,43 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         }
         break;
     case HID_GET_REPORT:
-        if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
-            p->actual_length = hid_pointer_poll(hs, data, length);
+        if (us->vmapple_tablet) {
+            uint8_t report_type = value >> 8;
+            uint8_t report_id = value & 0xff;
+
+            if (report_type == 1 &&
+                report_id == VMAPPLE_TABLET_REPORT_INPUT) {
+                p->actual_length = usb_vmapple_tablet_poll(us, data, length);
+            } else if (report_type == 3 &&
+                       (report_id == VMAPPLE_TABLET_REPORT_MULTIPLIER ||
+                        report_id == VMAPPLE_TABLET_REPORT_SMOOTH) &&
+                       length >= 2) {
+                /* Numbered control reports include the report ID in-band. */
+                data[0] = report_id;
+                data[1] = report_id == VMAPPLE_TABLET_REPORT_MULTIPLIER
+                    ? us->vmapple_multiplier : us->vmapple_smooth;
+                p->actual_length = 2;
+            } else {
+                goto fail;
+            }
+        } else if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
+            p->actual_length = usb_hid_pointer_poll(us, data, length);
         } else if (hs->kind == HID_KEYBOARD) {
             p->actual_length = hid_keyboard_poll(hs, data, length);
         }
         break;
     case HID_SET_REPORT:
-        if (hs->kind == HID_KEYBOARD) {
+        if (us->vmapple_tablet && (value >> 8) == 3 &&
+            length >= 2 && data[0] == (value & 0xff) &&
+            (value & 0xff) >= VMAPPLE_TABLET_REPORT_MULTIPLIER &&
+            (value & 0xff) <= VMAPPLE_TABLET_REPORT_SMOOTH) {
+            if ((value & 0xff) == VMAPPLE_TABLET_REPORT_MULTIPLIER) {
+                us->vmapple_multiplier = data[1] & 1;
+            } else {
+                us->vmapple_smooth = data[1] & 1;
+            }
+            p->actual_length = length;
+        } else if (hs->kind == HID_KEYBOARD) {
             p->actual_length = hid_keyboard_write(hs, data, length);
         } else {
             goto fail;
@@ -652,6 +928,57 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     }
 }
 
+/* A pointer report: the tablet's, or a usb-touchscreen's made of it. */
+static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len)
+{
+    uint8_t tablet[8];
+    int n;
+
+    if (us->vmapple_tablet) {
+        return usb_vmapple_tablet_poll(us, buf, len);
+    }
+    if (!us->touch) {
+        return hid_pointer_poll(&us->hid, buf, len);
+    }
+    n = hid_pointer_poll(&us->hid, tablet, sizeof(tablet));
+    if (n < 5 || len < 5) {
+        return 0;
+    }
+    buf[0] = (tablet[0] & 1) ? 0x03 : 0x00;
+    memcpy(buf + 1, tablet + 1, 4);
+    return 5;
+}
+
+/*
+ * Make the QEMU absolute-pointer report look like the VZ tablet's report 1.
+ * The unimplemented scroll fields and phase are zero-filled.
+ */
+static int usb_vmapple_tablet_poll(USBHIDState *us, uint8_t *buf, int len)
+{
+    uint8_t tablet[8];
+    uint8_t report[VMAPPLE_TABLET_REPORT_SIZE] = { 0 };
+    uint16_t wheel;
+    int n;
+
+    n = hid_pointer_poll(&us->hid, tablet, sizeof(tablet));
+    if (n < 5) {
+        return 0;
+    }
+
+    report[0] = VMAPPLE_TABLET_REPORT_INPUT;
+    report[1] = tablet[0] & 0x07;
+    memcpy(report + 2, tablet + 1, 4);
+    if (n >= 6) {
+        wheel = (uint16_t)((int8_t)tablet[5] *
+                           (us->vmapple_multiplier ? 120 : 1));
+        report[6] = wheel & 0xff;
+        report[7] = wheel >> 8;
+    }
+    len = MIN(len, VMAPPLE_TABLET_REPORT_SIZE);
+    memcpy(buf, report, len);
+    return len;
+}
+
 static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBHIDState *us = USB_HID(dev);
@@ -671,7 +998,7 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
             }
             hid_set_next_idle(hs);
             if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
-                len = hid_pointer_poll(hs, buf, p->iov.size);
+                len = usb_hid_pointer_poll(us, buf, p->iov.size);
             } else if (hs->kind == HID_KEYBOARD) {
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
             }
@@ -729,6 +1056,19 @@ static void usb_tablet_realize(USBDevice *dev, Error **errp)
 {
 
     usb_hid_initfn(dev, HID_TABLET, &desc_tablet, &desc_tablet2, errp);
+}
+
+static void usb_touch_realize(USBDevice *dev, Error **errp)
+{
+    USB_HID(dev)->touch = true;
+    usb_hid_initfn(dev, HID_TABLET, &desc_touch, &desc_touch, errp);
+}
+
+static void usb_vmapple_tablet_realize(USBDevice *dev, Error **errp)
+{
+    USB_HID(dev)->vmapple_tablet = true;
+    usb_hid_initfn(dev, HID_TABLET, &desc_vmapple_tablet,
+                   &desc_vmapple_tablet, errp);
 }
 
 static void usb_mouse_realize(USBDevice *dev, Error **errp)
@@ -817,6 +1157,43 @@ static const TypeInfo usb_tablet_info = {
     .class_init    = usb_tablet_class_initfn,
 };
 
+static void usb_touch_class_initfn(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_touch_realize;
+    uc->product_desc   = "QEMU USB Touchscreen";
+    dc->vmsd = &vmstate_usb_ptr;
+    device_class_set_props(dc, usb_tablet_properties);
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_touch_info = {
+    .name          = "usb-touchscreen",
+    .parent        = TYPE_USB_HID,
+    .class_init    = usb_touch_class_initfn,
+};
+
+static void usb_vmapple_tablet_class_initfn(ObjectClass *klass,
+                                            const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_vmapple_tablet_realize;
+    uc->product_desc   = "QEMU VZ-compatible USB Tablet";
+    dc->vmsd = &vmstate_usb_ptr;
+    device_class_set_props(dc, usb_tablet_properties);
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_vmapple_tablet_info = {
+    .name          = "usb-vmapple-tablet",
+    .parent        = TYPE_USB_HID,
+    .class_init    = usb_vmapple_tablet_class_initfn,
+};
+
 static const Property usb_mouse_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
 };
@@ -866,6 +1243,8 @@ static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
     type_register_static(&usb_tablet_info);
+    type_register_static(&usb_touch_info);
+    type_register_static(&usb_vmapple_tablet_info);
     usb_legacy_register("usb-tablet", "tablet", NULL);
     type_register_static(&usb_mouse_info);
     usb_legacy_register("usb-mouse", "mouse", NULL);
