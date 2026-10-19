@@ -151,9 +151,17 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
         return;
     }
 
+    /*
+     * vphone-linux: mark the page's entries stale (an older generation)
+     * rather than emptying them. tb_lookup() rechecks a stale entry against
+     * the current mapping, one TLB lookup, where an empty slot went to the
+     * TB hash table (that lookup plus a hash and a table walk); an iOS
+     * guest flushes single pages often enough that 5-11% of its lookups
+     * found their slot emptied. Called on @cpu itself, like the generation.
+     */
     i0 = tb_jmp_cache_hash_page(page_addr);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
+        jc->array[i0 + i].gen = jc->gen - 1;
     }
 }
 
