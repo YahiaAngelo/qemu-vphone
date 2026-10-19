@@ -22,7 +22,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(VHostVSockCommon, VHOST_VSOCK_COMMON)
 enum {
     VHOST_VSOCK_SAVEVM_VERSION = 0,
 
-    VHOST_VSOCK_QUEUE_SIZE = 128,
+    /*
+     * vphone-linux: 256, not 128. An iOS guest's virtio driver assumes its
+     * ring memory is page aligned: it places the used ring at the descriptor
+     * table's page + 4 KiB. Its allocator serves a block under a page from a
+     * zone, sometimes ending at page offset 0xff0 (a 128-entry table at
+     * 0x7f0, a 64-entry one at 0xbf0), so the avail ring crossed into the
+     * used ring's page, the two overlapped, and the transmit queue stalled:
+     * every vsock connection timed out, about one boot in five. A 256-entry
+     * descriptor table is a whole page, which the allocator page-aligns.
+     */
+    VHOST_VSOCK_QUEUE_SIZE = 256,
 };
 
 struct VHostVSockCommon {
