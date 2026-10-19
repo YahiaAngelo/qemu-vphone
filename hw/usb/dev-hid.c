@@ -935,8 +935,14 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         p->actual_length = 1;
         break;
     case HID_SET_IDLE:
+        /*
+         * vphone-linux: remember the idle rate (GET_IDLE answers it) but do
+         * not repeat unchanged reports. iOS sets 24 ms on the keyboard, so
+         * an idle VM sent ~42 "no keys" reports a second for backboardd and
+         * the HID driver to process (about a fifth of a vCPU at rest).
+         * HID reports are state: a repeat says nothing new.
+         */
         hs->idle = (uint8_t) (value >> 8);
-        hid_set_next_idle(hs);
         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
             hid_pointer_activate(hs);
         }
@@ -1076,7 +1082,6 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
                 p->status = USB_RET_NAK;
                 return;
             }
-            hid_set_next_idle(hs);
             if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
                 len = usb_hid_pointer_poll(us, buf, p->iov.size);
             } else if (hs->kind == HID_KEYBOARD) {
