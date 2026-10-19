@@ -211,7 +211,8 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
-static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu, TCGTBCPUState s,
+                                              const void **tc_ptr)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
@@ -226,11 +227,12 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == s.pc &&
-               tb->cs_base == s.cs_base &&
-               tb->flags == s.flags &&
-               tb_cflags(tb) == s.cflags)) {
+               jc->array[hash].cs_base == s.cs_base &&
+               jc->array[hash].flags == s.flags &&
+               jc->array[hash].cflags == s.cflags)) {
         if (likely(jc->array[hash].gen == jc->gen)) {
-            goto hit;
+            *tc_ptr = jc->array[hash].tc_ptr;
+            return tb;
         }
         /*
          * From before a TLB flush: still right if the pc maps to the code
@@ -248,9 +250,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         return NULL;
     }
 
-    jc->array[hash].pc = s.pc;
-    jc->array[hash].gen = jc->gen;
-    qatomic_set(&jc->array[hash].tb, tb);
+    tb_jmp_cache_fill(jc, hash, s.pc, tb);
 
 hit:
     /*
@@ -258,7 +258,15 @@ hit:
      * the virtual PC has to match for non-CF_PCREL translations.
      */
     assert((tb_cflags(tb) & CF_PCREL) || tb->pc == s.pc);
+    *tc_ptr = tb->tc.ptr;
     return tb;
+}
+
+static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+{
+    const void *tc_ptr;
+
+    return tb_lookup_ptr(cpu, s, &tc_ptr);
 }
 
 static void log_cpu_exec(vaddr pc, CPUState *cpu,
@@ -387,7 +395,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
-    tb = tb_lookup(cpu, s);
+    const void *tc_ptr;
+
+    tb = tb_lookup_ptr(cpu, s, &tc_ptr);
     if (tb == NULL) {
         return tcg_code_gen_epilogue;
     }
@@ -396,7 +406,7 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         log_cpu_exec(s.pc, cpu, tb);
     }
 
-    return tb->tc.ptr;
+    return tc_ptr;
 }
 
 /* Return the current PC from CPU, which may be cached in TB. */
@@ -944,9 +954,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  */
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
-                jc->array[h].pc = s.pc;
-                jc->array[h].gen = jc->gen;
-                qatomic_set(&jc->array[h].tb, tb);
+                tb_jmp_cache_fill(jc, h, s.pc, tb);
             }
 
             /*
