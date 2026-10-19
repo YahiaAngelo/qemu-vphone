@@ -1958,3 +1958,32 @@ uint64_t HELPER(wkdmd)(CPUARMState *env, uint64_t vaddr_in, uint64_t vaddr_out)
 
     return 0x3000;
 }
+
+/*
+ * vphone diagnostic (VPHONE_LOOKUP_STATS=1): counts, per vCPU thread, why
+ * translated code ends in a lookup_and_goto_ptr (the reasons in
+ * translate-a64.c), logged (LOG_GUEST_ERROR) every 2^24 lookups of a thread.
+ */
+static const char *const vphone_lookup_names[] = {
+    "other", "br", "blr", "ret", "braz", "blraz", "reta", "bra", "blra",
+    "nochain", "fallthrough-page", "direct-branch-page",
+};
+static __thread uint64_t vphone_lookup_counts[12];
+static __thread uint64_t vphone_lookup_total;
+
+void HELPER(vphone_lookup_stat)(uint32_t reason)
+{
+    if (reason >= ARRAY_SIZE(vphone_lookup_counts)) {
+        reason = 0;
+    }
+    vphone_lookup_counts[reason]++;
+    if (!(++vphone_lookup_total & ((1u << 24) - 1))) {
+        g_autoptr(GString) line = g_string_new("lookupstat");
+        g_string_append_printf(line, " cpu=%d", current_cpu ? current_cpu->cpu_index : -1);
+        for (int i = 0; i < ARRAY_SIZE(vphone_lookup_counts); i++) {
+            g_string_append_printf(line, " %s=%" PRIu64, vphone_lookup_names[i],
+                                   vphone_lookup_counts[i]);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR, "%s\n", line->str);
+    }
+}

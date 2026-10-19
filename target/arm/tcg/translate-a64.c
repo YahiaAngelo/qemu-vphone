@@ -443,6 +443,19 @@ static void gen_step_complete_exception(DisasContext *s)
     s->base.is_jmp = DISAS_NORETURN;
 }
 
+static void vphone_gen_lookup_stat(DisasContext *s, int reason)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_LOOKUP_STATS");
+        on = e && *e && *e != '0';
+    }
+    if (on) {
+        gen_helper_vphone_lookup_stat(tcg_constant_i32(reason));
+    }
+}
+
 static inline bool use_goto_tb(DisasContext *s, uint64_t dest)
 {
     if (s->ss_active) {
@@ -476,6 +489,7 @@ static void gen_goto_tb(DisasContext *s, int n, int64_t diff)
         if (s->ss_active) {
             gen_step_complete_exception(s);
         } else {
+            vphone_gen_lookup_stat(s, n == 1 && diff == 4 ? 10 : 11);
             tcg_gen_lookup_and_goto_ptr();
             s->base.is_jmp = DISAS_NORETURN;
         }
@@ -1710,6 +1724,7 @@ static void set_btype_for_blr(DisasContext *s)
 
 static bool trans_BR(DisasContext *s, arg_r *a)
 {
+    s->vphone_lookup_reason = 1;
     set_btype_for_br(s, a->rn);
     gen_a64_set_pc(s, cpu_reg(s, a->rn));
     s->base.is_jmp = DISAS_JUMP;
@@ -1718,6 +1733,7 @@ static bool trans_BR(DisasContext *s, arg_r *a)
 
 static bool trans_BLR(DisasContext *s, arg_r *a)
 {
+    s->vphone_lookup_reason = 2;
     TCGv_i64 dst = cpu_reg(s, a->rn);
     TCGv_i64 lr = cpu_reg(s, 30);
     if (a->rn == 30) {
@@ -1734,6 +1750,7 @@ static bool trans_BLR(DisasContext *s, arg_r *a)
 
 static bool trans_RET(DisasContext *s, arg_r *a)
 {
+    s->vphone_lookup_reason = 3;
     gen_a64_set_pc(s, cpu_reg(s, a->rn));
     s->base.is_jmp = DISAS_JUMP;
     return true;
@@ -1763,6 +1780,7 @@ static TCGv_i64 auth_branch_target(DisasContext *s, TCGv_i64 dst,
 
 static bool trans_BRAZ(DisasContext *s, arg_braz *a)
 {
+    s->vphone_lookup_reason = 4;
     TCGv_i64 dst;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
@@ -1778,6 +1796,7 @@ static bool trans_BRAZ(DisasContext *s, arg_braz *a)
 
 static bool trans_BLRAZ(DisasContext *s, arg_braz *a)
 {
+    s->vphone_lookup_reason = 5;
     TCGv_i64 dst, lr;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
@@ -1800,6 +1819,7 @@ static bool trans_BLRAZ(DisasContext *s, arg_braz *a)
 
 static bool trans_RETA(DisasContext *s, arg_reta *a)
 {
+    s->vphone_lookup_reason = 6;
     TCGv_i64 dst;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
@@ -1814,6 +1834,7 @@ static bool trans_RETA(DisasContext *s, arg_reta *a)
 
 static bool trans_BRA(DisasContext *s, arg_bra *a)
 {
+    s->vphone_lookup_reason = 7;
     TCGv_i64 dst;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
@@ -1828,6 +1849,7 @@ static bool trans_BRA(DisasContext *s, arg_bra *a)
 
 static bool trans_BLRA(DisasContext *s, arg_bra *a)
 {
+    s->vphone_lookup_reason = 8;
     TCGv_i64 dst, lr;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
@@ -10442,8 +10464,11 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             break;
         case DISAS_UPDATE_NOCHAIN:
             gen_a64_update_pc(dc, 4);
-            /* fall through */
+            vphone_gen_lookup_stat(dc, 9);
+            tcg_gen_lookup_and_goto_ptr();
+            break;
         case DISAS_JUMP:
+            vphone_gen_lookup_stat(dc, dc->vphone_lookup_reason);
             tcg_gen_lookup_and_goto_ptr();
             break;
         case DISAS_NORETURN:

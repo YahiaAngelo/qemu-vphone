@@ -108,6 +108,8 @@ typedef struct DisasContext {
      * single-step support).
      */
     bool ss_active;
+    /* vphone diagnostic (VPHONE_LOOKUP_STATS): why the TB ends in a lookup. */
+    int vphone_lookup_reason;
     bool pstate_ss;
     /* True if the insn just emitted was a load-exclusive instruction
      * (necessary for syndrome information for single step exceptions),
