@@ -2343,45 +2343,6 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     }
 
     if (ptw->in_prot_check & ~result->f.prot) {
-        if (access_type == MMU_DATA_STORE) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "arm-ptw: write permission fault va=%016" PRIx64
-                          " level=%d desc=%016" PRIx64 " attrs=%016" PRIx64
-                          " ap=%d xn=%d pxn=%d sprr=%d guarded=%d"
-                          " perm=%016" PRIx64 " el0perm=%016" PRIx64
-                          " prot=%x need=%x"
-                          " pc=%016" PRIx64 " sp=%016" PRIx64
-                          " sp_el1=%016" PRIx64 " sp_gl1=%016" PRIx64
-                          " pstate=%x x0=%016" PRIx64 " x1=%016" PRIx64
-                          " x2=%016" PRIx64 " x3=%016" PRIx64 "\n",
-                          address, level, descriptor, attrs, ap, xn, pxn,
-                          arm_is_sprr_enabled(env), arm_is_guarded(env),
-                          env->sprr.sprr_el_br_el1[el][el],
-                          env->sprr.sprr_el_br_el1[0][0],
-                           result->f.prot, ptw->in_prot_check, env->pc,
-                           env->xregs[31], env->sp_el[1], env->gxf.sp_gl[1],
-                           pstate_read(env), env->xregs[0], env->xregs[1],
-                           env->xregs[2], env->xregs[3]);
-            if (level == 3 && ptw->out_host) {
-                uint64_t index = extract64(address, 12, stride + 3);
-                int first = -(int)MIN(index, 16ULL);
-
-                for (int i = first; i <= 16; i++) {
-                    uint64_t neighbor = ldq_le_p((uint8_t *)ptw->out_host + i * 8);
-                    uint64_t va = (address & ~0xfffULL) + (int64_t)i * 0x1000;
-
-                    qemu_log_mask(LOG_GUEST_ERROR,
-                                  "arm-ptw: neighbor va=%016" PRIx64
-                                  " pte=%016" PRIx64 " pa=%016" PRIx64
-                                  " ap=%u UXN=%u PXN=%u\n",
-                                  va, neighbor,
-                                  neighbor & (uint64_t)0x0000fffffffff000ULL,
-                                  (unsigned)extract64(neighbor, 6, 2),
-                                  (unsigned)extract64(neighbor, 54, 1),
-                                  (unsigned)extract64(neighbor, 53, 1));
-                }
-            }
-        }
         fi->type = ARMFault_Permission;
         goto do_fault;
     }

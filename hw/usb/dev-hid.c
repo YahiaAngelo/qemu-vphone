@@ -31,6 +31,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "hw/input/hid.h"
 #include "hw/usb/hid.h"
 #include "hw/qdev-properties.h"
@@ -44,6 +45,9 @@ struct USBHIDState {
     char *display;
     uint32_t head;
     bool touch;     /* usb-touchscreen: a HID Touch Screen over the tablet's events */
+    /* usb-touchscreen Home shortcuts (touch_home_check): the last buttons and the press's start. */
+    uint8_t touch_buttons;
+    uint16_t touch_start_y;
     bool vmapple_tablet;
     uint8_t vmapple_multiplier;
     uint8_t vmapple_smooth;
@@ -56,6 +60,7 @@ enum {
     STR_MANUFACTURER = 1,
     STR_PRODUCT_MOUSE,
     STR_PRODUCT_TABLET,
+    STR_PRODUCT_TOUCH,
     STR_PRODUCT_KEYBOARD,
     STR_SERIAL_COMPAT,
     STR_CONFIG_MOUSE,
@@ -70,6 +75,7 @@ static const USBDescStrings desc_strings = {
     [STR_MANUFACTURER]     = "QEMU",
     [STR_PRODUCT_MOUSE]    = "QEMU USB Mouse",
     [STR_PRODUCT_TABLET]   = "QEMU USB Tablet",
+    [STR_PRODUCT_TOUCH]    = "Virtual USB Touch Screen",
     [STR_PRODUCT_KEYBOARD] = "QEMU USB Keyboard",
     [STR_SERIAL_COMPAT]    = "42",
     [STR_CONFIG_MOUSE]     = "HID Mouse",
@@ -429,36 +435,49 @@ static const USBDesc desc_tablet2 = {
 };
 
 /*
- * usb-touchscreen (vphone-linux): one finger of a HID Touch Screen (Digitizer 0x0D/0x04), which
- * an iOS guest's generic HID event driver takes as a display-integrated digitizer. Its report:
- * tip switch and in range (bits 0 and 1), X and Y over 0..0x7fff, from the tablet's events
- * (button 1 down is the finger touching).
+ * usb-touchscreen (vphone-linux): Virtualization.framework's USB touchscreen report descriptor
+ * (com.apple.Virtualization.VirtualMachine, macOS 27): a Touch Screen of four Finger
+ * collections, each a 6-bit transducer index, In Range and Touch, and X and Y over 0..0x7fff.
+ * The tablet's events drive finger 0 (button 1 down is the finger touching); fingers 1-3
+ * stay out of range. iOS's gestures (the home swipe among them) follow a finger by its
+ * transducer index, which the earlier single-finger Tip Switch report did not carry.
  */
+#define TOUCH_FINGER \
+    0x05, 0x0d,         /*   Usage Page (Digitizer) */ \
+    0x09, 0x22,         /*   Usage (Finger) */ \
+    0xa1, 0x02,         /*   Collection (Logical) */ \
+    0x09, 0x38,         /*     Usage (Transducer Index) */ \
+    0x75, 0x06,         /*     Report Size (6) */ \
+    0x95, 0x01,         /*     Report Count (1) */ \
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */ \
+    0x09, 0x32,         /*     Usage (In Range) */ \
+    0x09, 0x33,         /*     Usage (Touch) */ \
+    0x15, 0x00,         /*     Logical Minimum (0) */ \
+    0x25, 0x01,         /*     Logical Maximum (1) */ \
+    0x75, 0x01,         /*     Report Size (1) */ \
+    0x95, 0x02,         /*     Report Count (2) */ \
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */ \
+    0x05, 0x01,         /*     Usage Page (Generic Desktop) */ \
+    0x09, 0x30,         /*     Usage (X) */ \
+    0x09, 0x31,         /*     Usage (Y) */ \
+    0x15, 0x00,         /*     Logical Minimum (0) */ \
+    0x26, 0xff, 0x7f,   /*     Logical Maximum (0x7fff) */ \
+    0x75, 0x10,         /*     Report Size (16) */ \
+    0x95, 0x02,         /*     Report Count (2) */ \
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */ \
+    0xc0                /*   End Collection */
+
+#define TOUCH_FINGERS 4
+#define TOUCH_REPORT_SIZE (TOUCH_FINGERS * 5)
+
 static const uint8_t qemu_touch_hid_report_descriptor[] = {
     0x05, 0x0d,         /* Usage Page (Digitizer) */
     0x09, 0x04,         /* Usage (Touch Screen) */
     0xa1, 0x01,         /* Collection (Application) */
-    0x09, 0x22,         /*   Usage (Finger) */
-    0xa1, 0x02,         /*   Collection (Logical) */
-    0x09, 0x42,         /*     Usage (Tip Switch) */
-    0x09, 0x32,         /*     Usage (In Range) */
-    0x15, 0x00,         /*     Logical Minimum (0) */
-    0x25, 0x01,         /*     Logical Maximum (1) */
-    0x75, 0x01,         /*     Report Size (1) */
-    0x95, 0x02,         /*     Report Count (2) */
-    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
-    0x75, 0x06,         /*     Report Size (6) */
-    0x95, 0x01,         /*     Report Count (1) */
-    0x81, 0x03,         /*     Input (Constant) */
-    0x05, 0x01,         /*     Usage Page (Generic Desktop) */
-    0x09, 0x30,         /*     Usage (X) */
-    0x09, 0x31,         /*     Usage (Y) */
-    0x15, 0x00,         /*     Logical Minimum (0) */
-    0x26, 0xff, 0x7f,   /*     Logical Maximum (0x7fff) */
-    0x75, 0x10,         /*     Report Size (16) */
-    0x95, 0x02,         /*     Report Count (2) */
-    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
-    0xc0,               /*   End Collection */
+    TOUCH_FINGER,
+    TOUCH_FINGER,
+    TOUCH_FINGER,
+    TOUCH_FINGER,
     0xc0,               /* End Collection */
 };
 
@@ -480,7 +499,7 @@ static const USBDescIface desc_iface_touch = {
         {
             .bEndpointAddress      = USB_DIR_IN | 0x01,
             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-            .wMaxPacketSize        = 8,
+            .wMaxPacketSize        = TOUCH_REPORT_SIZE,
             .bInterval             = 4,
         },
     },
@@ -503,13 +522,14 @@ static const USBDescDevice desc_device_touch = {
     },
 };
 
+/* VZ's touchscreen's identity: Apple, 0x8108, "Virtual USB Touch Screen". */
 static const USBDesc desc_touch = {
     .id = {
-        .idVendor          = 0x0627,
-        .idProduct         = 0x0002,
+        .idVendor          = 0x05ac,
+        .idProduct         = 0x8108,
         .bcdDevice         = 0,
         .iManufacturer     = STR_MANUFACTURER,
-        .iProduct          = STR_PRODUCT_TABLET,
+        .iProduct          = STR_PRODUCT_TOUCH,
         .iSerialNumber     = STR_SERIAL_TABLET,
     },
     .full = &desc_device_touch,
@@ -928,6 +948,58 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     }
 }
 
+/*
+ * usb-touchscreen Home shortcuts (vphone-linux). iOS's home swipe does not start from this
+ * touchscreen (Control Center's top-edge swipe does), so the device sends the guest keyboard's
+ * Cmd+H, iOS's Home shortcut, for a drag that starts on the bottom edge and ends at least 12% of
+ * the screen higher, and for a middle click. VPHONE_TOUCH_HOME=0 turns both off.
+ */
+#define TOUCH_EDGE_Y (0x7fff - 0x7fff / 100)   /* the bottom 1% */
+#define TOUCH_HOME_RISE (0x7fff * 12 / 100)
+
+static void touch_send_home_bh(void *opaque)
+{
+    qemu_input_event_send_key_qcode(NULL, Q_KEY_CODE_META_L, true);
+    qemu_input_event_send_key_qcode(NULL, Q_KEY_CODE_H, true);
+    qemu_input_event_send_key_qcode(NULL, Q_KEY_CODE_H, false);
+    qemu_input_event_send_key_qcode(NULL, Q_KEY_CODE_META_L, false);
+}
+
+/*
+ * After the touchscreen's packet completes: the keyboard's events wake its endpoint, which must
+ * not run inside this device's packet handling.
+ */
+static void touch_send_home(void)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), touch_send_home_bh, NULL);
+}
+
+static void touch_home_check(USBHIDState *us, uint8_t buttons, uint16_t y)
+{
+    static int enabled = -1;
+    uint8_t pressed = buttons & ~us->touch_buttons;
+    uint8_t released = us->touch_buttons & ~buttons;
+
+    if (enabled < 0) {
+        const char *e = getenv("VPHONE_TOUCH_HOME");
+        enabled = !(e && e[0] == '0');
+    }
+    us->touch_buttons = buttons;
+    if (!enabled) {
+        return;
+    }
+    if (pressed & 1) {
+        us->touch_start_y = y;
+    }
+    if ((released & 1) && us->touch_start_y >= TOUCH_EDGE_Y &&
+        y + TOUCH_HOME_RISE <= us->touch_start_y) {
+        touch_send_home();
+    }
+    if (pressed & 4) {
+        touch_send_home();
+    }
+}
+
 /* A pointer report: the tablet's, or a usb-touchscreen's made of it. */
 static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len)
 {
@@ -941,12 +1013,20 @@ static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len)
         return hid_pointer_poll(&us->hid, buf, len);
     }
     n = hid_pointer_poll(&us->hid, tablet, sizeof(tablet));
-    if (n < 5 || len < 5) {
+    if (n < 5 || len < TOUCH_REPORT_SIZE) {
         return 0;
     }
-    buf[0] = (tablet[0] & 1) ? 0x03 : 0x00;
+    /* Each finger: index (bits 0-5), In Range (6), Touch (7), then X and Y. */
+    memset(buf, 0, TOUCH_REPORT_SIZE);
+    for (int i = 0; i < TOUCH_FINGERS; i++) {
+        buf[i * 5] = i;
+    }
+    if (tablet[0] & 1) {
+        buf[0] |= 0xc0;
+    }
     memcpy(buf + 1, tablet + 1, 4);
-    return 5;
+    touch_home_check(us, tablet[0], tablet[3] | (tablet[4] << 8));
+    return TOUCH_REPORT_SIZE;
 }
 
 /*
