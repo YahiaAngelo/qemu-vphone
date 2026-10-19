@@ -470,6 +470,20 @@ static void vphone_gen_lookup_stat(DisasContext *s, int reason)
  * updated pc, not a constant: A64 TBs are CF_PCREL, run at any virtual
  * address that maps their code.
  */
+/* VPHONE_RET_PREFETCH=1: at a call, prefetch the return address's jump cache entry. */
+static void vphone_gen_prefetch_ret(DisasContext *s, TCGv_i64 lr)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_RET_PREFETCH");
+        on = e && *e && *e != '0';
+    }
+    if (on) {
+        gen_helper_vphone_prefetch_ret(tcg_env, lr);
+    }
+}
+
 static bool vphone_xpage_links(void)
 {
     static int on = -1;
@@ -1707,6 +1721,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
 static bool trans_BL(DisasContext *s, arg_i *a)
 {
     gen_pc_plus_diff(s, cpu_reg(s, 30), curr_insn_len(s));
+    vphone_gen_prefetch_ret(s, cpu_reg(s, 30));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
     return true;
@@ -1813,6 +1828,7 @@ static bool trans_BLR(DisasContext *s, arg_r *a)
         dst = tmp;
     }
     gen_pc_plus_diff(s, lr, curr_insn_len(s));
+    vphone_gen_prefetch_ret(s, lr);
     set_btype_for_blr(s);
     gen_a64_set_pc(s, dst);
     s->base.is_jmp = DISAS_JUMP;
@@ -1882,6 +1898,7 @@ static bool trans_BLRAZ(DisasContext *s, arg_braz *a)
         dst = tmp;
     }
     gen_pc_plus_diff(s, lr, curr_insn_len(s));
+    vphone_gen_prefetch_ret(s, lr);
     set_btype_for_blr(s);
     gen_a64_set_pc(s, dst);
     s->base.is_jmp = DISAS_JUMP;
@@ -1934,6 +1951,7 @@ static bool trans_BLRA(DisasContext *s, arg_bra *a)
         dst = tmp;
     }
     gen_pc_plus_diff(s, lr, curr_insn_len(s));
+    vphone_gen_prefetch_ret(s, lr);
     set_btype_for_blr(s);
     gen_a64_set_pc(s, dst);
     s->base.is_jmp = DISAS_JUMP;

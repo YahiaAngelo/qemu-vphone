@@ -1987,3 +1987,11 @@ void HELPER(vphone_lookup_stat)(uint32_t reason)
         qemu_log_mask(LOG_GUEST_ERROR, "%s\n", line->str);
     }
 }
+
+void vphone_tb_jmp_cache_prefetch(CPUState *cpu, vaddr pc);
+
+/* A call's return address: its TB lookup's entry, prefetched (cpu-exec.c). */
+void HELPER(vphone_prefetch_ret)(CPUARMState *env, uint64_t ret_pc)
+{
+    vphone_tb_jmp_cache_prefetch(env_cpu(env), ret_pc);
+}

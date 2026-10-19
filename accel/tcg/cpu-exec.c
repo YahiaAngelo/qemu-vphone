@@ -278,6 +278,21 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     return tb_lookup_ptr(cpu, &s, &tc_ptr);
 }
 
+/*
+ * vphone-linux: bring the jump cache entry for @pc towards the cache, for a
+ * call's return address: by the time the callee returns, its lookup finds the
+ * entry without a miss (returns were ~58% of an iOS guest's TB lookups, and
+ * the entry load half of their cost). An entry is 48 bytes: both lines.
+ */
+void vphone_tb_jmp_cache_prefetch(CPUState *cpu, vaddr pc)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    const char *e = (const char *)&jc->array[tb_jmp_cache_hash_func(pc)];
+
+    __builtin_prefetch(e, 0, 3);
+    __builtin_prefetch(e + sizeof(jc->array[0]) - 1, 0, 3);
+}
+
 static void log_cpu_exec(vaddr pc, CPUState *cpu,
                          const TranslationBlock *tb)
 {
