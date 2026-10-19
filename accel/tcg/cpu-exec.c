@@ -211,9 +211,17 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
-static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu, TCGTBCPUState s,
+/*
+ * @sp by pointer, not value (vphone-linux): get_tb_cpu_state fills the
+ * struct with scalar stores, and copying it straight into an argument with
+ * 16-byte moves stalled store forwarding (40% of helper_lookup_tb_ptr's
+ * samples sat on that one copy on an iOS guest).
+ */
+static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
+                                              const TCGTBCPUState *sp,
                                               const void **tc_ptr)
 {
+#define s (*sp)
     TranslationBlock *tb;
     CPUJumpCache *jc;
     uint32_t hash;
@@ -261,12 +269,13 @@ hit:
     *tc_ptr = tb->tc.ptr;
     return tb;
 }
+#undef s
 
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     const void *tc_ptr;
 
-    return tb_lookup_ptr(cpu, s, &tc_ptr);
+    return tb_lookup_ptr(cpu, &s, &tc_ptr);
 }
 
 static void log_cpu_exec(vaddr pc, CPUState *cpu,
@@ -397,7 +406,7 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
     const void *tc_ptr;
 
-    tb = tb_lookup_ptr(cpu, s, &tc_ptr);
+    tb = tb_lookup_ptr(cpu, &s, &tc_ptr);
     if (tb == NULL) {
         return tcg_code_gen_epilogue;
     }
