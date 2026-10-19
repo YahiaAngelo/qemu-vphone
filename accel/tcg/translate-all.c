@@ -474,6 +474,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->jmp_list_next[0] = (uintptr_t)NULL;
     tb->jmp_list_next[1] = (uintptr_t)NULL;
     tb->jmp_dest[0] = (uintptr_t)NULL;
+    tb->vphone_jmp_host[0] = 0;
+    tb->vphone_jmp_host[1] = 0;
     tb->jmp_dest[1] = (uintptr_t)NULL;
 
     /* init original jump addresses which have been set during tcg_gen_code() */

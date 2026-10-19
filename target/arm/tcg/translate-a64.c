@@ -456,6 +456,75 @@ static void vphone_gen_lookup_stat(DisasContext *s, int reason)
     }
 }
 
+/*
+ * vphone-linux cross-page links (VPHONE_XPAGE_LINKS=1). System-mode TCG chains
+ * a direct branch only within its page: a link to another page would outlive a
+ * change of that page's mapping. On an iOS guest a third of all TB lookups
+ * are such branches (VPHONE_LOOKUP_STATS). A checked exit chains them anyway:
+ * it takes its goto_tb only while the destination, looked up in the CPU's own
+ * softmmu TLB, still translates to the host address its link was made for
+ * (tb->vphone_jmp_host[n], written by tb_add_jump before it patches the
+ * jump). Not yet linked, it exits to cpu_exec, which links it; a destination
+ * that translates elsewhere (another process's mapping, a flushed or
+ * flagged TLB entry) takes the ordinary lookup. The destination is the
+ * updated pc, not a constant: A64 TBs are CF_PCREL, run at any virtual
+ * address that maps their code.
+ */
+static bool vphone_xpage_links(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_XPAGE_LINKS");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
+static void gen_goto_tb_checked(DisasContext *s, int n)
+{
+    TCGLabel *link = gen_new_label();
+    TCGLabel *slow = gen_new_label();
+    int fi = mmuidx_to_fast_index(arm_to_core_mmu_idx(s->mmu_idx));
+    intptr_t f = offsetof(CPUNegativeOffsetState, tlb.f[fi]) -
+                 sizeof(CPUNegativeOffsetState);
+    TCGv_i64 want = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+    TCGv_i64 tag = tcg_temp_new_i64();
+    TCGv_ptr table = tcg_temp_new_ptr();
+    TCGv_ptr entry = tcg_temp_new_ptr();
+
+    tcg_gen_ld_i64(want, tcg_constant_ptr(&s->base.tb->vphone_jmp_host[n]), 0);
+    tcg_gen_brcondi_i64(TCG_COND_EQ, want, 0, link);
+
+    /* entry = table + ((pc >> (page_bits - entry_bits)) & mask) */
+    tcg_gen_shri_i64(t, cpu_pc, TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+    tcg_gen_ld_i64(tag, tcg_env, f + offsetof(CPUTLBDescFast, mask));
+    tcg_gen_and_i64(t, t, tag);
+    tcg_gen_ld_ptr(table, tcg_env, f + offsetof(CPUTLBDescFast, table));
+    tcg_gen_trunc_i64_ptr(entry, t);
+    tcg_gen_add_ptr(entry, entry, table);
+
+    /* the code comparator must be the bare page: any flag bit takes the slow way */
+    tcg_gen_ld_i64(tag, entry, offsetof(CPUTLBEntry, addr_code));
+    tcg_gen_andi_i64(t, cpu_pc, TARGET_PAGE_MASK);
+    tcg_gen_brcond_i64(TCG_COND_NE, tag, t, slow);
+
+    /* host = addend + pc, as linked */
+    tcg_gen_ld_i64(t, entry, offsetof(CPUTLBEntry, addend));
+    tcg_gen_add_i64(t, t, cpu_pc);
+    tcg_gen_brcond_i64(TCG_COND_NE, t, want, slow);
+
+    tcg_gen_goto_tb(n);
+    gen_set_label(link);
+    tcg_gen_exit_tb(s->base.tb, n);
+
+    gen_set_label(slow);
+    vphone_gen_lookup_stat(s, 11);
+    tcg_gen_lookup_and_goto_ptr();
+    s->base.is_jmp = DISAS_NORETURN;
+}
+
 static inline bool use_goto_tb(DisasContext *s, uint64_t dest)
 {
     if (s->ss_active) {
@@ -488,6 +557,8 @@ static void gen_goto_tb(DisasContext *s, int n, int64_t diff)
         gen_a64_update_pc(s, diff);
         if (s->ss_active) {
             gen_step_complete_exception(s);
+        } else if ((tb_cflags(s->base.tb) & CF_PCREL) && vphone_xpage_links()) {
+            gen_goto_tb_checked(s, n);
         } else {
             vphone_gen_lookup_stat(s, n == 1 && diff == 4 ? 10 : 11);
             tcg_gen_lookup_and_goto_ptr();

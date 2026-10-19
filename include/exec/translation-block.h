@@ -125,6 +125,13 @@ struct TranslationBlock {
     uintptr_t jmp_list_head;
     uintptr_t jmp_list_next[2];
     uintptr_t jmp_dest[2];
+    /*
+     * vphone-linux cross-page links: for a checked exit n, the host address
+     * of the destination's code when the exit was linked (0: not linked).
+     * The exit's code takes the link only while the destination still
+     * translates to it (see gen_goto_tb_checked in translate-a64.c).
+     */
+    uintptr_t vphone_jmp_host[2];
 };
 
 /* The alignment given to TranslationBlock during allocation. */

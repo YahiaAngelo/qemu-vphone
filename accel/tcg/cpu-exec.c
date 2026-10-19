@@ -614,7 +614,7 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 }
 
 static inline void tb_add_jump(TranslationBlock *tb, int n,
-                               TranslationBlock *tb_next)
+                               TranslationBlock *tb_next, uintptr_t host)
 {
     uintptr_t old;
 
@@ -632,6 +632,12 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     if (old) {
         goto out_unlock_next;
     }
+
+    /*
+     * The link's host address, for a checked cross-page exit, before the
+     * jump is patched: a CPU that sees the patched jump sees it.
+     */
+    qatomic_store_release(&tb->vphone_jmp_host[n], host);
 
     /* patch the native jump address */
     tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
@@ -969,7 +975,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
             /* See if we can patch the calling TB. */
             if (last_tb) {
-                tb_add_jump(last_tb, tb_exit, tb);
+                void *host = NULL;
+
+                get_page_addr_code_hostp(cpu_env(cpu), s.pc, &host);
+                tb_add_jump(last_tb, tb_exit, tb, (uintptr_t)host);
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
