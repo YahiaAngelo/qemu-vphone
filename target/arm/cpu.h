@@ -873,6 +873,8 @@ typedef struct CPUArchState {
     const struct arm_boot_info *boot_info;
     /* Store GICv3CPUState to access from this struct */
     void *gicv3state;
+    /* vphone-linux: where an inline jump cache prefetch stores its load. */
+    uint64_t vphone_prefetch_sink;
 } CPUARMState;
 
 static inline void set_feature(CPUARMState *env, int feature)

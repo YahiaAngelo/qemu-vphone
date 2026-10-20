@@ -478,10 +478,35 @@ static void vphone_gen_prefetch_ret(DisasContext *s, TCGv_i64 lr)
 
     if (unlikely(on < 0)) {
         const char *e = getenv("VPHONE_RET_PREFETCH");
-        on = e && *e && *e != '0';
+        on = e && *e ? atoi(e) : 0;
     }
-    if (on) {
+    if (on == 1) {
         gen_helper_vphone_prefetch_ret(tcg_env, lr);
+    } else if (on == 2) {
+        /*
+         * Inline: the return address's jump cache entry is loaded and the
+         * value stored to a sink, so nothing waits for it, but the line is
+         * in the cache when the callee returns and looks it up
+         * (helper_vphone_lookup_fast stalled on that load).
+         */
+        TCGv_i64 h = tcg_temp_new_i64(), t = tcg_temp_new_i64();
+        TCGv_ptr jc = tcg_temp_new_ptr(), e = tcg_temp_new_ptr();
+        int sh = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+
+        tcg_gen_shri_i64(t, lr, sh);
+        tcg_gen_xor_i64(t, t, lr);
+        tcg_gen_shri_i64(t, t, sh);
+        tcg_gen_andi_i64(t, t, TB_JMP_PAGE_MASK);
+        tcg_gen_shri_i64(h, lr, TB_JMP_INSN_SHIFT);
+        tcg_gen_andi_i64(h, h, TB_JMP_ADDR_MASK);
+        tcg_gen_or_i64(h, h, t);
+        tcg_gen_muli_i64(h, h, sizeof(((CPUJumpCache *)0)->array[0]));
+        tcg_gen_ld_ptr(jc, tcg_env,
+                       offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+        tcg_gen_trunc_i64_ptr(e, h);
+        tcg_gen_add_ptr(e, e, jc);
+        tcg_gen_ld_i64(t, e, offsetof(CPUJumpCache, array[0].tb));
+        tcg_gen_st_i64(t, tcg_env, offsetof(CPUARMState, vphone_prefetch_sink));
     }
 }
 
