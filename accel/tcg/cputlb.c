@@ -879,8 +879,18 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
     /*
      * For more than a few pages it takes longer to clear each page's
      * entries than to put the whole cache in doubt.
+     * vphone-linux: "a few" is 4 pages (VPHONE_JC_RANGE_PAGES), not 512:
+     * marking is 256 stale entries a page, each on a cache line of its own
+     * (48-byte entries), and an iOS guest's range flushes made that loop 3%
+     * of vCPU time; a generation bump costs one TLB lookup per entry at its
+     * next use instead.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * 2 * TB_JMP_PAGE_SIZE)) {
+    static uint64_t range_pages;
+    if (unlikely(!range_pages)) {
+        const char *e = getenv("VPHONE_JC_RANGE_PAGES");
+        range_pages = e && *e ? MAX(strtoull(e, NULL, 0), 1) : 4;
+    }
+    if (d.len >= TARGET_PAGE_SIZE * MIN(range_pages, 2 * TB_JMP_PAGE_SIZE)) {
         tcg_stale_jmp_cache(cpu);
         return;
     }
