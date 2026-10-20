@@ -750,6 +750,13 @@ static void aarch64_apple_gxf_initfn(Object *obj)
 
     aarch64_max_initfn(obj);
     SET_IDREG(&cpu->isar, ID_AA64ISAR1, REG_FIELD_DP64(GET_IDREG(&cpu->isar, ID_AA64ISAR1), ID_AA64ISAR1, APA, PauthFeat_2));
+    /*
+     * vphone-linux: no BTI. No Apple core implements FEAT_BTI, and with it
+     * advertised TCG checks guarded pages at every branch target (1.3% of
+     * an iOS guest's vCPU time: is_guarded_page, helper_guarded_page_check).
+     */
+    SET_IDREG(&cpu->isar, ID_AA64PFR1,
+              REG_FIELD_DP64(GET_IDREG(&cpu->isar, ID_AA64PFR1), ID_AA64PFR1, BT, 0));
 
     if (tcg_enabled()) {
         object_property_set_bool(obj, "pauth-noop", true, NULL);
