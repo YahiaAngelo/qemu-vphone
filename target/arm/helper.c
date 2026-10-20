@@ -2672,9 +2672,46 @@ static void vmsa_tcr_el12_write(CPUARMState *env, const ARMCPRegInfo *ri,
     raw_write(env, ri, value);
 }
 
+/*
+ * vphone-linux diagnostic: VPHONE_ASID_TRACE=<file> records every TTBR0_EL1
+ * write that changes the ASID: "<CLOCK_MONOTONIC ns> <cpu> <asid> <ttbr0>",
+ * so that host perf samples of a vCPU thread can be tagged with the guest
+ * address space that ran.
+ */
+static void vphone_asid_trace(CPUARMState *env, uint64_t value)
+{
+    static FILE *f;
+    static int on = -1;
+    static QemuMutex lock;
+
+    if (unlikely(on < 0)) {
+        const char *path = getenv("VPHONE_ASID_TRACE");
+        on = path && *path && (f = fopen(path, "w")) != NULL;
+        if (on) {
+            setvbuf(f, NULL, _IOFBF, 1 << 20);
+            qemu_mutex_init(&lock);
+        }
+    }
+    if (on) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        qemu_mutex_lock(&lock);
+        fprintf(f, "%" PRIu64 " %d %u %" PRIx64 "\n",
+                (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec,
+                env_cpu(env)->cpu_index, (unsigned)extract64(value, 48, 16),
+                value & MAKE_64BIT_MASK(0, 48));
+        qemu_mutex_unlock(&lock);
+    }
+}
+
 static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
+    if (ri->state == ARM_CP_STATE_AA64 && ri->opc1 == 0 && ri->crn == 2 &&
+        ri->crm == 0 && ri->opc2 == 0 &&
+        extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
+        vphone_asid_trace(env, value);
+    }
     /* If the ASID changes (with a 64-bit write), we must flush the TLB.  */
     if (cpreg_field_is_64bit(ri) &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
