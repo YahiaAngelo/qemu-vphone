@@ -547,17 +547,18 @@ static void gen_goto_tb_checked(DisasContext *s, int n)
  * the cache's generation; a hit jumps straight to its code, anything else
  * takes helper_lookup_tb_ptr as before. This skips the helper call and its
  * recomputation of the CPU state (arm_get_tb_cpu_state, curr_cflags) for
- * most returns. VPHONE_INLINE_LOOKUP=0 disables.
+ * most returns. VPHONE_INLINE_LOOKUP: 0 off, 1 this inline check, 2 (the
+ * default) the same check in helper_vphone_lookup_fast, a third of the code.
  */
-static bool vphone_inline_lookup(void)
+static int vphone_inline_lookup(void)
 {
-    static int on = -1;
+    static int mode = -1;
 
-    if (unlikely(on < 0)) {
+    if (unlikely(mode < 0)) {
         const char *e = getenv("VPHONE_INLINE_LOOKUP");
-        on = !(e && *e == '0');
+        mode = e && *e ? atoi(e) : 2;
     }
-    return on;
+    return mode;
 }
 
 static void vphone_gen_lookup_and_goto(DisasContext *s)
@@ -571,6 +572,11 @@ static void vphone_gen_lookup_and_goto(DisasContext *s)
 
     if (!vphone_inline_lookup() || (tb_cflags(tb) & CF_NO_GOTO_PTR)) {
         tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+    if (vphone_inline_lookup() == 2) {
+        tcg_gen_vphone_lookup_fast(tb->cs_base, tb->flags,
+                                   tb_cflags(tb) & ~CF_INVALID);
         return;
     }
     slow = gen_new_label();

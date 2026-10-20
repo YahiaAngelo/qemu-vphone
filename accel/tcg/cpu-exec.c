@@ -433,6 +433,34 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     return tc_ptr;
 }
 
+/*
+ * vphone-linux: an indirect branch's lookup with the branching TB's own
+ * cs_base, flags and cflags as arguments (such a branch changes none of
+ * them): the jump cache entry for the current pc is checked against them
+ * and the cache's generation, without recomputing the CPU state; anything
+ * else takes helper_lookup_tb_ptr. A call of three constants, a third of
+ * the inline check's code (translate-a64.c vphone_gen_lookup_and_goto).
+ */
+const void *HELPER(vphone_lookup_fast)(CPUArchState *env, uint64_t cs_base,
+                                       uint32_t flags, uint32_t cflags)
+{
+    CPUState *cpu = env_cpu(env);
+    vaddr pc = cpu->cc->get_pc(cpu);
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint32_t h = tb_jmp_cache_hash_func(pc);
+
+    if (likely(qatomic_read(&jc->array[h].tb) &&
+               jc->array[h].pc == pc &&
+               jc->array[h].cs_base == cs_base &&
+               jc->array[h].flags == flags &&
+               jc->array[h].cflags == cflags &&
+               jc->array[h].gen == jc->gen)) {
+        cpu->neg.can_do_io = true;
+        return jc->array[h].tc_ptr;
+    }
+    return HELPER(lookup_tb_ptr)(env);
+}
+
 /* Return the current PC from CPU, which may be cached in TB. */
 static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
 {

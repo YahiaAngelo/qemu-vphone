@@ -3239,6 +3239,17 @@ void tcg_gen_goto_ptr(TCGv_ptr ptr)
     tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
 }
 
+/* vphone-linux: helper_vphone_lookup_fast with the TB's state, then goto_ptr. */
+void tcg_gen_vphone_lookup_fast(uint64_t cs_base, uint32_t flags, uint32_t cflags)
+{
+    TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
+
+    gen_helper_vphone_lookup_fast(ptr, tcg_env, tcg_constant_i64(cs_base),
+                                  tcg_constant_i32(flags), tcg_constant_i32(cflags));
+    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
+    tcg_temp_free_ptr(ptr);
+}
+
 void tcg_gen_lookup_and_goto_ptr(void)
 {
     TCGv_ptr ptr;
