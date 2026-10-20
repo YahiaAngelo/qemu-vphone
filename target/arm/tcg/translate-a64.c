@@ -25,6 +25,7 @@
 #include "arm_ldst.h"
 #include "semihosting/semihost.h"
 #include "cpregs.h"
+#include "../../../accel/tcg/tb-hash.h"
 
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_pc;
@@ -537,6 +538,96 @@ static void gen_goto_tb_checked(DisasContext *s, int n)
     vphone_gen_lookup_stat(s, 11);
     tcg_gen_lookup_and_goto_ptr();
     s->base.is_jmp = DISAS_NORETURN;
+}
+
+/*
+ * vphone-linux: an indirect branch's TB lookup, inline. The jump cache entry
+ * for cpu_pc is checked in the generated code against this TB's own flags,
+ * cs_base and cflags (a BR/BLR/RET changes none of them once BTI is off) and
+ * the cache's generation; a hit jumps straight to its code, anything else
+ * takes helper_lookup_tb_ptr as before. This skips the helper call and its
+ * recomputation of the CPU state (arm_get_tb_cpu_state, curr_cflags) for
+ * most returns. VPHONE_INLINE_LOOKUP=0 disables.
+ */
+static bool vphone_inline_lookup(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_INLINE_LOOKUP");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static void vphone_gen_lookup_and_goto(DisasContext *s)
+{
+    TranslationBlock *tb = s->base.tb;
+    TCGLabel *slow;
+    TCGv_i64 h, t;
+    TCGv_ptr jc, e;
+    TCGv_i32 w;
+    int sh = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+
+    if (!vphone_inline_lookup() || (tb_cflags(tb) & CF_NO_GOTO_PTR)) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+    slow = gen_new_label();
+    h = tcg_temp_new_i64();
+    t = tcg_temp_new_i64();
+    /* tb_jmp_cache_hash_func(pc) */
+    tcg_gen_shri_i64(t, cpu_pc, sh);
+    tcg_gen_xor_i64(t, t, cpu_pc);
+    tcg_gen_shri_i64(t, t, sh);
+    tcg_gen_andi_i64(t, t, TB_JMP_PAGE_MASK);
+    tcg_gen_shri_i64(h, cpu_pc, TB_JMP_INSN_SHIFT);
+    tcg_gen_andi_i64(h, h, TB_JMP_ADDR_MASK);
+    tcg_gen_or_i64(h, h, t);
+    tcg_gen_muli_i64(h, h, sizeof(((CPUJumpCache *)0)->array[0]));
+    jc = tcg_temp_new_ptr();
+    tcg_gen_ld_ptr(jc, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    e = tcg_temp_new_ptr();
+    tcg_gen_trunc_i64_ptr(e, h);
+    tcg_gen_add_ptr(e, e, jc);
+    tcg_gen_addi_ptr(e, e, offsetof(CPUJumpCache, array));
+
+    tcg_gen_ld_i64(t, (TCGv_ptr)e, offsetof(CPUJumpCache, array[0].tb) -
+                   offsetof(CPUJumpCache, array));
+    tcg_gen_brcondi_i64(TCG_COND_EQ, t, 0, slow);
+    tcg_gen_ld_i64(t, e, offsetof(CPUJumpCache, array[0].pc) -
+                   offsetof(CPUJumpCache, array));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, cpu_pc, slow);
+    tcg_gen_ld_i64(t, e, offsetof(CPUJumpCache, array[0].cs_base) -
+                   offsetof(CPUJumpCache, array));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, tb->cs_base, slow);
+    w = tcg_temp_new_i32();
+    tcg_gen_ld_i32(w, e, offsetof(CPUJumpCache, array[0].flags) -
+                   offsetof(CPUJumpCache, array));
+    tcg_gen_brcondi_i32(TCG_COND_NE, w, tb->flags, slow);
+    tcg_gen_ld_i32(w, e, offsetof(CPUJumpCache, array[0].cflags) -
+                   offsetof(CPUJumpCache, array));
+    tcg_gen_brcondi_i32(TCG_COND_NE, w, tb_cflags(tb) & ~CF_INVALID, slow);
+    {
+        TCGv_i32 g = tcg_temp_new_i32();
+
+        tcg_gen_ld_i32(w, e, offsetof(CPUJumpCache, array[0].gen) -
+                       offsetof(CPUJumpCache, array));
+        tcg_gen_ld_i32(g, jc, offsetof(CPUJumpCache, gen));
+        tcg_gen_brcond_i32(TCG_COND_NE, w, g, slow);
+    }
+    tcg_gen_st8_i32(tcg_constant_i32(1), tcg_env,
+                    offsetof(CPUState, neg.can_do_io) - sizeof(CPUState));
+    {
+        TCGv_ptr code = tcg_temp_new_ptr();
+
+        tcg_gen_ld_ptr(code, e, offsetof(CPUJumpCache, array[0].tc_ptr) -
+                       offsetof(CPUJumpCache, array));
+        tcg_gen_goto_ptr(code);
+    }
+    gen_set_label(slow);
+    tcg_gen_lookup_and_goto_ptr();
 }
 
 static inline bool use_goto_tb(DisasContext *s, uint64_t dest)
@@ -10558,7 +10649,7 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             break;
         case DISAS_JUMP:
             vphone_gen_lookup_stat(dc, dc->vphone_lookup_reason);
-            tcg_gen_lookup_and_goto_ptr();
+            vphone_gen_lookup_and_goto(dc);
             break;
         case DISAS_NORETURN:
         case DISAS_SWI:
