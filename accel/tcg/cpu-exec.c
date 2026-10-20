@@ -570,8 +570,10 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
     assert_no_pages_locked();
 }
 
+extern uint64_t vphone_excl_atomic_steps;
 void cpu_exec_step_atomic(CPUState *cpu)
 {
+    qatomic_inc(&vphone_excl_atomic_steps);
     TranslationBlock *tb;
     int tb_exit;
 

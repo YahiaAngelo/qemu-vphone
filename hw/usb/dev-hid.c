@@ -1032,6 +1032,21 @@ static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len)
     }
     memcpy(buf + 1, tablet + 1, 4);
     touch_home_check(us, tablet[0], tablet[3] | (tablet[4] << 8));
+    {
+        /* VPHONE_TOUCH_TRACE (temporary): each report as the guest takes it, CLOCK_BOOTTIME. */
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("VPHONE_TOUCH_TRACE");
+            on = e && *e && *e != '0';
+        }
+        if (on) {
+            struct timespec ts;
+            clock_gettime(CLOCK_BOOTTIME, &ts);
+            fprintf(stderr, "touchrep %" PRIu64 " btn %d x %d y %d\n",
+                    (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec, tablet[0],
+                    tablet[1] | (tablet[2] << 8), tablet[3] | (tablet[4] << 8));
+        }
+    }
     return TOUCH_REPORT_SIZE;
 }
 

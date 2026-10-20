@@ -189,8 +189,24 @@ static inline void exclusive_idle(void)
 
 /* Start an exclusive operation.
    Must only be called from outside cpu_exec.  */
+/* VPHONE_EXCL_STATS (temporary): exclusive sections per second and their wall time. */
+uint64_t vphone_excl_atomic_steps;
+static uint64_t vphone_excl_n, vphone_excl_ns, vphone_excl_t0, vphone_excl_last, vphone_safe_n;
+static int vphone_excl_on = -1;
+static bool vphone_excl_enabled(void)
+{
+    if (vphone_excl_on < 0) {
+        const char *e = getenv("VPHONE_EXCL_STATS");
+        vphone_excl_on = e && *e && *e != '0';
+    }
+    return vphone_excl_on;
+}
+
 void start_exclusive(void)
 {
+    if (vphone_excl_enabled() && !current_cpu->exclusive_context_count) {
+        vphone_excl_t0 = get_clock();
+    }
     CPUState *other_cpu;
     int running_cpus;
 
@@ -235,6 +251,20 @@ void start_exclusive(void)
 /* Finish an exclusive operation.  */
 void end_exclusive(void)
 {
+    if (vphone_excl_enabled() && current_cpu->exclusive_context_count == 1) {
+        uint64_t now = get_clock();
+        vphone_excl_n++;
+        vphone_excl_ns += now - vphone_excl_t0;
+        if (now - vphone_excl_last > 1000000000ULL) {
+            fprintf(stderr, "exclstat: %" PRIu64 " sections, %.1f ms stopped, %" PRIu64
+                    " atomic steps, %" PRIu64 " safe work items (last %.2f s)\n",
+                    vphone_excl_n, vphone_excl_ns / 1e6, qatomic_read(&vphone_excl_atomic_steps),
+                    vphone_safe_n, (now - vphone_excl_last) / 1e9);
+            vphone_excl_n = vphone_excl_ns = vphone_safe_n = 0;
+            qatomic_set(&vphone_excl_atomic_steps, 0);
+            vphone_excl_last = now;
+        }
+    }
     current_cpu->exclusive_context_count--;
     if (current_cpu->exclusive_context_count) {
         return;
@@ -324,6 +354,7 @@ void cpu_exec_end(CPUState *cpu)
 void async_safe_run_on_cpu(CPUState *cpu, run_on_cpu_func func,
                            run_on_cpu_data data)
 {
+    vphone_safe_n++;
     struct qemu_work_item *wi;
 
     wi = g_new0(struct qemu_work_item, 1);
