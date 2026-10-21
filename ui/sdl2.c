@@ -199,12 +199,12 @@ static void sdl_update_caption(struct sdl2_console *scon)
     }
 
     if (qemu_name) {
-        snprintf(win_title, sizeof(win_title), "ChefKiss Inferno (%s-%d)%s", qemu_name,
+        snprintf(win_title, sizeof(win_title), "QEMU (%s-%d)%s", qemu_name,
                  scon->idx, status);
-        snprintf(icon_title, sizeof(icon_title), "ChefKiss Inferno (%s)", qemu_name);
+        snprintf(icon_title, sizeof(icon_title), "QEMU (%s)", qemu_name);
     } else {
-        snprintf(win_title, sizeof(win_title), "ChefKiss Inferno%s", status);
-        snprintf(icon_title, sizeof(icon_title), "ChefKiss Inferno");
+        snprintf(win_title, sizeof(win_title), "QEMU%s", status);
+        snprintf(icon_title, sizeof(icon_title), "QEMU");
     }
 
     if (scon->real_window) {

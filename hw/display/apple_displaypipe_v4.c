@@ -852,7 +852,8 @@ static void adp_v4_read_and_draw_boot_splash(AppleDisplayPipeV4State *adp)
     assert_nonnull(path);
     fp = fopen(path, "rb");
     if (fp == NULL) {
-        error_setg(&error_abort, "Missing emulator branding: %s.", path);
+        /* qemu-vphone ships no boot splash (ui/icons/CKBrandingNotice.md). */
+        g_free(path);
         return;
     }
     fread(sig, sizeof(sig), 1, fp);

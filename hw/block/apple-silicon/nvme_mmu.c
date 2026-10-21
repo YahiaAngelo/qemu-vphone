@@ -193,7 +193,7 @@ SysBusDevice *apple_nvme_mmu_from_node(AppleDTNode *node, PCIBus *pci_bus)
     pci_dev = pci_new(-1, TYPE_NVME);
     s->nvme = NVME(pci_dev);
 
-    object_property_set_str(OBJECT(s->nvme), "serial", "ChefKiss-NVMeMMU",
+    object_property_set_str(OBJECT(s->nvme), "serial", "QEMU-NVMeMMU",
                             &error_fatal);
     object_property_set_uint(OBJECT(s->nvme), "max_ioqpairs", 7, &error_fatal);
     object_property_set_uint(OBJECT(s->nvme), "mdts", 8, &error_fatal);

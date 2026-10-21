@@ -1,3 +1,8 @@
+qemu-vphone is a fork of ChefKissInc/QEMUAppleSilicon (https://github.com/ChefKissInc/QEMUAppleSilicon),
+the project whose notice follows, with changes for vphone-linux (https://github.com/YahiaAngelo/vphone-linux).
+As that project's branding notice (ui/icons/CKBrandingNotice.md) requires, this fork does not use its
+name or artwork. Its license terms below apply unchanged.
+
 The “ChefKiss Inferno” project is derived from QEMU, see its original notice below.
 
 1) This derivative project (“ChefKiss Inferno”) is licensed under the GNU General Public License version 3,

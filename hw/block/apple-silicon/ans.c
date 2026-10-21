@@ -260,7 +260,7 @@ SysBusDevice *apple_ans_from_node(AppleDTNode *node, AppleA7IOPVersion version,
     pci_dev = pci_new(-1, TYPE_NVME);
     s->nvme = NVME(pci_dev);
 
-    object_property_set_str(OBJECT(s->nvme), "serial", "ChefKiss-ANS",
+    object_property_set_str(OBJECT(s->nvme), "serial", "QEMU-ANS",
                             &error_fatal);
     object_property_set_bool(OBJECT(s->nvme), "is-apple-ans", true,
                              &error_fatal);
