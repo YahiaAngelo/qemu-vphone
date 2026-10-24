@@ -193,10 +193,11 @@ const char *virtio_device_names[] = {
 
 static const char *virtio_id_to_name(uint16_t device_id)
 {
-    assert(device_id < G_N_ELEMENTS(virtio_device_names));
+    if (device_id >= G_N_ELEMENTS(virtio_device_names)) {
+        return "virtio-unknown";
+    }
     const char *name = virtio_device_names[device_id];
-    assert(name != NULL);
-    return name;
+    return name ? name : "virtio-unknown";
 }
 
 static void virtio_check_indirect_feature(VirtIODevice *vdev)

@@ -68,6 +68,7 @@ struct VResearchMachineState {
     DeviceState *pvpanic;
     DeviceState *gpio_key;
     DeviceState *vpiop;
+    DeviceState *vusb;
     Notifier powerdown_notifier;
     PCIBus *bus;
     MemoryRegion fw_mr;
@@ -205,10 +206,9 @@ static void create_bdif(VResearchMachineState *vms)
      * The backdoor interface's USB slot (device 0x10 at 0x30100000) is the
      * virtual USB device controller AVPBooter's DFU mode uses.
      */
-    sysbus_create_simple(TYPE_VMAPPLE_VUSB, -1, NULL);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(object_resolve_type_unambiguous(
-                                TYPE_VMAPPLE_VUSB, &error_fatal)),
-                            0, vms->memmap[VR_BDOOR].base + 0x100000, 1);
+    vms->vusb = DEVICE(sysbus_create_simple(TYPE_VMAPPLE_VUSB, -1, NULL));
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vms->vusb), 0,
+                            vms->memmap[VR_BDOOR].base + 0x100000, 1);
 }
 
 static void create_pvpanic(VResearchMachineState *vms)
@@ -874,6 +874,14 @@ static void create_pcie(VResearchMachineState *vms)
     vms->bus = pci->bus;
     assert(vms->bus);
 
+    /* RestoreOS switches to the Apple VirtIO PCI transport for USB device
+     * mode; AVPBooter and iBoot continue using the backdoor MMIO slot above.
+     */
+    dev = qdev_new(TYPE_VMAPPLE_VUSB_PCI);
+    object_property_set_link(OBJECT(dev), "vusb", OBJECT(vms->vusb),
+                             &error_fatal);
+    qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
+
     while ((dev = qemu_create_nic_device("virtio-net-pci", true, NULL))) {
         qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
     }
@@ -925,6 +933,29 @@ static void create_root_virtio_blk(VResearchMachineState *vms)
     dev = qdev_new(TYPE_VMAPPLE_VIRTIO_BLK_PCI);
     qdev_prop_set_drive(dev, "drive", blk);
     qdev_prop_set_enum(dev, "variant", VM_APPLE_VIRTIO_BLK_VARIANT_ROOT);
+    qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
+}
+
+/*
+ * Virtualization.framework attaches the auxiliary storage (the -pflash
+ * nvram.bin: firmware plus iBoot's two 512 KiB NVRAM banks at 0xa04000 and
+ * 0xa84000) as a second "aux" virtio-blk device.  The RestoreOS's
+ * AppleVirtIOStorage creates its IONVRAM service from that role, so without it
+ * restored waits forever for the nvram service.
+ */
+static void create_aux_virtio_blk(VResearchMachineState *vms)
+{
+    BlockBackend *blk = blk_by_name("aux-pci");
+    DeviceState *dev;
+
+    if (!blk) {
+        warn_report("No aux-pci block backend; the guest will not see its NVRAM");
+        return;
+    }
+
+    dev = qdev_new(TYPE_VMAPPLE_VIRTIO_BLK_PCI);
+    qdev_prop_set_drive(dev, "drive", blk);
+    qdev_prop_set_enum(dev, "variant", VM_APPLE_VIRTIO_BLK_VARIANT_AUX);
     qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
 }
 
@@ -1019,6 +1050,7 @@ static void mach_vresearch_init(MachineState *machine)
     create_rtc(vms);
     create_pcie(vms);
     create_root_virtio_blk(vms);
+    create_aux_virtio_blk(vms);
     create_gpio_devices(vms, sysmem);
 
     vresearch_firmware_init(vms, sysmem);

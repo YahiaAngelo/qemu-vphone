@@ -42,6 +42,7 @@ enum {
     VIRTIO_PCI_FLAG_AER_BIT,
     VIRTIO_PCI_FLAG_ATS_PAGE_ALIGNED_BIT,
     VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET_BIT,
+    VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE_BIT,
 };
 
 /* Need to activate work-arounds for buggy guests at vmstate load. */
@@ -75,6 +76,10 @@ enum {
 /* Init The No_Soft_Reset bit of Power Management */
 #define VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET \
   (1 << VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET_BIT)
+
+/* Some Apple VirtIO drivers write Q_ENABLE=0 while reinitializing queues. */
+#define VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE \
+  (1 << VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE_BIT)
 
 /* Init Function Level Reset capability */
 #define VIRTIO_PCI_FLAG_INIT_FLR (1 << VIRTIO_PCI_FLAG_INIT_FLR_BIT)

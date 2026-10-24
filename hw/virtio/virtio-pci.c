@@ -1662,8 +1662,17 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
             proxy->vqs[vdev->queue_sel].enabled = 1;
             proxy->vqs[vdev->queue_sel].reset = 0;
             virtio_queue_enable(vdev, vdev->queue_sel);
+        } else if (val == 0 &&
+                   (proxy->flags & VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE)) {
+            if (proxy->vqs[vdev->queue_sel].enabled) {
+                virtio_queue_reset(vdev, vdev->queue_sel);
+                proxy->vqs[vdev->queue_sel].enabled = 0;
+            }
         } else {
-            virtio_error(vdev, "wrong value for queue_enable %"PRIx64, val);
+            virtio_error(vdev,
+                         "wrong value for queue_enable %"PRIx64
+                         " on %s queue %u",
+                         val, vdev->name, vdev->queue_sel);
         }
         break;
     case VIRTIO_PCI_COMMON_Q_DESCLO:
@@ -2643,4 +2652,3 @@ static void virtio_pci_register_types(void)
 }
 
 type_init(virtio_pci_register_types)
-

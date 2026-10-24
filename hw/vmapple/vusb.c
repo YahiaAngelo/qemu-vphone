@@ -1,5 +1,5 @@
 /*
- * vresearch101 virtual USB device controller ("virtio-usb", AVP device 0x1a01)
+ * vresearch101 virtual USB device controller (AVP device 0x1a01)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
@@ -24,7 +24,10 @@
  * it. The driver polls 0x10: a TX request completes at once, an RX request
  * when the host has a message for it. Posting a request clears the queue's
  * completion; the TX queue starts out complete (iBoot waits for an idle TX
- * queue before each send and panics after 5 s).
+ * queue before each send and panics after 5 s). On completion the device
+ * also writes the request's first descriptor back: flags = 0x8000 and, for
+ * a receive, len = the bytes written. OpenAVB polls that word in RAM instead
+ * of 0x10 (Virtualization.framework does both); AVPBooter and iBoot ignore it.
  *
  * Host to device message: { u32 len; u8 ep; u8 type; u8 payload[len] }
  *   type 1: data for an endpoint; on EP0 OUT (ep 0x00) the payload starts
@@ -37,6 +40,10 @@
  *   code 2: stall (?)
  *   code 4: bus reset done
  *   code 5: abort done
+ *   code 6: driver reset: the guest (re)initialised the controller, as each
+ *           boot stage does (AVPBooter's DFU, iBoot, the restore OS). The
+ *           USB device it presented is gone; the host should treat this as
+ *           an unplug and enumerate the new device. Sent with ep 0, no data.
  *
  * Inferred from AVPBooter's and iBoot's drivers. With a chardev attached,
  * the host side is a byte stream: host to device messages are sent as they
@@ -72,6 +79,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VUSBState, VUSB)
 #define VUSB_MSG_HDR        6
 #define VUSB_MSG_MAX        0x10000
 #define VUSB_HOST_FIFO      64
+#define VUSB_CODE_DRIVER_RESET 6
 
 #define REG_STATUS          0x000
 #define REG_DEVICE_ID       0x004
@@ -84,6 +92,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(VUSBState, VUSB)
 
 #define DESC_F_NEXT         (1 << 0)
 #define DESC_F_WRITE        (1 << 1)
+/* written into a request's first descriptor when the device is done with it */
+#define DESC_F_COMPLETE     0x8000
 
 typedef struct VUSBDesc {
     uint64_t addr;
@@ -112,6 +122,9 @@ struct VUSBState {
 
     /* messages from the host waiting for a receive buffer */
     GQueue host_msgs;
+    /* the VirtIO-PCI transport, and whether its driver owns the link */
+    VUSBAltTransport alt;
+    bool alt_active;
     /* partial message from the chardev */
     GByteArray *rx_buf;
 };
@@ -150,6 +163,38 @@ static void vusb_send_to_host(VUSBState *s, const uint8_t *msg, uint32_t len)
     qemu_chr_fe_write_all(&s->chr, msg, len);
 }
 
+/*
+ * The guest's driver took the controller over afresh: whatever the previous
+ * stage presented is unplugged. Host messages queued for it are dropped (the
+ * new driver must not see them) and the host is told to enumerate again.
+ */
+static void vusb_driver_reset(VUSBState *s)
+{
+    static const uint8_t detach[2] = { VUSB_CODE_DRIVER_RESET, 0 };
+    GByteArray *msg;
+
+    while ((msg = g_queue_pop_head(&s->host_msgs))) {
+        g_byte_array_unref(msg);
+    }
+    vusb_send_to_host(s, detach, sizeof(detach));
+}
+
+/* mark a request done in its first descriptor (len only when used >= 0) */
+static void vusb_write_back(uint64_t request, int64_t used)
+{
+    uint8_t len[4];
+    uint8_t flags[2];
+
+    if (used >= 0) {
+        stl_le_p(len, used);
+        dma_memory_write(&address_space_memory, request + 8, len, sizeof(len),
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+    stw_le_p(flags, DESC_F_COMPLETE);
+    dma_memory_write(&address_space_memory, request + 14, flags,
+                     sizeof(flags), MEMTXATTRS_UNSPECIFIED);
+}
+
 /* gather a transmit request and pass it to the host */
 static void vusb_do_tx(VUSBState *s, VUSBQueue *q)
 {
@@ -170,8 +215,12 @@ static void vusb_do_tx(VUSBState *s, VUSBQueue *q)
                         msg->data + off, descs[i].len,
                         MEMTXATTRS_UNSPECIFIED);
     }
-    if (n > 0) {
+    /* OpenAVB answers a malformed event with an empty send: nothing to pass on */
+    if (n > 0 && msg->len > 0) {
         vusb_send_to_host(s, msg->data, msg->len);
+    }
+    if (n > 0) {
+        vusb_write_back(q->request, -1);
     }
     q->request = 0;
     q->done = true;
@@ -208,6 +257,9 @@ static void vusb_do_rx(VUSBState *s)
                       msg->len, off);
     }
     trace_vusb_rx(msg->len, ldl_le_p(msg->data), msg->data[4], msg->data[5]);
+    if (n > 0) {
+        vusb_write_back(q->request, off);
+    }
     q->request = 0;
     q->done = true;
 }
@@ -220,7 +272,13 @@ static void vusb_queue_host_msg(VUSBState *s, GByteArray *msg)
         return;
     }
     g_queue_push_tail(&s->host_msgs, msg);
-    vusb_do_rx(s);
+    if (s->alt_active) {
+        if (s->alt.kick) {
+            s->alt.kick(s->alt.opaque);
+        }
+    } else {
+        vusb_do_rx(s);
+    }
 }
 
 static void vusb_queue_test_msg(VUSBState *s, uint8_t ep, uint8_t type,
@@ -292,6 +350,11 @@ static void vusb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     switch (addr) {
     case REG_RESET:
         s->reset = val;
+        if (val) {
+            /* the backdoor slot's driver (AVPBooter, iBoot) owns the link */
+            s->alt_active = false;
+            vusb_driver_reset(s);
+        }
         break;
     case REG_DRIVER_STATUS:
         s->driver_status = val;
@@ -368,11 +431,46 @@ static void vusb_chr_receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+void vusb_set_alt_transport(DeviceState *dev, const VUSBAltTransport *alt)
+{
+    VUSB(dev)->alt = *alt;
+}
+
+void vusb_alt_activate(DeviceState *dev, bool active)
+{
+    VUSBState *s = VUSB(dev);
+
+    if (active == s->alt_active) {
+        return;
+    }
+    s->alt_active = active;
+    if (active) {
+        /* a new driver, a new device: unplug whatever the last stage showed */
+        vusb_driver_reset(s);
+    }
+}
+
+GByteArray *vusb_pop_host_msg(DeviceState *dev)
+{
+    return g_queue_pop_head(&VUSB(dev)->host_msgs);
+}
+
+void vusb_unpop_host_msg(DeviceState *dev, GByteArray *msg)
+{
+    g_queue_push_head(&VUSB(dev)->host_msgs, msg);
+}
+
+void vusb_msg_to_host(DeviceState *dev, const uint8_t *msg, uint32_t len)
+{
+    vusb_send_to_host(VUSB(dev), msg, len);
+}
+
 static void vusb_reset(DeviceState *dev)
 {
     VUSBState *s = VUSB(dev);
     GByteArray *msg;
 
+    s->alt_active = false;
     s->reset = 0;
     s->driver_status = 0;
     s->queue_sel = 0;

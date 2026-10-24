@@ -32,5 +32,12 @@ vusb_write(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u 
 vusb_tx(uint32_t len, uint8_t code, uint8_t ep) "to host: %u bytes, code %u ep 0x%02x"
 vusb_rx(uint32_t len, uint32_t plen, uint8_t ep, uint8_t type) "from host: %u bytes, payload %u ep 0x%02x type %u"
 
+# vusb-pci.c
+vusb_pci_status(uint8_t status, bool active) "status 0x%02x active=%d"
+vusb_pci_features(uint64_t features) "requested features 0x%016" PRIx64
+vusb_pci_iov(uint8_t queue, uint32_t out_num, uint32_t in_num, uint64_t out_len, uint64_t in_len) "queue %u iov out %u in %u out_len %" PRIu64 " in_len %" PRIu64
+vusb_pci_tx(uint32_t len, uint8_t code, uint8_t ep) "to host: %u bytes code %u ep 0x%02x"
+vusb_pci_rx(uint32_t len, uint8_t ep, uint8_t type, uint32_t a, uint32_t b) "from host: %u bytes ep 0x%02x type %u head %08x %08x"
+
 # sep-storage.c
 sep_storage_request(uint32_t type, uint64_t sector, int ndesc, uint8_t status) "type %u sector %" PRIu64 " descs %d status %u"
