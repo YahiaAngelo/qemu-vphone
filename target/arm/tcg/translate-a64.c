@@ -8679,6 +8679,88 @@ static bool trans_RETSPPC_IMM(DisasContext *s, arg_RETSPPC_IMM *a)
 
 
 
+
+/*
+ * FEAT_CPA (checked pointer arithmetic). The "checked" part: the pointer
+ * operand's tag rides in the most significant bits and must not leak into
+ * the result — the offset operand is sign-extended from bit 55 (stripping
+ * the tag field) and the base operand's tag is preserved. For tag-free
+ * pointers this is exactly plain arithmetic, which is what kept the
+ * bootstrap lowering honest. The architectural overflow check (carry into
+ * the tag field) faults on real hardware; TCG stays permissive.
+ */
+static void strip_ptr_tag(TCGv_i64 v)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+    tcg_gen_sari_i64(t, v, 55);
+    tcg_gen_shli_i64(t, t, 55);
+    tcg_gen_and_i64(v, v, t);
+}
+
+static bool trans_ADDPT(DisasContext *s, arg_ADDPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mov_i64(t, read_cpu_reg_sp(s, a->rm, true));
+    strip_ptr_tag(t);
+    if (a->imm3) {
+        tcg_gen_shli_i64(t, t, a->imm3);
+    }
+    tcg_gen_add_i64(t, read_cpu_reg_sp(s, a->rn, true), t);
+    tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
+    return true;
+}
+
+static bool trans_SUBPT(DisasContext *s, arg_SUBPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mov_i64(t, read_cpu_reg_sp(s, a->rm, true));
+    strip_ptr_tag(t);
+    if (a->imm3) {
+        tcg_gen_shli_i64(t, t, a->imm3);
+    }
+    tcg_gen_sub_i64(t, read_cpu_reg_sp(s, a->rn, true), t);
+    tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
+    return true;
+}
+
+static bool trans_MADDPT(DisasContext *s, arg_MADDPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mul_i64(t, read_cpu_reg(s, a->rn, true), read_cpu_reg(s, a->rm, true));
+    tcg_gen_add_i64(t, t, read_cpu_reg_sp(s, a->ra, true));
+    tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
+    return true;
+}
+
+static bool trans_MSUBPT(DisasContext *s, arg_MSUBPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mul_i64(t, read_cpu_reg(s, a->rn, true), read_cpu_reg(s, a->rm, true));
+    tcg_gen_sub_i64(t, read_cpu_reg_sp(s, a->ra, true), t);
+    tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
+    return true;
+}
+
 static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
 {
     TCGv_i64 tcg_rd, tcg_rn;
