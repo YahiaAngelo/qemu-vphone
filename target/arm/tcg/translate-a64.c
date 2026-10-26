@@ -8499,6 +8499,139 @@ static void gen_cls32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
 TRANS(CLZ, gen_rr, a->rd, a->rn, a->sf ? gen_clz64 : gen_clz32)
 TRANS(CLS, gen_rr, a->rd, a->rn, a->sf ? tcg_gen_clrsb_i64 : gen_cls32)
 
+/*
+ * vphone-linux: FEAT_CSSC scalar instructions. The encodings and the
+ * zero-source-width CTZ semantics follow the guest patcher's own CSSC
+ * emulator (VPhoneCSSCCode), which was validated against the real iOS 27
+ * binaries: CTZ counts trailing zeros of the source and yields the register
+ * width for a zero source; CNT counts set bits (popcount); ABS is the
+ * wrapping integer absolute value.
+ */
+static void gen_ctz32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
+{
+    TCGv_i32 t32 = tcg_temp_new_i32();
+
+    tcg_gen_extrl_i64_i32(t32, tcg_rn);
+    tcg_gen_ctzi_i32(t32, t32, 32);
+    tcg_gen_extu_i32_i64(tcg_rd, t32);
+}
+
+static void gen_ctz64(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
+{
+    /* A zero source yields the register width. */
+    tcg_gen_ctzi_i64(tcg_rd, tcg_rn, 64);
+}
+
+static void gen_cnt32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
+{
+    TCGv_i32 t32 = tcg_temp_new_i32();
+
+    tcg_gen_extrl_i64_i32(t32, tcg_rn);
+    tcg_gen_ctpop_i32(t32, t32);
+    tcg_gen_extu_i32_i64(tcg_rd, t32);
+}
+
+static void gen_abs32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
+{
+    TCGv_i32 t32 = tcg_temp_new_i32();
+
+    tcg_gen_extrl_i64_i32(t32, tcg_rn);
+    tcg_gen_abs_i32(t32, t32);
+    tcg_gen_extu_i32_i64(tcg_rd, t32);
+}
+
+TRANS_FEAT(CTZ, aa64_cssc, gen_rr, a->rd, a->rn, a->sf ? gen_ctz64 : gen_ctz32)
+TRANS_FEAT(CNT, aa64_cssc, gen_rr, a->rd, a->rn, a->sf ? tcg_gen_ctpop_i64 : gen_cnt32)
+TRANS_FEAT(ABS, aa64_cssc, gen_rr, a->rd, a->rn, a->sf ? tcg_gen_abs_i64 : gen_abs32)
+
+/*
+ * FEAT_CSSC scalar min/max. kind bit 0 selects unsigned, bit 1 selects min
+ * (00=SMAX 01=UMAX 10=SMIN 11=UMIN), matching the guest patcher's emulator.
+ * rd = op(rn, m) where m is the register or the immediate operand; the
+ * 32-bit form works on sign/zero-extended 32-bit values and zero-extends
+ * the result.
+ */
+static bool trans_cssc_maxmin(DisasContext *s, int rd, int rn, TCGv_i64 tcg_m,
+                              int sf, bool is_min, bool is_unsigned)
+{
+    TCGv_i64 tcg_n = read_cpu_reg(s, rn, sf);
+    TCGv_i64 tcg_rd = cpu_reg(s, rd);
+
+    if (!sf) {
+        TCGv_i64 n = tcg_temp_new_i64();
+        TCGv_i64 m = tcg_temp_new_i64();
+        if (is_unsigned) {
+            tcg_gen_ext32u_i64(n, tcg_n);
+            tcg_gen_ext32u_i64(m, tcg_m);
+        } else {
+            tcg_gen_ext32s_i64(n, tcg_n);
+            tcg_gen_ext32s_i64(m, tcg_m);
+        }
+        if (is_min) {
+            if (is_unsigned) {
+                tcg_gen_umin_i64(n, n, m);
+            } else {
+                tcg_gen_smin_i64(n, n, m);
+            }
+        } else {
+            if (is_unsigned) {
+                tcg_gen_umax_i64(n, n, m);
+            } else {
+                tcg_gen_smax_i64(n, n, m);
+            }
+        }
+        tcg_gen_ext32u_i64(tcg_rd, n);
+    } else {
+        if (is_min) {
+            if (is_unsigned) {
+                tcg_gen_umin_i64(tcg_rd, tcg_n, tcg_m);
+            } else {
+                tcg_gen_smin_i64(tcg_rd, tcg_n, tcg_m);
+            }
+        } else {
+            if (is_unsigned) {
+                tcg_gen_umax_i64(tcg_rd, tcg_n, tcg_m);
+            } else {
+                tcg_gen_smax_i64(tcg_rd, tcg_n, tcg_m);
+            }
+        }
+    }
+    return true;
+}
+
+static bool trans_cssc_maxmin_r(DisasContext *s, arg_rrr_sf *a, bool is_min, bool is_unsigned)
+{
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    return trans_cssc_maxmin(s, a->rd, a->rn, read_cpu_reg(s, a->rm, a->sf),
+                             a->sf, is_min, is_unsigned);
+}
+
+TRANS(SMAX_r, trans_cssc_maxmin_r, a, false, false)
+TRANS(UMAX_r, trans_cssc_maxmin_r, a, false, true)
+TRANS(SMIN_r, trans_cssc_maxmin_r, a, true, false)
+TRANS(UMIN_r, trans_cssc_maxmin_r, a, true, true)
+
+static bool trans_CSSC_MAXMIN_I(DisasContext *s, arg_cssc_imm *a)
+{
+    TCGv_i64 tcg_m;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    /* The immediate is 8 bits, signed for the SM* forms, unsigned for UM*. */
+    tcg_m = tcg_temp_new_i64();
+    if (a->kind & 1) {
+        tcg_gen_movi_i64(tcg_m, (uint8_t)a->imm8);
+    } else {
+        tcg_gen_movi_i64(tcg_m, (int8_t)a->imm8);
+    }
+    return trans_cssc_maxmin(s, a->rd, a->rn, tcg_m, a->sf, a->kind & 2, a->kind & 1);
+}
+
+
+
 static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
 {
     TCGv_i64 tcg_rd, tcg_rn;

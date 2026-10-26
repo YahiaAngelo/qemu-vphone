@@ -614,6 +614,17 @@ static inline bool isar_feature_aa64_mops(const ARMISARegisters *id)
     return FIELD_EX64_IDREG(id, ID_AA64ISAR2, MOPS);
 }
 
+/*
+ * vphone-linux: FEAT_CSSC (scalar CTZ/CNT/ABS and scalar min/max). No
+ * upstream QEMU implements the instructions; our TCG translation lives in
+ * translate-a64.c beside the other 1-source and 2/3-source operations.
+ */
+static inline bool isar_feature_aa64_cssc(const ARMISARegisters *id)
+{
+    return FIELD_EX64_IDREG(id, ID_AA64ISAR2, CSSC) != 0;
+}
+
+
 static inline bool isar_feature_aa64_rpres(const ARMISARegisters *id)
 {
     return FIELD_EX64_IDREG(id, ID_AA64ISAR2, RPRES);

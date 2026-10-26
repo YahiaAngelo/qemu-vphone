@@ -698,6 +698,17 @@ CRC32C          0 00 11010110 ..... 0101 01 ..... ..... @rrr_h
 CRC32C          0 00 11010110 ..... 0101 10 ..... ..... @rrr_s
 CRC32C          1 00 11010110 ..... 0101 11 ..... ..... @rrr_d
 
+# FEAT_CSSC: scalar min/max (vphone-linux). Register and immediate forms.
+SMAX_r          . 00 11010110 ..... 011000 ..... .....  @rrr_sf
+UMAX_r          . 00 11010110 ..... 011001 ..... .....  @rrr_sf
+SMIN_r          . 00 11010110 ..... 011010 ..... .....  @rrr_sf
+UMIN_r          . 00 11010110 ..... 011011 ..... .....  @rrr_sf
+
+# kind: 00=SMAX 01=UMAX 10=SMIN 11=UMIN; imm8 = signed for the SM* forms.
+&cssc_imm       rd rn imm8 kind sf
+@cssc_imm       sf:1 ........ ... kind:2 imm8:8 rn:5 rd:5  &cssc_imm
+CSSC_MAXMIN_I   . 00 100011 1 00 .. ........ ..... .....  @cssc_imm
+
 SUBP            1 00 11010110 ..... 000000 ..... .....  @rrr
 SUBPS           1 01 11010110 ..... 000000 ..... .....  @rrr
 IRG             1 00 11010110 ..... 000100 ..... .....  @rrr
@@ -714,6 +725,11 @@ RBIT            . 10 11010110 00000 000000 ..... .....  @rr_sf
 REV16           . 10 11010110 00000 000001 ..... .....  @rr_sf
 REV32           . 10 11010110 00000 000010 ..... .....  @rr_sf
 REV64           1 10 11010110 00000 000011 ..... .....  @rr
+
+# FEAT_CSSC: scalar CTZ/CNT/ABS (vphone-linux; unallocated without the feature)
+CTZ             . 10 11010110 00000 000110 ..... .....  @rr_sf
+CNT             . 10 11010110 00000 000111 ..... .....  @rr_sf
+ABS             . 10 11010110 00000 001000 ..... .....  @rr_sf
 
 CLZ             . 10 11010110 00000 000100 ..... .....  @rr_sf
 CLS             . 10 11010110 00000 000101 ..... .....  @rr_sf
