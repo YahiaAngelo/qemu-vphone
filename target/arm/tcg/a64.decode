@@ -206,15 +206,16 @@ RET             1101011 0010 11111 000000 rn:5 00000 &r
 BRAZ            1101011 0000 11111 00001 m:1 rn:5 11111 &braz   # BRAAZ, BRABZ
 BLRAZ           1101011 0001 11111 00001 m:1 rn:5 11111 &braz   # BLRAAZ, BLRABZ
 
-&reta       m
-RETA            1101011 0010 11111 00001 m:1 11111 11111 &reta  # RETAA, RETAB
+&reta       m rd
+RETA            1101011 0010 11111 00001 m:1 11111 rd:5 &reta  # RETAA, RETAB, RETAASPPC, RETABSPPC
 
 &bra        rn rm m
 BRA             1101011 1000 11111 00001 m:1 rn:5 rm:5 &bra # BRAA, BRAB
 BLRA            1101011 1001 11111 00001 m:1 rn:5 rm:5 &bra # BLRAA, BLRAB
 
 ERET            1101011 0100 11111 000000 11111 00000
-ERETA           1101011 0100 11111 00001 m:1 11111 11111 &reta  # ERETAA, ERETAB
+&ereta       m
+ERETA           1101011 0100 11111 00001 m:1 11111 rd:5 &reta  # ERETAA, ERETAB
 
 # We don't need to decode DRPS because it always UNDEFs except when
 # the processor is in halting debug state (which we don't implement).
@@ -708,6 +709,41 @@ UMIN_r          . 00 11010110 ..... 011011 ..... .....  @rrr_sf
 &cssc_imm       rd rn imm8 kind sf
 @cssc_imm       sf:1 ........ ... kind:2 imm8:8 rn:5 rd:5  &cssc_imm
 CSSC_MAXMIN_I   . 00 100011 1 00 .. ........ ..... .....  @cssc_imm
+
+# FEAT_PAUTH_LR (the Apple X1's SP+PC-authenticated call/return forms).
+# TCG's PAC is a no-op, so every PAC/AUT form translates to nothing; the RET
+# forms return through x30 exactly like RETAA/RETAB under a no-op auth. The
+# patterns are the encodings from the guest patcher's disassembly vectors.
+PACIASPPC       11011010110000011010001111111110
+PACIBSPPC       11011010110000011010011111111110
+PACNBIASPPC     11011010110000011000001111111110
+PACNBIBSPPC     11011010110000011000011111111110
+PACIA171615     11011010110000011000101111111110
+PACIB171615     11011010110000011000111111111110
+AUTIA171615     11011010110000011011101111111110
+AUTIB171615     11011010110000011011111111111110
+# PACM (0xD50324FF) stays a trap: it lives in the HINT space which QEMU
+# decodes in its own switch, and it is rare in the guest's hot paths.
+
+@pacaut_reg     ...................... rm:5 .....
+AUTIASPPC_REG   1101101011000001100100 ..... 11110  @pacaut_reg
+AUTIBSPPC_REG   1101101011000001100101 ..... 11110  @pacaut_reg
+
+&reta_sppc      imm
+@reta_sppc      ........ imm:19 .....  &reta_sppc
+RETSPPC_IMM     01010101 ................... 11111  @reta_sppc
+
+# FEAT_CPA (the Apple X1's tagged-pointer arithmetic): the same semantics as
+# ADD/SUB/MADD/MSUB; the pointer tag rides in the high bits and TCG's plain
+# arithmetic propagates it, which is what the guest's own lowering does.
+&cssc_pt3       rd rn rm imm3 sf
+@cssc_pt3       sf:1 .. ..... ... rm:5 ... imm3:3 rn:5 rd:5  &cssc_pt3
+ADDPT           . 00 11010 000 ..... 001 ... ..... .....  @cssc_pt3
+SUBPT           . 10 11010 000 ..... 001 ... ..... .....  @cssc_pt3
+&cssc_pt4       rd rn rm ra sf
+@cssc_pt4       sf:1 .. ..... . .. rm:5 . ra:5 rn:5 rd:5  &cssc_pt4
+MADDPT          . 00 11011 0 11 ..... 0 ..... ..... .....  @cssc_pt4
+MSUBPT          . 00 11011 0 11 ..... 1 ..... ..... .....  @cssc_pt4
 
 SUBP            1 00 11010110 ..... 000000 ..... .....  @rrr
 SUBPS           1 01 11010110 ..... 000000 ..... .....  @rrr

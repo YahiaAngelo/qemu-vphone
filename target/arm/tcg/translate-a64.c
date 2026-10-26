@@ -8630,6 +8630,111 @@ static bool trans_CSSC_MAXMIN_I(DisasContext *s, arg_cssc_imm *a)
     return trans_cssc_maxmin(s, a->rd, a->rn, tcg_m, a->sf, a->kind & 2, a->kind & 1);
 }
 
+/*
+ * FEAT_PAUTH_LR (the Apple X1's SP+PC forms) — decoded from the guest
+ * patcher's vectors. TCG's PAC is a no-op, so every PAC/AUT form is a no-op;
+ * the RET*SPPC forms return through x30 exactly like RETAA/RETAB under a
+ * no-op auth.
+ */
+/* Variadic: some call sites pass the decode arg, some the empty struct. */
+static bool trans_cssc_nop(DisasContext *s, ...)
+{
+    /* The PAC/AUT forms authenticate nothing under TCG's no-op pauth. */
+    return true;
+}
+
+TRANS_FEAT(PACIASPPC, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(PACIBSPPC, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(PACNBIASPPC, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(PACNBIBSPPC, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(PACIA171615, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(PACIB171615, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(AUTIA171615, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(AUTIB171615, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(AUTIASPPC_REG, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(AUTIBSPPC_REG, aa64_pauth, trans_cssc_nop)
+
+static bool trans_RETSPPC_IMM(DisasContext *s, arg_RETSPPC_IMM *a)
+{
+    s->vphone_lookup_reason = 6;
+
+    if (!dc_isar_feature(aa64_pauth, s)) {
+        return false;
+    }
+    /* The auth is a no-op; the return goes through x30. */
+    gen_a64_set_pc(s, cpu_reg(s, 30));
+    s->base.is_jmp = DISAS_JUMP;
+    return true;
+}
+
+/*
+ * FEAT_CPA (the Apple X1's tagged-pointer arithmetic): the same semantics as
+ * ADD/SUB/MADD/MSUB — the pointer tag rides in the address's high bits and
+ * plain arithmetic propagates it, which is exactly what the guest's own X1
+ * lowering does to these instructions.
+ */
+static bool trans_ADDPT(DisasContext *s, arg_ADDPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mov_i64(t, read_cpu_reg_sp(s, a->rm, true));
+    if (a->imm3) {
+        tcg_gen_shli_i64(t, t, a->imm3);
+    }
+    tcg_gen_add_i64(t, read_cpu_reg_sp(s, a->rn, true), t);
+    tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
+    return true;
+}
+
+static bool trans_SUBPT(DisasContext *s, arg_SUBPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mov_i64(t, read_cpu_reg_sp(s, a->rm, true));
+    if (a->imm3) {
+        tcg_gen_shli_i64(t, t, a->imm3);
+    }
+    tcg_gen_sub_i64(t, read_cpu_reg_sp(s, a->rn, true), t);
+    tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
+    return true;
+}
+
+static bool trans_MADDPT(DisasContext *s, arg_MADDPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mul_i64(t, read_cpu_reg(s, a->rn, true), read_cpu_reg(s, a->rm, true));
+    tcg_gen_add_i64(t, t, read_cpu_reg(s, a->ra, true));
+    tcg_gen_mov_i64(cpu_reg(s, a->rd), t);
+    return true;
+}
+
+static bool trans_MSUBPT(DisasContext *s, arg_MSUBPT *a)
+{
+    TCGv_i64 t;
+
+    if (!dc_isar_feature(aa64_cssc, s)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mul_i64(t, read_cpu_reg(s, a->rn, true), read_cpu_reg(s, a->rm, true));
+    tcg_gen_sub_i64(t, t, read_cpu_reg(s, a->ra, true));
+    tcg_gen_mov_i64(cpu_reg(s, a->rd), t);
+    return true;
+}
+
 
 
 static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)

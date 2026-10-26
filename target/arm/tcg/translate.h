@@ -846,10 +846,10 @@ static inline void gen_restore_rmode(TCGv_i32 old, TCGv_ptr fpst)
  */
 #define TRANS(NAME, FUNC, ...) \
     static bool trans_##NAME(DisasContext *s, arg_##NAME *a) \
-    { return FUNC(s, __VA_ARGS__); }
+    { return FUNC(s, ##__VA_ARGS__); }
 #define TRANS_FEAT(NAME, FEAT, FUNC, ...) \
     static bool trans_##NAME(DisasContext *s, arg_##NAME *a) \
-    { return dc_isar_feature(FEAT, s) && FUNC(s, __VA_ARGS__); }
+    { return dc_isar_feature(FEAT, s) && FUNC(s, ##__VA_ARGS__); }
 
 #define TRANS_FEAT_NONSTREAMING(NAME, FEAT, FUNC, ...)            \
     static bool trans_##NAME(DisasContext *s, arg_##NAME *a)      \
