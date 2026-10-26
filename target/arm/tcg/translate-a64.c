@@ -8707,7 +8707,9 @@ static bool trans_ADDPT(DisasContext *s, arg_ADDPT *a)
     tcg_gen_xor_i64(chk, t, read_cpu_reg_sp(s, a->rn, true));
     tcg_gen_shri_i64(chk, chk, 56);
     tcg_gen_brcondi_i64(TCG_COND_EQ, chk, 0, ok);
-    gen_exception_insn(s, 0, EXCP_UDEF, syn_uncategorized());
+    gen_a64_update_pc(s, 0);
+    gen_helper_exception_with_syndrome(tcg_env, tcg_constant_i32(EXCP_UDEF),
+                                       tcg_constant_i32(syn_uncategorized()));
     gen_set_label(ok);
 
     tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
@@ -8734,7 +8736,9 @@ static bool trans_SUBPT(DisasContext *s, arg_SUBPT *a)
     tcg_gen_xor_i64(chk, t, read_cpu_reg_sp(s, a->rn, true));
     tcg_gen_shri_i64(chk, chk, 56);
     tcg_gen_brcondi_i64(TCG_COND_EQ, chk, 0, ok);
-    gen_exception_insn(s, 0, EXCP_UDEF, syn_uncategorized());
+    gen_a64_update_pc(s, 0);
+    gen_helper_exception_with_syndrome(tcg_env, tcg_constant_i32(EXCP_UDEF),
+                                       tcg_constant_i32(syn_uncategorized()));
     gen_set_label(ok);
 
     tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
@@ -8758,7 +8762,9 @@ static bool trans_MADDPT(DisasContext *s, arg_MADDPT *a)
     tcg_gen_xor_i64(chk, t, read_cpu_reg_sp(s, a->ra, true));
     tcg_gen_shri_i64(chk, chk, 56);
     tcg_gen_brcondi_i64(TCG_COND_EQ, chk, 0, ok);
-    gen_exception_insn(s, 0, EXCP_UDEF, syn_uncategorized());
+    gen_a64_update_pc(s, 0);
+    gen_helper_exception_with_syndrome(tcg_env, tcg_constant_i32(EXCP_UDEF),
+                                       tcg_constant_i32(syn_uncategorized()));
     gen_set_label(ok);
 
     tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
@@ -8782,7 +8788,9 @@ static bool trans_MSUBPT(DisasContext *s, arg_MSUBPT *a)
     tcg_gen_xor_i64(chk, t, read_cpu_reg_sp(s, a->ra, true));
     tcg_gen_shri_i64(chk, chk, 56);
     tcg_gen_brcondi_i64(TCG_COND_EQ, chk, 0, ok);
-    gen_exception_insn(s, 0, EXCP_UDEF, syn_uncategorized());
+    gen_a64_update_pc(s, 0);
+    gen_helper_exception_with_syndrome(tcg_env, tcg_constant_i32(EXCP_UDEF),
+                                       tcg_constant_i32(syn_uncategorized()));
     gen_set_label(ok);
 
     tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
