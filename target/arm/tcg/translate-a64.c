@@ -8673,93 +8673,9 @@ static bool trans_RETSPPC_IMM(DisasContext *s, arg_RETSPPC_IMM *a)
  * plain arithmetic propagates it, which is exactly what the guest's own X1
  * lowering does to these instructions.
  */
-static bool trans_ADDPT(DisasContext *s, arg_ADDPT *a)
-{
-    TCGv_i64 t;
 
-    if (!dc_isar_feature(aa64_cssc, s)) {
-        return false;
-    }
-    t = tcg_temp_new_i64();
-    if (a->sf) {
-        tcg_gen_mov_i64(t, read_cpu_reg_sp(s, a->rm, true));
-        if (a->imm3) {
-            tcg_gen_shli_i64(t, t, a->imm3);
-        }
-        tcg_gen_add_i64(t, read_cpu_reg_sp(s, a->rn, true), t);
-        tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
-    } else {
-        tcg_gen_mov_i64(t, read_cpu_reg(s, a->rm, false));
-        if (a->imm3) {
-            tcg_gen_shli_i64(t, t, a->imm3);
-        }
-        tcg_gen_add_i64(t, read_cpu_reg(s, a->rn, false), t);
-        tcg_gen_andi_i64(cpu_reg(s, a->rd), t, 0xffffffffu);
-    }
-    return true;
-}
 
-static bool trans_SUBPT(DisasContext *s, arg_SUBPT *a)
-{
-    TCGv_i64 t;
 
-    if (!dc_isar_feature(aa64_cssc, s)) {
-        return false;
-    }
-    t = tcg_temp_new_i64();
-    if (a->sf) {
-        tcg_gen_mov_i64(t, read_cpu_reg_sp(s, a->rm, true));
-        if (a->imm3) {
-            tcg_gen_shli_i64(t, t, a->imm3);
-        }
-        tcg_gen_sub_i64(t, read_cpu_reg_sp(s, a->rn, true), t);
-        tcg_gen_mov_i64(cpu_reg_sp(s, a->rd), t);
-    } else {
-        tcg_gen_mov_i64(t, read_cpu_reg(s, a->rm, false));
-        if (a->imm3) {
-            tcg_gen_shli_i64(t, t, a->imm3);
-        }
-        tcg_gen_sub_i64(t, read_cpu_reg(s, a->rn, false), t);
-        tcg_gen_andi_i64(cpu_reg(s, a->rd), t, 0xffffffffu);
-    }
-    return true;
-}
-
-static bool trans_MADDPT(DisasContext *s, arg_MADDPT *a)
-{
-    TCGv_i64 t;
-
-    if (!dc_isar_feature(aa64_cssc, s)) {
-        return false;
-    }
-    t = tcg_temp_new_i64();
-    tcg_gen_mul_i64(t, read_cpu_reg(s, a->rn, a->sf), read_cpu_reg(s, a->rm, a->sf));
-    tcg_gen_add_i64(t, t, read_cpu_reg(s, a->ra, a->sf));
-    if (a->sf) {
-        tcg_gen_mov_i64(cpu_reg(s, a->rd), t);
-    } else {
-        tcg_gen_andi_i64(cpu_reg(s, a->rd), t, 0xffffffffu);
-    }
-    return true;
-}
-
-static bool trans_MSUBPT(DisasContext *s, arg_MSUBPT *a)
-{
-    TCGv_i64 t;
-
-    if (!dc_isar_feature(aa64_cssc, s)) {
-        return false;
-    }
-    t = tcg_temp_new_i64();
-    tcg_gen_mul_i64(t, read_cpu_reg(s, a->rn, a->sf), read_cpu_reg(s, a->rm, a->sf));
-    tcg_gen_sub_i64(t, read_cpu_reg(s, a->ra, a->sf), t);
-    if (a->sf) {
-        tcg_gen_mov_i64(cpu_reg(s, a->rd), t);
-    } else {
-        tcg_gen_andi_i64(cpu_reg(s, a->rd), t, 0xffffffffu);
-    }
-    return true;
-}
 
 
 

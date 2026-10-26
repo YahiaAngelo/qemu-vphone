@@ -738,12 +738,8 @@ RETSPPC_IMM     01010101 ................... 11111  @reta_sppc
 # arithmetic propagates it, which is what the guest's own lowering does.
 &cssc_pt3       rd rn rm imm3 sf
 @cssc_pt3       sf:1 .. ..... ... rm:5 ... imm3:3 rn:5 rd:5  &cssc_pt3
-ADDPT           . 00 11010 000 ..... 001 ... ..... .....  @cssc_pt3
-SUBPT           . 10 11010 000 ..... 001 ... ..... .....  @cssc_pt3
 &cssc_pt4       rd rn rm ra sf
 @cssc_pt4       sf:1 .. ..... . .. rm:5 . ra:5 rn:5 rd:5  &cssc_pt4
-MADDPT          . 00 11011 0 11 ..... 0 ..... ..... .....  @cssc_pt4
-MSUBPT          . 00 11011 0 11 ..... 1 ..... ..... .....  @cssc_pt4
 
 SUBP            1 00 11010110 ..... 000000 ..... .....  @rrr
 SUBPS           1 01 11010110 ..... 000000 ..... .....  @rrr
