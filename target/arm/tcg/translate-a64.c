@@ -8653,6 +8653,8 @@ TRANS_FEAT(AUTIA171615, aa64_pauth, trans_cssc_nop)
 TRANS_FEAT(AUTIB171615, aa64_pauth, trans_cssc_nop)
 TRANS_FEAT(AUTIASPPC_REG, aa64_pauth, trans_cssc_nop)
 TRANS_FEAT(AUTIBSPPC_REG, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(AUTIASPPC_IMM, aa64_pauth, trans_cssc_nop)
+TRANS_FEAT(AUTIBSPPC_IMM, aa64_pauth, trans_cssc_nop)
 
 static bool trans_RETSPPC_IMM(DisasContext *s, arg_RETSPPC_IMM *a)
 {
@@ -8672,7 +8674,70 @@ static bool trans_RETSPPC_IMM(DisasContext *s, arg_RETSPPC_IMM *a)
  * ADD/SUB/MADD/MSUB — the pointer tag rides in the address's high bits and
  * plain arithmetic propagates it, which is exactly what the guest's own X1
  * lowering does to these instructions.
+ *
+ * Decoded natively only for user code (EL0, low-half PC): the patcher's
+ * add/sub lowering of these forms is proven on the user dyld cache, while
+ * the TXM relies on the trap (native decode there wedges the boot), so
+ * kernel-side code still gets UNDEF. Only the 64-bit forms appear in the
+ * guest; the 32-bit ones stay UNDEF too.
  */
+static bool cpa_native_ok(DisasContext *s, int sf)
+{
+    return sf && s->current_el == 0 && !extract64(s->pc_curr, 55, 1) &&
+           dc_isar_feature(aa64_cssc, s);
+}
+
+static bool trans_ADDPT(DisasContext *s, arg_ADDPT *a)
+{
+    TCGv_i64 t;
+
+    if (!cpa_native_ok(s, a->sf)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_shli_i64(t, cpu_reg(s, a->rm), a->imm3);
+    tcg_gen_add_i64(cpu_reg_sp(s, a->rd), cpu_reg_sp(s, a->rn), t);
+    return true;
+}
+
+static bool trans_SUBPT(DisasContext *s, arg_SUBPT *a)
+{
+    TCGv_i64 t;
+
+    if (!cpa_native_ok(s, a->sf)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_shli_i64(t, cpu_reg(s, a->rm), a->imm3);
+    tcg_gen_sub_i64(cpu_reg_sp(s, a->rd), cpu_reg_sp(s, a->rn), t);
+    return true;
+}
+
+static bool trans_MADDPT(DisasContext *s, arg_MADDPT *a)
+{
+    TCGv_i64 t;
+
+    if (!cpa_native_ok(s, a->sf)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mul_i64(t, cpu_reg(s, a->rn), cpu_reg(s, a->rm));
+    tcg_gen_add_i64(cpu_reg(s, a->rd), cpu_reg(s, a->ra), t);
+    return true;
+}
+
+static bool trans_MSUBPT(DisasContext *s, arg_MSUBPT *a)
+{
+    TCGv_i64 t;
+
+    if (!cpa_native_ok(s, a->sf)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_mul_i64(t, cpu_reg(s, a->rn), cpu_reg(s, a->rm));
+    tcg_gen_sub_i64(cpu_reg(s, a->rd), cpu_reg(s, a->ra), t);
+    return true;
+}
 
 
 
