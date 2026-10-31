@@ -26,6 +26,8 @@
 #include "crypto/clmul.h"
 #include "vec_internal.h"
 
+#include "vec-f32-fast.h"
+
 /*
  * Data for expanding active predicate bits to bytes, for byte elements.
  *
@@ -1467,21 +1469,36 @@ void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
     clear_tail(d, oprsz, simd_maxsz(desc));                                \
 }
 
+/* The float32 forms try vf32_fast() first. */
+#define DO_3OP_F32(NAME, FUNC, OP)                                         \
+void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
+                  float_status *stat, uint32_t desc)                       \
+{                                                                          \
+    intptr_t i, oprsz = simd_oprsz(desc);                                  \
+    float32 *d = vd, *n = vn, *m = vm;                                     \
+    if (!vf32_fast(vd, vn, vm, NULL, stat, oprsz, OP, -1)) {               \
+        for (i = 0; i < oprsz / sizeof(float32); i++) {                    \
+            d[i] = FUNC(n[i], m[i], stat);                                 \
+        }                                                                  \
+    }                                                                      \
+    clear_tail(d, oprsz, simd_maxsz(desc));                                \
+}
+
 DO_3OP(gvec_fadd_b16, bfloat16_add, float16)
 DO_3OP(gvec_fadd_h, float16_add, float16)
-DO_3OP(gvec_fadd_s, float32_add, float32)
+DO_3OP_F32(gvec_fadd_s, float32_add, VF32_ADD)
 DO_3OP(gvec_fadd_d, float64_add, float64)
 DO_3OP(gvec_bfadd, bfloat16_add, bfloat16)
 
 DO_3OP(gvec_fsub_b16, bfloat16_sub, float16)
 DO_3OP(gvec_fsub_h, float16_sub, float16)
-DO_3OP(gvec_fsub_s, float32_sub, float32)
+DO_3OP_F32(gvec_fsub_s, float32_sub, VF32_SUB)
 DO_3OP(gvec_fsub_d, float64_sub, float64)
 DO_3OP(gvec_bfsub, bfloat16_sub, bfloat16)
 
 DO_3OP(gvec_fmul_b16, bfloat16_mul, float16)
 DO_3OP(gvec_fmul_h, float16_mul, float16)
-DO_3OP(gvec_fmul_s, float32_mul, float32)
+DO_3OP_F32(gvec_fmul_s, float32_mul, VF32_MUL)
 DO_3OP(gvec_fmul_d, float64_mul, float64)
 
 DO_3OP(gvec_ftsmul_h, float16_ftsmul, float16)
@@ -1691,6 +1708,21 @@ void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
     clear_tail(d, oprsz, simd_maxsz(desc));                                \
 }
 
+/* d = d + n * m (FMA) or d - n * m (FMS), fused: vf32_fast() first. */
+#define DO_MULADD_F32(NAME, FUNC, OP)                                      \
+void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
+                  float_status *stat, uint32_t desc)                       \
+{                                                                          \
+    intptr_t i, oprsz = simd_oprsz(desc);                                  \
+    float32 *d = vd, *n = vn, *m = vm;                                     \
+    if (!vf32_fast(vd, vn, vm, vd, stat, oprsz, OP, -1)) {                 \
+        for (i = 0; i < oprsz / sizeof(float32); i++) {                    \
+            d[i] = FUNC(d[i], n[i], m[i], stat);                           \
+        }                                                                  \
+    }                                                                      \
+    clear_tail(d, oprsz, simd_maxsz(desc));                                \
+}
+
 DO_MULADD(gvec_fmla_nf_h, float16_muladd_nf, float16)
 DO_MULADD(gvec_fmla_nf_s, float32_muladd_nf, float32)
 
@@ -1698,12 +1730,12 @@ DO_MULADD(gvec_fmls_nf_h, float16_mulsub_nf, float16)
 DO_MULADD(gvec_fmls_nf_s, float32_mulsub_nf, float32)
 
 DO_MULADD(gvec_vfma_h, float16_muladd_f, float16)
-DO_MULADD(gvec_vfma_s, float32_muladd_f, float32)
+DO_MULADD_F32(gvec_vfma_s, float32_muladd_f, VF32_FMA)
 DO_MULADD(gvec_vfma_d, float64_muladd_f, float64)
 DO_MULADD(gvec_bfmla, bfloat16_muladd_f, bfloat16)
 
 DO_MULADD(gvec_vfms_h, float16_mulsub_f, float16)
-DO_MULADD(gvec_vfms_s, float32_mulsub_f, float32)
+DO_MULADD_F32(gvec_vfms_s, float32_mulsub_f, VF32_FMS)
 DO_MULADD(gvec_vfms_d, float64_mulsub_f, float64)
 DO_MULADD(gvec_bfmls, bfloat16_mulsub_f, bfloat16)
 
@@ -1787,7 +1819,24 @@ void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
 
 DO_FMUL_IDX(gvec_fmul_idx_b16, nop, bfloat16_mul, float16, H2)
 DO_FMUL_IDX(gvec_fmul_idx_h, nop, float16_mul, float16, H2)
-DO_FMUL_IDX(gvec_fmul_idx_s, nop, float32_mul, float32, H4)
+void HELPER(gvec_fmul_idx_s)(void *vd, void *vn, void *vm,
+                             float_status *stat, uint32_t desc)
+{
+    intptr_t i, j, oprsz = simd_oprsz(desc);
+    intptr_t segment = MIN(16, oprsz) / sizeof(float32);
+    intptr_t idx = simd_data(desc);
+    float32 *d = vd, *n = vn, *m = vm;
+
+    if (!vf32_fast(vd, vn, vm, NULL, stat, oprsz, VF32_MUL, idx)) {
+        for (i = 0; i < oprsz / sizeof(float32); i += segment) {
+            float32 mm = m[H4(i + idx)];
+            for (j = 0; j < segment; j++) {
+                d[i + j] = float32_mul(n[i + j], mm, stat);
+            }
+        }
+    }
+    clear_tail(d, oprsz, simd_maxsz(desc));
+}
 DO_FMUL_IDX(gvec_fmul_idx_d, nop, float64_mul, float64, H8)
 
 #ifdef TARGET_AARCH64
@@ -1830,12 +1879,33 @@ void HELPER(NAME)(void *vd, void *vn, void *vm, void *va,                  \
 }
 
 DO_FMLA_IDX(gvec_fmla_idx_h, float16, H2, 0, 0)
-DO_FMLA_IDX(gvec_fmla_idx_s, float32, H4, 0, 0)
+/* The float32 forms try vf32_fast() first. */
+#define DO_FMLA_IDX_F32(NAME, NEGX, OP)                                    \
+void HELPER(NAME)(void *vd, void *vn, void *vm, void *va,                  \
+                  float_status *stat, uint32_t desc)                       \
+{                                                                          \
+    intptr_t i, j, oprsz = simd_oprsz(desc);                               \
+    intptr_t segment = MIN(16, oprsz) / sizeof(float32);                   \
+    intptr_t idx = simd_data(desc);                                        \
+    float32 *d = vd, *n = vn, *m = vm, *a = va;                            \
+    if (!vf32_fast(vd, vn, vm, va, stat, oprsz, OP, idx)) {                \
+        for (i = 0; i < oprsz / sizeof(float32); i += segment) {           \
+            float32 mm = m[H4(i + idx)];                                   \
+            for (j = 0; j < segment; j++) {                                \
+                d[i + j] = float32_muladd(n[i + j] ^ NEGX, mm,             \
+                                          a[i + j], 0, stat);              \
+            }                                                              \
+        }                                                                  \
+    }                                                                      \
+    clear_tail(d, oprsz, simd_maxsz(desc));                                \
+}
+
+DO_FMLA_IDX_F32(gvec_fmla_idx_s, 0, VF32_FMA)
 DO_FMLA_IDX(gvec_fmla_idx_d, float64, H8, 0, 0)
 DO_FMLA_IDX(gvec_bfmla_idx, bfloat16, H2, 0, 0)
 
 DO_FMLA_IDX(gvec_fmls_idx_h, float16, H2, INT16_MIN, 0)
-DO_FMLA_IDX(gvec_fmls_idx_s, float32, H4, INT32_MIN, 0)
+DO_FMLA_IDX_F32(gvec_fmls_idx_s, INT32_MIN, VF32_FMS)
 DO_FMLA_IDX(gvec_fmls_idx_d, float64, H8, INT64_MIN, 0)
 DO_FMLA_IDX(gvec_bfmls_idx, bfloat16, H2, INT16_MIN, 0)
 
