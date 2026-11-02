@@ -227,9 +227,16 @@ GEN_INPUT_FLUSH3(float64_input_flush3, float64)
 # define QEMU_SOFTFLOAT_ATTR QEMU_FLATTEN __attribute__((noinline))
 #endif
 
+/*
+ * vphone-linux: set at startup when guest code may run with the host FPU's
+ * rounding mode following the guest's (target/arm/tcg/host-fpcr.h), where
+ * the host computing in its own mode, and its status flags, would be wrong.
+ */
+bool softfloat_hardfloat_disabled;
+
 static inline bool can_use_fpu(const float_status *s)
 {
-    if (QEMU_NO_HARDFLOAT) {
+    if (QEMU_NO_HARDFLOAT || softfloat_hardfloat_disabled) {
         return false;
     }
     return likely(s->float_exception_flags & float_flag_inexact &&
@@ -4639,7 +4646,7 @@ float32_hs_compare(float32 xa, float32 xb, float_status *s, bool is_quiet)
     ua.s = xa;
     ub.s = xb;
 
-    if (QEMU_NO_HARDFLOAT) {
+    if (QEMU_NO_HARDFLOAT || softfloat_hardfloat_disabled) {
         goto soft;
     }
 
@@ -4693,7 +4700,7 @@ float64_hs_compare(float64 xa, float64 xb, float_status *s, bool is_quiet)
     ua.s = xa;
     ub.s = xb;
 
-    if (QEMU_NO_HARDFLOAT) {
+    if (QEMU_NO_HARDFLOAT || softfloat_hardfloat_disabled) {
         goto soft;
     }
 

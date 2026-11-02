@@ -97,6 +97,13 @@ typedef enum {
 #include "fpu/softfloat-helpers.h"
 #include "qemu/int128.h"
 
+/*
+ * When true, softfloat never computes on the host FPU ("hardfloat"): set by
+ * targets that run guest code with the host's rounding mode or exception
+ * flags tied to the guest's (vphone-linux: target/arm/tcg/host-fpcr.h).
+ */
+extern bool softfloat_hardfloat_disabled;
+
 /*----------------------------------------------------------------------------
 | Routine to raise any or all of the software IEC/IEEE floating-point
 | exception flags.

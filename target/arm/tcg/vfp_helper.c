@@ -26,6 +26,7 @@
 
 #define HELPER_H "tcg/helper.h"
 #include "exec/helper-proto.h.inc"
+#include "host-fpcr.h"
 
 /*
  * Set the float_status behaviour to match the Arm defaults:
@@ -138,8 +139,10 @@ uint32_t vfp_get_fpsr_from_host(CPUARMState *env)
     if ((env->vfp.fpcr & (FPCR_FZ | FPCR_AH)) != FPCR_FZ) {
         a64_flags &= ~float_flag_input_denormal_flushed;
     }
+    /* And what natively executed FP raised in the host's status register. */
     return vfp_exceptbits_from_host(a64_flags, env->vfp.fpcr & FPCR_AH) |
-        vfp_exceptbits_from_host(a32_flags, false);
+        vfp_exceptbits_from_host(a32_flags, false) |
+        (uint32_t)arm_host_fpsr_peek(env);
 }
 
 void vfp_clear_float_status_exc_flags(CPUARMState *env)

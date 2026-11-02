@@ -8,6 +8,9 @@
  * through softfloat lane by lane, as the generic helpers do. Wherever
  * vf32_fast() accepts a vector, its lanes must equal softfloat's bit for bit,
  * and softfloat must have raised no flag the status did not already hold.
+ * Where it refuses, the host's MXCSR must be as it was (with native FP the
+ * MXCSR flags are the guest's), and with MXCSR not rounding to nearest (the
+ * guest's FPCR.RMode under native FP) it must refuse everything.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -97,8 +100,20 @@ int main(int argc, char **argv)
         }
 
         float_status fs = s;
+        unsigned csr = 0x1f80 | (rnd32() % 16 == 0 ? (1 + rnd32() % 3) << 13 : 0);
+        bool ok;
+
+        _mm_setcsr(csr);
         run[op]++;
-        if (!vf32_fast(d, n, m, op >= VF32_FMA ? a : NULL, &fs, oprsz, op, idx)) {
+        ok = vf32_fast(d, n, m, op >= VF32_FMA ? a : NULL, &fs, oprsz, op, idx);
+        if ((!ok && _mm_getcsr() != csr) || (ok && (csr & 0x6000))) {
+            if (failures++ < 10) {
+                printf("MXCSR %s: %#x -> %#x, %s\n", names[op], csr,
+                       _mm_getcsr(), ok ? "taken" : "refused");
+            }
+        }
+        _mm_setcsr(0x1f80);
+        if (!ok) {
             continue;
         }
         accepted[op]++;

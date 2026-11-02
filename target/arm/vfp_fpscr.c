@@ -21,6 +21,7 @@
 #include "cpu.h"
 #include "internals.h"
 #include "cpu-features.h"
+#include "tcg/host-fpcr.h"
 
 uint32_t vfp_get_fpcr(CPUARMState *env)
 {
@@ -84,6 +85,7 @@ void vfp_set_fpsr(CPUARMState *env, uint32_t val)
     val &= FPSR_NZCV_MASK | FPSR_CEXC_MASK;
     env->vfp.fpsr = val;
     vfp_clear_float_status_exc_flags(env);
+    arm_host_fpsr_ack(env);
 }
 
 static void vfp_set_fpcr_masked(CPUARMState *env, uint32_t val, uint32_t mask)
@@ -141,6 +143,8 @@ static void vfp_set_fpcr_masked(CPUARMState *env, uint32_t val, uint32_t mask)
         FPCR_EBF | FPCR_FIZ | FPCR_AH | FPCR_NEP;
     env->vfp.fpcr &= ~mask;
     env->vfp.fpcr |= val;
+
+    arm_host_fpcr_reload(env);
 }
 
 void vfp_set_fpcr(CPUARMState *env, uint32_t val)

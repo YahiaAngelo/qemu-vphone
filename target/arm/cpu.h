@@ -834,6 +834,14 @@ typedef struct CPUArchState {
 
     /* Fields after this point are preserved across CPU reset. */
 
+    /*
+     * Host FP control and status (MXCSR on x86) saved across a run of
+     * generated code, which a reset can happen inside, so kept here: see
+     * target/arm/tcg/host-fpcr.h.
+     */
+    uint64_t host_fpcr_saved;
+    bool host_fp_active;
+
     /* Internal CPU feature flags.  */
     uint64_t features;
 

@@ -604,6 +604,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
     qatomic_inc(&vphone_excl_atomic_steps);
     TranslationBlock *tb;
     int tb_exit;
+    volatile bool entered = false;
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
         start_exclusive();
@@ -631,6 +632,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
         }
 
         cpu_exec_enter(cpu);
+        entered = true;
         /* execute the generated code */
 #ifdef CONFIG_DEBUG_TCG
         trace_exec_tb(tb, s.pc);
@@ -638,6 +640,14 @@ void cpu_exec_step_atomic(CPUState *cpu)
         cpu_tb_exec(cpu, tb, &tb_exit);
         cpu_exec_exit(cpu);
     } else {
+        /*
+         * An exception out of the generated code skipped the exit above;
+         * the target may hold host state (host FP control) until it runs.
+         * Unlike cpu_exec, which stays entered across its longjmps.
+         */
+        if (entered) {
+            cpu_exec_exit(cpu);
+        }
         cpu_exec_longjmp_cleanup(cpu);
     }
 

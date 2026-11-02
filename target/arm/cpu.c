@@ -47,6 +47,27 @@
 #include "cpregs.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/gtimer.h"
+#include "tcg/host-fpcr.h"
+
+/*
+ * vphone-linux: A64 FP / Neon emitted as host FP instructions by TCG
+ * (translate-a64.c, host-fpcr.h). VPHONE_NATIVE_FP=0 turns it off, leaving
+ * every FP instruction to the softfloat helpers as before (and softfloat's
+ * own hardfloat path on, which the native mode has to disable).
+ */
+bool arm_native_fp_enabled;
+
+static void __attribute__((constructor)) arm_native_fp_init(void)
+{
+#if defined(__x86_64__) && defined(CONFIG_TCG)
+    const char *e = getenv("VPHONE_NATIVE_FP");
+
+    arm_native_fp_enabled = !(e && *e == '0');
+    if (arm_native_fp_enabled) {
+        softfloat_hardfloat_disabled = true;
+    }
+#endif
+}
 
 static void arm_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -479,6 +500,10 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
         hw_watchpoint_update_all(cpu);
 
         arm_rebuild_hflags(env);
+
+        /* FPSR and FPCR were just cleared: so too the host's copies. */
+        arm_host_fpsr_ack(env);
+        arm_host_fpcr_reload(env);
     }
 }
 
@@ -2096,6 +2121,16 @@ static vaddr aprofile_pointer_wrap(CPUState *cs, int mmu_idx,
     return result;
 }
 
+static void arm_cpu_exec_enter(CPUState *cs)
+{
+    arm_host_fpcr_enter(&ARM_CPU(cs)->env);
+}
+
+static void arm_cpu_exec_exit(CPUState *cs)
+{
+    arm_host_fpcr_exit(&ARM_CPU(cs)->env);
+}
+
 static const TCGCPUOps arm_tcg_ops = {
     .mttcg_supported = true,
     /* ARM processors have a weak memory model */
@@ -2111,6 +2146,8 @@ static const TCGCPUOps arm_tcg_ops = {
     .tlb_fill_align = arm_cpu_tlb_fill_align,
     .pointer_wrap = aprofile_pointer_wrap,
     .cpu_exec_interrupt = arm_cpu_exec_interrupt,
+    .cpu_exec_enter = arm_cpu_exec_enter,
+    .cpu_exec_exit = arm_cpu_exec_exit,
     .cpu_exec_halt = arm_cpu_exec_halt,
     .cpu_exec_reset = cpu_reset,
     .do_interrupt = arm_cpu_do_interrupt,

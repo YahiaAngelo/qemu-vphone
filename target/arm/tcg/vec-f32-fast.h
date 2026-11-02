@@ -32,6 +32,13 @@
  * check, and any failing lane sends the whole vector to the generic loop,
  * which has not run and finds its inputs untouched (the results go to a
  * buffer first, as d may alias an operand). VPHONE_FAST_F32=0 turns it off.
+ *
+ * With native FP (target/arm/tcg/host-fpcr.h) MXCSR holds the guest's
+ * rounding mode and accumulates the guest's exception flags while helpers
+ * run, so this also requires MXCSR to round to nearest, and puts MXCSR back
+ * when it gives up: the lanes it rejects may have raised anything. When it
+ * succeeds the only flag it can have raised is inexact, which the status
+ * already holds.
  */
 #if defined(__x86_64__)
 #include <float.h>
@@ -100,9 +107,23 @@ static bool vf32_fast(void *vd, const void *vn, const void *vm, const void *va,
         return false;
     }
 
+    /*
+     * The compiler does not order SSE arithmetic against MXCSR accesses:
+     * the arithmetic hangs off the pointers, which come out of the asm that
+     * reads MXCSR, and the second read takes ok, which every lane's result
+     * and every check feeds.
+     */
+    unsigned csr, now;
+    const float *n = vn, *m = vm, *a = va;
+
+    __asm__ volatile("stmxcsr %0" : "=m"(csr));
+    if (csr & 0x6000) {         /* MXCSR.RC not round-to-nearest */
+        return false;
+    }
+    __asm__ volatile("" : "+r"(n), "+r"(m), "+r"(a));
+
     const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(INT32_MAX));
     const __m128 sign = _mm_castsi128_ps(_mm_set1_epi32(INT32_MIN));
-    const float *n = vn, *m = vm, *a = va;
     __m128 ok = _mm_castsi128_ps(_mm_set1_epi32(-1));
 
     for (intptr_t i = 0; i < oprsz / 4; i += 4) {
@@ -151,6 +172,10 @@ static bool vf32_fast(void *vd, const void *vn, const void *vm, const void *va,
         _mm_storeu_ps(out + i, r);
     }
     if (_mm_movemask_ps(ok) != 0xf) {
+        __asm__ volatile("stmxcsr %0" : "=m"(now) : "x"(ok));
+        if (now != csr) {
+            __asm__ volatile("ldmxcsr %0" :: "m"(csr));
+        }
         return false;
     }
     memcpy(vd, out, oprsz);
