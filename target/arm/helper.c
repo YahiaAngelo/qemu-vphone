@@ -2716,7 +2716,23 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     if (cpreg_field_is_64bit(ri) &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
         ARMCPU *cpu = env_archcpu(env);
-        tlb_flush(CPU(cpu));
+
+        raw_write(env, ri, value);
+        /*
+         * vphone-linux: TTBR0_EL1 or TTBR1_EL1 of AArch64 changes the EL1&0
+         * address space, now the ASID of the TTBR TCR_EL1.A1 names; that
+         * alone changes no mapping, so the jump cache keeps what it filled
+         * under that ASID (tlb_flush_asid_switch(), tb-jmp-cache.h).
+         */
+        if (ri->state == ARM_CP_STATE_AA64 && ri->opc1 == 0 && ri->crn == 2 &&
+            ri->crm == 0 && ri->opc2 <= 1) {
+            uint64_t ttbr = (env->cp15.tcr_el[1] & TTBCR_A1)
+                            ? env->cp15.ttbr1_el[1] : env->cp15.ttbr0_el[1];
+            tlb_flush_asid_switch(CPU(cpu), extract64(ttbr, 48, 16));
+        } else {
+            tlb_flush(CPU(cpu));
+        }
+        return;
     }
     raw_write(env, ri, value);
 }

@@ -238,7 +238,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
                jc->array[hash].cs_base == s.cs_base &&
                jc->array[hash].flags == s.flags &&
                jc->array[hash].cflags == s.cflags)) {
-        if (likely(jc->array[hash].gen == jc->gen)) {
+        if (likely(tb_jmp_cache_current(jc, hash))) {
             *tc_ptr = jc->array[hash].tc_ptr;
             return tb;
         }
@@ -248,7 +248,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
          */
         if (tb_page_addr1(tb) == -1 &&
             tb_page_addr0(tb) == get_page_addr_code(cpu_env(cpu), s.pc)) {
-            jc->array[hash].gen = jc->gen;
+            tb_jmp_cache_renew(jc, hash);
             goto hit;
         }
     }
@@ -454,7 +454,7 @@ const void *HELPER(vphone_lookup_fast)(CPUArchState *env, uint64_t cs_base,
                jc->array[h].cs_base == cs_base &&
                jc->array[h].flags == flags &&
                jc->array[h].cflags == cflags &&
-               jc->array[h].gen == jc->gen)) {
+               tb_jmp_cache_current(jc, h))) {
         cpu->neg.can_do_io = true;
         return jc->array[h].tc_ptr;
     }
@@ -1113,6 +1113,8 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     }
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    /* generation 0 is never current (tb-jmp-cache.h) */
+    cpu->tb_jmp_cache->gen = cpu->tb_jmp_cache->last_gen = 1;
     tlb_init(cpu);
     tcg_iommu_init_notifier_list(cpu);
 

@@ -623,6 +623,28 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     }
 }
 
+/* A generation no entry of @jc holds yet (never 0, see tb-jmp-cache.h). */
+static uint32_t tcg_new_jmp_gen(CPUState *cpu, CPUJumpCache *jc)
+{
+    if (unlikely(++jc->last_gen == 0)) {
+        /* wrapped: an entry could pass for current again */
+        tcg_flush_jmp_cache(cpu);
+        memset(jc->asid_gen, 0, sizeof(jc->asid_gen));
+        jc->last_gen = 1;
+    }
+    return jc->last_gen;
+}
+
+/* Record @jc's current generation as its address space's in this epoch. */
+static void tcg_note_jmp_gen(CPUJumpCache *jc)
+{
+    unsigned i = jc->asid % TB_JMP_ASID_SLOTS;
+
+    jc->asid_gen[i].key = jc->asid + 1;
+    jc->asid_gen[i].epoch = jc->epoch;
+    jc->asid_gen[i].gen = jc->gen;
+}
+
 /*
  * After a TLB flush on @cpu, by @cpu itself: the entries of its jump cache
  * may no longer be right for their pc, but most still are. Start a new
@@ -636,8 +658,29 @@ void tcg_stale_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
-    if (unlikely(++jc->gen == 0)) {
-        /* wrapped: an entry could pass for current again */
-        tcg_flush_jmp_cache(cpu);
+    jc->epoch++;
+    jc->gen = tcg_new_jmp_gen(cpu, jc);
+    tcg_note_jmp_gen(jc);
+}
+
+/*
+ * After a TLB flush on @cpu, by @cpu itself, that only switched the
+ * address space to @asid (tb-jmp-cache.h): the entries filled under @asid
+ * in this epoch are current again.
+ */
+void tcg_switch_jmp_cache(CPUState *cpu, uint32_t asid)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    unsigned i = asid % TB_JMP_ASID_SLOTS;
+
+    if (unlikely(jc == NULL)) {
+        return;
     }
+    jc->asid = asid;
+    if (jc->asid_gen[i].key == asid + 1 && jc->asid_gen[i].epoch == jc->epoch) {
+        jc->gen = jc->asid_gen[i].gen;
+        return;
+    }
+    jc->gen = tcg_new_jmp_gen(cpu, jc);
+    tcg_note_jmp_gen(jc);
 }

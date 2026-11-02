@@ -38,9 +38,46 @@
  * tb_lookup on the compare, 37% on the entry load). The copies are written
  * with the entry by its own CPU; other CPUs only clear 'tb'.
  */
+/*
+ * vphone-linux: generations per address space. An ASID switch flushes the
+ * softmmu TLB, which has no ASID tag, but changes no mapping: a mapping
+ * changes only with a TLB invalidation (or a permission change), each of
+ * which starts a new epoch. So the jump cache keeps a generation per
+ * address space (tcg_switch_jmp_cache()): switching back to an ASID makes
+ * the entries filled under it current again when no epoch began since, as
+ * a TLB tagged by ASID would keep them. Every other flush starts a new
+ * epoch, which forgets every address space's generation
+ * (tcg_stale_jmp_cache()). Generation 0 is never current: a flushed page's
+ * entries are marked with it (cputlb.c tb_jmp_cache_clear_page()).
+ */
+#define TB_JMP_ASID_SLOTS 256
+
+/*
+ * vphone-linux: a generation per bucket too. A page's entries all lie in
+ * one bucket of 2^TB_JMP_BUCKET_SHIFT entries (tb-hash.h, the bucket of
+ * tb_jmp_cache_hash_page()), so a TLB flush of a page starts a new
+ * generation of its bucket, one store, instead of marking the bucket's
+ * entries; a range flush does so for each page, and starts a new epoch
+ * only past one page a bucket. An entry is current when both its
+ * generation and its bucket's are.
+ */
+#define TB_JMP_BUCKET_SHIFT 8
+#define TB_JMP_BUCKETS (TB_JMP_CACHE_SIZE >> TB_JMP_BUCKET_SHIFT)
+
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
     uint32_t gen;
+    /* the last generation handed out; the epoch; the current address space */
+    uint32_t last_gen;
+    uint32_t epoch;
+    uint32_t asid;
+    /* address space (its key + 1, 0 when empty) -> generation, this epoch */
+    struct {
+        uint32_t key;
+        uint32_t epoch;
+        uint32_t gen;
+    } asid_gen[TB_JMP_ASID_SLOTS];
+    uint32_t bgen[TB_JMP_BUCKETS];
     struct {
         TranslationBlock *tb;
         vaddr pc;
@@ -49,6 +86,7 @@ typedef struct CPUJumpCache {
         uint32_t flags;
         uint32_t cflags;
         uint32_t gen;
+        uint32_t bgen;
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
 
@@ -62,7 +100,22 @@ static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,
     jc->array[h].flags = tb->flags;
     jc->array[h].cflags = tb->cflags;
     jc->array[h].gen = jc->gen;
+    jc->array[h].bgen = jc->bgen[h >> TB_JMP_BUCKET_SHIFT];
     qatomic_set(&jc->array[h].tb, tb);
+}
+
+/* Whether entry @h of @jc is of the current generations (keys aside). */
+static inline bool tb_jmp_cache_current(const CPUJumpCache *jc, uint32_t h)
+{
+    return jc->array[h].gen == jc->gen &&
+           jc->array[h].bgen == jc->bgen[h >> TB_JMP_BUCKET_SHIFT];
+}
+
+/* Make entry @h of @jc current again, its TB checked against the mappings. */
+static inline void tb_jmp_cache_renew(CPUJumpCache *jc, uint32_t h)
+{
+    jc->array[h].gen = jc->gen;
+    jc->array[h].bgen = jc->bgen[h >> TB_JMP_BUCKET_SHIFT];
 }
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */

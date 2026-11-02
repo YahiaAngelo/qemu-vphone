@@ -160,8 +160,12 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
      * found their slot emptied. Called on @cpu itself, like the generation.
      */
     i0 = tb_jmp_cache_hash_page(page_addr);
-    for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        jc->array[i0 + i].gen = jc->gen - 1;
+    /* a new generation of the page's bucket (tb-jmp-cache.h) */
+    if (unlikely(++jc->bgen[i0 >> TB_JMP_BUCKET_SHIFT] == 0)) {
+        /* wrapped: an entry of the bucket could pass for current again */
+        for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
+            qatomic_set(&jc->array[i0 + i].tb, NULL);
+        }
     }
 }
 
@@ -372,9 +376,13 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
-static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+/*
+ * Flush @asked's TLBs of @cpu, by @cpu. @asid >= 0: the flush only switches
+ * the address space to ASID @asid, so the jump cache takes that address
+ * space's generation (tcg_switch_jmp_cache()) instead of a new epoch.
+ */
+static void tlb_flush_mmuidx_work(CPUState *cpu, MMUIdxMap asked, int64_t asid)
 {
-    MMUIdxMap asked = data.host_int;
     MMUIdxMap all_dirty, work, to_clean;
     int64_t now = get_clock_realtime();
 
@@ -396,7 +404,11 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_stale_jmp_cache(cpu);
+    if (asid >= 0) {
+        tcg_switch_jmp_cache(cpu, asid);
+    } else {
+        tcg_stale_jmp_cache(cpu);
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -410,6 +422,22 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
                         ctpop32(asked & ~to_clean));
         }
     }
+}
+
+static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+{
+    tlb_flush_mmuidx_work(cpu, data.host_int, -1);
+}
+
+/*
+ * vphone-linux: tlb_flush() for a change of address space alone, to ASID
+ * @asid (tb-jmp-cache.h): the TLBs are flushed, as they hold no ASID, but
+ * the jump cache keeps what it filled under @asid.
+ */
+void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid)
+{
+    assert_cpu_is_self(cpu);
+    tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
 }
 
 void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
@@ -879,16 +907,17 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
     /*
      * For more than a few pages it takes longer to clear each page's
      * entries than to put the whole cache in doubt.
-     * vphone-linux: "a few" is 4 pages (VPHONE_JC_RANGE_PAGES), not 512:
-     * marking is 256 stale entries a page, each on a cache line of its own
-     * (48-byte entries), and an iOS guest's range flushes made that loop 3%
-     * of vCPU time; a generation bump costs one TLB lookup per entry at its
-     * next use instead.
+     * vphone-linux: clearing a page is one store, a new generation of its
+     * bucket (tb-jmp-cache.h), so "a few" is a page a bucket, 512 pages
+     * (VPHONE_JC_RANGE_PAGES sets fewer). It had been 4, when clearing marked
+     * 256 entries a page: an iOS guest's range flushes then started nearly
+     * half the jump cache's epochs, each of which costs a TLB lookup per
+     * entry at its next use.
      */
     static uint64_t range_pages;
     if (unlikely(!range_pages)) {
         const char *e = getenv("VPHONE_JC_RANGE_PAGES");
-        range_pages = e && *e ? MAX(strtoull(e, NULL, 0), 1) : 4;
+        range_pages = e && *e ? MAX(strtoull(e, NULL, 0), 1) : TB_JMP_BUCKETS;
     }
     if (d.len >= TARGET_PAGE_SIZE * MIN(range_pages, 2 * TB_JMP_PAGE_SIZE)) {
         tcg_stale_jmp_cache(cpu);

@@ -600,7 +600,11 @@ static void vphone_gen_lookup_and_goto(DisasContext *s)
         tcg_gen_lookup_and_goto_ptr();
         return;
     }
-    if (vphone_inline_lookup() == 2) {
+    /*
+     * vphone-linux: the jump cache's bucket generations (tb-jmp-cache.h) are
+     * checked in the helper only: the inline check (1) takes the helper too.
+     */
+    if (vphone_inline_lookup() >= 1) {
         tcg_gen_vphone_lookup_fast(tb->cs_base, tb->flags,
                                    tb_cflags(tb) & ~CF_INVALID);
         return;

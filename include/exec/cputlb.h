@@ -128,6 +128,16 @@ void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr);
 void tlb_flush(CPUState *cpu);
 
 /**
+ * tlb_flush_asid_switch:
+ * @cpu: CPU whose TLB should be flushed (the current one)
+ * @asid: the address space it switches to
+ *
+ * tlb_flush() for a change of address space alone (vphone-linux): the
+ * jump cache keeps the entries it filled under @asid in this epoch.
+ */
+void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid);
+
+/**
  * tlb_flush_all_cpus_synced:
  * @cpu: src CPU of the flush
  *
@@ -235,6 +245,9 @@ static inline void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
 {
 }
 static inline void tlb_flush(CPUState *cpu)
+{
+}
+static inline void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid)
 {
 }
 static inline void tlb_flush_all_cpus_synced(CPUState *src_cpu)
