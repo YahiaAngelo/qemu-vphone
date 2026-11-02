@@ -34,6 +34,7 @@
 #include "internals.h"
 #include "cpu-features.h"
 #include "exec/target_page.h"
+#include "exec/cputlb.h"
 #include "hw/qdev-properties.h"
 #include "hw/loader.h"
 #include "hw/boards.h"
@@ -157,8 +158,16 @@ static bool arm_cpu_has_work(CPUState *cs)
 {
     ARMCPU *cpu = container_of(cs, ARMCPU, parent_obj);
 
-    return (cpu->power_state != PSCI_OFF)
-        && cpu_test_interrupt(cs,
+    if (cpu->power_state == PSCI_OFF) {
+        return false;
+    }
+#ifdef CONFIG_TCG
+    /* In WFE, only what ends the wait: not a masked interrupt. */
+    if (qatomic_read(&cpu->env.wfe_waiting)) {
+        return arm_cpu_wfe_wakeup_pending(cs);
+    }
+#endif
+    return cpu_test_interrupt(cs,
                CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD
                | CPU_INTERRUPT_NMI | CPU_INTERRUPT_VINMI | CPU_INTERRUPT_VFNMI
                | CPU_INTERRUPT_VFIQ | CPU_INTERRUPT_VIRQ | CPU_INTERRUPT_VSERR
@@ -678,6 +687,8 @@ bool arm_cpu_exec_halt(CPUState *cs)
         if (cpu->wfxt_timer) {
             timer_del(cpu->wfxt_timer);
         }
+        qatomic_set(&cpu->env.wfe_waiting, 0);
+        tlb_unwatch_ram_write(cs);
     }
     return leave_halt;
 }
@@ -1855,7 +1866,8 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
         }
     }
 
-    if (tcg_enabled() && cpu_isar_feature(aa64_wfxt, cpu)) {
+    /* Every WFE may wait for a deadline now (vphone-linux), not just WFET. */
+    if (tcg_enabled()) {
         cpu->wfxt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        arm_wfxt_timer_cb, cpu);
     }

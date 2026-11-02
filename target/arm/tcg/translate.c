@@ -6733,7 +6733,8 @@ static void arm_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             tcg_gen_exit_tb(NULL, 0);
             break;
         case DISAS_WFE:
-            gen_helper_wfe(tcg_env);
+            /* A32: still a yield; helper_wfe waits on A64's monitor state */
+            gen_helper_yield(tcg_env);
             break;
         case DISAS_YIELD:
             gen_helper_yield(tcg_env);

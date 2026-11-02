@@ -653,6 +653,7 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     aarch64_save_sp(env, cur_el);
 
     arm_clear_exclusive(env);
+    qatomic_set(&env->event_register, 1);   /* an exception return is an event (WFE) */
 
     /* We must squash the PSTATE.SS bit to zero unless both of the
      * following hold:

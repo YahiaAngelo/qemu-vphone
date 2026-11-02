@@ -168,7 +168,14 @@ static inline bool arm_excp_unmasked(CPUState *cs, unsigned int excp_idx,
     return unmasked || pstate_unmasked;
 }
 
-bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+/*
+ * The interrupt arm_cpu_exec_interrupt() would take now, if any. WFE asks it
+ * too, to know whether a pending interrupt would end its wait (vphone-linux,
+ * from Inferno a5620ce), so it has no side effect: taking a virtual SError
+ * clears HCR_EL2.VSE in arm_cpu_exec_interrupt() itself.
+ */
+static bool arm_cpu_select_interrupt(CPUState *cs, int interrupt_request,
+                                     uint32_t *excp_out, uint32_t *target_out)
 {
     CPUARMState *env = cpu_env(cs);
     uint32_t cur_el = arm_current_el(env);
@@ -258,19 +265,46 @@ bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         target_el = 1;
         if (arm_excp_unmasked(cs, excp_idx, target_el,
                               cur_el, secure, hcr_el2)) {
-            /* Taking a virtual abort clears HCR_EL2.VSE */
-            env->cp15.hcr_el2 &= ~HCR_VSE;
-            cpu_reset_interrupt(cs, CPU_INTERRUPT_VSERR);
             goto found;
         }
     }
     return false;
 
  found:
+    *excp_out = excp_idx;
+    *target_out = target_el;
+    return true;
+}
+
+bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+{
+    CPUARMState *env = cpu_env(cs);
+    uint32_t excp_idx, target_el;
+
+    if (!arm_cpu_select_interrupt(cs, interrupt_request,
+                                  &excp_idx, &target_el)) {
+        return false;
+    }
+    if (excp_idx == EXCP_VSERR) {
+        /* Taking a virtual abort clears HCR_EL2.VSE */
+        env->cp15.hcr_el2 &= ~HCR_VSE;
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_VSERR);
+    }
     cs->exception_index = excp_idx;
     env->exception.target_el = target_el;
     cs->cc->tcg_ops->do_interrupt(cs);
     return true;
+}
+
+/* Whether a WFE's wait must end: a kick, or an interrupt it would take. */
+bool arm_cpu_wfe_wakeup_pending(CPUState *cs)
+{
+    uint32_t excp_idx, target_el;
+
+    return cpu_test_interrupt(cs, CPU_INTERRUPT_EXITTB) ||
+           arm_cpu_select_interrupt(cs,
+                                    qatomic_load_acquire(&cs->interrupt_request),
+                                    &excp_idx, &target_el);
 }
 #endif /* CONFIG_TCG */
 

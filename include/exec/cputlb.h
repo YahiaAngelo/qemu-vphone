@@ -28,6 +28,8 @@
 #ifdef CONFIG_TCG
 void tlb_protect_code(ram_addr_t ram_addr);
 void tlb_unprotect_code(ram_addr_t ram_addr);
+bool tlb_watch_ram_write(CPUState *cpu, vaddr addr, void *host);
+void tlb_unwatch_ram_write(CPUState *cpu);
 #endif
 
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length);

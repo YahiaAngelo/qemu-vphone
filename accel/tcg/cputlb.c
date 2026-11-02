@@ -38,6 +38,7 @@
 #include "exec/log.h"
 #include "exec/helper-proto-common.h"
 #include "exec/tlb-flags.h"
+#include "exec/cpu-interrupt.h"
 #include "qemu/atomic.h"
 #include "qemu/atomic128.h"
 #include "tb-internal.h"
@@ -331,6 +332,7 @@ void tlb_init(CPUState *cpu)
 
     /* All tlbs are initialized flushed. */
     cpu->neg.tlb.c.dirty = 0;
+    qatomic_set(&cpu->neg.tlb.c.watch, RAM_ADDR_INVALID);
 
     for (i = 0; i < NB_MMU_MODES; i++) {
         tlb_mmu_init(&cpu->neg.tlb.d[i], cpu_tlb_fast(cpu, i), now);
@@ -1090,6 +1092,99 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
 
+/*
+ * vphone-linux (WFE, from Inferno a5620ce): a vCPU waiting in WFE on its
+ * exclusive monitor's address watches that RAM page. While it is watched,
+ * every vCPU's TLB entry for the page takes the not-dirty slow path on a
+ * store (TLB_NOTDIRTY), and notdirty_write() wakes the watcher, as a real
+ * monitor's loss of exclusivity sends an event. Only the entries at the
+ * address's own index are reset, so a store through another virtual alias
+ * of the page is missed; WFE's 1 ms backstop timer covers that case.
+ */
+static unsigned tlb_ram_watchers;
+
+static bool tlb_ram_watched(ram_addr_t page)
+{
+    CPUState *cpu;
+
+    if (likely(!qatomic_read(&tlb_ram_watchers))) {
+        return false;
+    }
+    CPU_FOREACH(cpu) {
+        if (qatomic_read(&cpu->neg.tlb.c.watch) == page) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tlb_ram_watch_notify(ram_addr_t page)
+{
+    CPUState *cpu;
+
+    if (likely(!qatomic_read(&tlb_ram_watchers))) {
+        return;
+    }
+    CPU_FOREACH(cpu) {
+        if (qatomic_cmpxchg(&cpu->neg.tlb.c.watch, page,
+                            RAM_ADDR_INVALID) == page) {
+            qatomic_dec(&tlb_ram_watchers);
+            /*
+             * Under the BQL, which the halted vCPU holds from its has_work
+             * check to its wait: a kick in between would be lost.
+             */
+            BQL_LOCK_GUARD();
+            cpu_interrupt(cpu, CPU_INTERRUPT_EXITTB);
+        }
+    }
+}
+
+/* Watch the page of @host (guest @addr) for stores; false if it is not RAM. */
+bool tlb_watch_ram_write(CPUState *cpu, vaddr addr, void *host)
+{
+    ram_addr_t page = qemu_ram_addr_from_host(host);
+    uintptr_t start = (uintptr_t)host - (addr & ~TARGET_PAGE_MASK);
+    CPUState *other;
+
+    if (page == RAM_ADDR_INVALID) {
+        return false;
+    }
+    page &= TARGET_PAGE_MASK;
+    if (qatomic_xchg(&cpu->neg.tlb.c.watch, page) == RAM_ADDR_INVALID) {
+        qatomic_inc(&tlb_ram_watchers);
+    }
+    smp_mb();
+
+    CPU_FOREACH(other) {
+        if (other == cpu) {
+            continue;
+        }
+        qemu_spin_lock(&other->neg.tlb.c.lock);
+        for (int mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+            CPUTLBDesc *desc = &other->neg.tlb.d[mmu_idx];
+            uintptr_t idx = tlb_index(other, mmu_idx, addr);
+
+            tlb_reset_dirty_range_locked(&desc->fulltlb[idx],
+                                         &cpu_tlb_fast(other, mmu_idx)->table[idx],
+                                         start, TARGET_PAGE_SIZE);
+            for (int k = 0; k < CPU_VTLB_SIZE; k++) {
+                tlb_reset_dirty_range_locked(&desc->vfulltlb[k], &desc->vtable[k],
+                                             start, TARGET_PAGE_SIZE);
+            }
+        }
+        qemu_spin_unlock(&other->neg.tlb.c.lock);
+    }
+    return true;
+}
+
+void tlb_unwatch_ram_write(CPUState *cpu)
+{
+    if (qatomic_xchg(&cpu->neg.tlb.c.watch, RAM_ADDR_INVALID) !=
+        RAM_ADDR_INVALID) {
+        qatomic_dec(&tlb_ram_watchers);
+    }
+}
+
 /* Called with tlb_c.lock held */
 static inline void tlb_set_dirty1_locked(CPUTLBEntry *tlb_entry,
                                          vaddr addr)
@@ -1235,7 +1330,8 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         if (prot & PAGE_WRITE) {
             if (section->readonly) {
                 write_flags |= TLB_DISCARD_WRITE;
-            } else if (cpu_physical_memory_is_clean(iotlb)) {
+            } else if (cpu_physical_memory_is_clean(iotlb) ||
+                       tlb_ram_watched(iotlb)) {
                 write_flags |= TLB_NOTDIRTY;
             }
         }
@@ -1490,6 +1586,8 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     ram_addr_t ram_addr = mem_vaddr + full->xlat_offset;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
+
+    tlb_ram_watch_notify(ram_addr & TARGET_PAGE_MASK);
 
     if (!cpu_physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
