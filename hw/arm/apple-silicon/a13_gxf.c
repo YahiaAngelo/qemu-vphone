@@ -176,6 +176,15 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
     // what's about bit36?
     // Visual also accidentally found it on his own "TPRO regions should not be writable on entry to dyld"
 
+    /*
+     * vphone-linux: permissions are cached in TLB entries, so a change needs
+     * a flush; a write of the value already held does not (iOS rewrites
+     * these registers thousands of times a second, mostly unchanged).
+     */
+    if (raw_read(env, ri) == perm &&
+        (!env->sprr_cfg.unified_perms || env->sprr.sprr_el_br_el1[0][1] == perm)) {
+        return;
+    }
     raw_write(env, ri, perm);
     if (env->sprr_cfg.unified_perms) {
         env->sprr.sprr_el_br_el1[0][1] = perm;
@@ -203,10 +212,18 @@ static void sprr_c1_6_write(CPUARMState *env, const ARMCPRegInfo *ri,
                       env_cpu(env)->cpu_index, env->pc, value,
                       env->sprr_cfg.unified_perms, arm_is_guarded(env));
     }
+    /* vphone-linux: unchanged permissions keep the TLB valid (see C1_5) */
     if (env->sprr_cfg.unified_perms) {
+        if (env->sprr.sprr_el_br_el1[1][0] == value &&
+            env->sprr.sprr_el_br_el1[1][1] == value) {
+            return;
+        }
         env->sprr.sprr_el_br_el1[1][0] = value;
         env->sprr.sprr_el_br_el1[1][1] = value;
     } else {
+        if (env->sprr.sprr_el_br_el1[0][1] == value) {
+            return;
+        }
         env->sprr.sprr_el_br_el1[0][1] = value;
     }
     tlb_flush(env_cpu(env));
@@ -241,7 +258,7 @@ static void sprr_c3_0_write(CPUARMState *env, const ARMCPRegInfo *ri,
     }
     if (env->sprr_cfg.unified_perms) {
         env->sprr.c3_0 = value;
-    } else {
+    } else if (env->sprr.sprr_el_br_el1[1][1] != value) {
         env->sprr.sprr_el_br_el1[1][1] = value;
         tlb_flush(env_cpu(env));
     }
