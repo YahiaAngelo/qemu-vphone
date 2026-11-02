@@ -26,6 +26,8 @@
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/probe.h"
 #include "cpregs.h"
+#include "exec/cputlb.h"
+#include "qemu/timer.h"
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -445,16 +447,167 @@ void HELPER(wfit)(CPUARMState *env, uint64_t timeout)
     cpu_loop_exit(cs);
 }
 
+/*
+ * vphone-linux: WFE that waits (ported from Inferno a5620ce). XNU spins on
+ * locks with LDXR + WFE; a WFE that returns at once kept every vCPU of an
+ * iOS guest busy in those loops. The wait ends on an event (SEV/SEVL, an
+ * exception return), an interrupt the CPU would take, the timer's event
+ * stream (CNTKCTL/CNTHCTL.EVNTEN), WFET's deadline, or a store to the
+ * address the exclusive monitor holds: the page is watched in cputlb, as a
+ * real monitor's loss of exclusivity generates an event, with a 1 ms
+ * backstop for a store the watch misses. VPHONE_WFE=0 returns at once, as
+ * before.
+ */
+static int wfe_mode = -1;
+
+/* Counter ticks until the next event-stream event, or UINT64_MAX if off. */
+static uint64_t wfe_event_stream_ticks(uint64_t ctl, uint64_t cnt)
+{
+    unsigned bit;
+    uint64_t period, trigger;
+
+    if (!REG_FIELD_EX64(ctl, CNTHCTL, EVNTEN)) {
+        return UINT64_MAX;
+    }
+    bit = REG_FIELD_EX64(ctl, CNTHCTL, EVNTI) +
+          (REG_FIELD_EX64(ctl, CNTHCTL, EVNTIS) ? 8 : 0);
+    period = 2ULL << bit;
+    trigger = REG_FIELD_EX64(ctl, CNTHCTL, EVNTDIR) ? 0 : period / 2;
+    return ((trigger - cnt - 1) & (period - 1)) + 1;
+}
+
+/* Whether the monitored address no longer holds what the exclusive load read. */
+static bool wfe_monitor_cleared(CPUARMState *env, const void *host)
+{
+    MemOp mop = env->exclusive_memop;
+    bool be = (mop & MO_BSWAP) == MO_BE;
+
+    switch (mop & MO_SIZE) {
+    case MO_8:
+        return ldub_p(host) != env->exclusive_val;
+    case MO_16:
+        return (be ? lduw_be_p(host) : lduw_le_p(host)) != env->exclusive_val;
+    case MO_32:
+        return (uint32_t)(be ? ldl_be_p(host) : ldl_le_p(host)) !=
+               env->exclusive_val;
+    case MO_64:
+        return (be ? ldq_be_p(host) : ldq_le_p(host)) != env->exclusive_val;
+    default:
+        return (be ? ldq_be_p(host) : ldq_le_p(host)) != env->exclusive_val ||
+               (be ? ldq_be_p((const uint8_t *)host + 8)
+                   : ldq_le_p((const uint8_t *)host + 8)) != env->exclusive_high;
+    }
+}
+
+#define WFE_MONITOR_BACKSTOP_NS (1 * SCALE_MS)
+
+static void do_wfe(CPUARMState *env, uint64_t timeout, int ti)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = env_cpu(env);
+    uint32_t excp;
+    int target_el;
+    uint64_t cntval, cntvct, ticks;
+    int64_t delta_ns;
+
+    if (unlikely(wfe_mode < 0)) {
+        const char *e = getenv("VPHONE_WFE");
+        wfe_mode = !(e && *e == '0');
+    }
+    if (!wfe_mode || cpu->wfxt_timer == NULL) {
+        return;
+    }
+    if (qatomic_xchg(&env->event_register, 0)) {
+        return;
+    }
+
+    cntval = gt_get_countervalue(env);
+    cntvct = cntval - gt_direct_access_timer_offset(env, GTIMER_VIRT);
+    if (arm_cpu_wfe_wakeup_pending(cs) || cntvct >= timeout) {
+        return;
+    }
+
+    target_el = check_wfx_trap(env, true, &excp);
+    if (target_el) {
+        env->pc -= 4;
+        raise_exception(env, excp, syn_wfx(1, 0xe, ti, false), target_el);
+    }
+
+    ticks = timeout == UINT64_MAX ? UINT64_MAX : timeout - cntvct;
+    ticks = MIN(ticks, wfe_event_stream_ticks(env->cp15.c14_cntkctl, cntvct));
+    ticks = MIN(ticks, wfe_event_stream_ticks(env->cp15.cnthctl_el2, cntval));
+    if (ticks > cpu->gt_cntfrq_hz * 1000000ULL) {   /* past ~11 days: no deadline */
+        delta_ns = INT64_MAX;
+    } else {
+        /* +1 ns: the wait never ends before its deadline */
+        delta_ns = muldiv64(ticks, NANOSECONDS_PER_SECOND, cpu->gt_cntfrq_hz) + 1;
+    }
+
+    if (env->exclusive_addr != -1) {
+        int size = 1 << (env->exclusive_memop & MO_SIZE);
+        void *host = NULL;
+
+        if ((env->exclusive_addr & ~TARGET_PAGE_MASK) + size <=
+            TARGET_PAGE_SIZE) {
+            host = tlb_vaddr_to_host(env, env->exclusive_addr, MMU_DATA_LOAD,
+                                     arm_env_mmu_index(env));
+        }
+        if (host == NULL || !tlb_watch_ram_write(cs, env->exclusive_addr, host)) {
+            return;
+        }
+        if (wfe_monitor_cleared(env, host)) {
+            tlb_unwatch_ram_write(cs);
+            return;
+        }
+        delta_ns = MIN(delta_ns, WFE_MONITOR_BACKSTOP_NS);
+    }
+
+    if (delta_ns != INT64_MAX) {
+        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod_ns(cpu->wfxt_timer,
+                     delta_ns > INT64_MAX - now_ns ? INT64_MAX : now_ns + delta_ns);
+    }
+
+    qatomic_set(&env->wfe_waiting, 1);
+    smp_mb();
+    if (qatomic_xchg(&env->event_register, 0)) {
+        qatomic_set(&env->wfe_waiting, 0);
+        tlb_unwatch_ram_write(cs);
+        timer_del(cpu->wfxt_timer);
+        return;
+    }
+
+    cs->exception_index = EXCP_HLT;
+    cs->halted = 1;
+    cpu_loop_exit(cs);
+}
+
 void HELPER(wfe)(CPUARMState *env)
 {
-    /* This is a hint instruction that is semantically different
-     * from YIELD even though we currently implement it identically.
-     * Don't actually halt the CPU, just yield back to top
-     * level loop. This is not going into a "low power state"
-     * (ie halting until some event occurs), so we never take
-     * a configurable trap to a different exception level.
-     */
-    HELPER(yield)(env);
+    do_wfe(env, UINT64_MAX, 1);
+}
+
+void HELPER(wfet)(CPUARMState *env, uint64_t timeout)
+{
+    do_wfe(env, timeout, 3);
+}
+
+void HELPER(sev)(CPUARMState *env)
+{
+    CPUState *self = env_cpu(env);
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        CPUARMState *other = &container_of(cs, ARMCPU, parent_obj)->env;
+
+        qatomic_set(&other->event_register, 1);
+        smp_mb();
+        if (cs != self && qatomic_read(&other->wfe_waiting)) {
+            /* the BQL closes the gap between its has_work check and its wait */
+            BQL_LOCK_GUARD();
+            cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
+        }
+    }
 }
 
 void HELPER(yield)(CPUARMState *env)

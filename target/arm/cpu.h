@@ -759,6 +759,11 @@ typedef struct CPUArchState {
      * semantics of these fields are baked into the migration format.
      */
     uint64_t exclusive_high;
+    /* vphone-linux (WFE, from Inferno): the exclusive load's MemOp (size, endianness) */
+    uint32_t exclusive_memop;
+    /* WFE's event register (SEV, SEVL, exception return), and a WFE waiting on it */
+    uint32_t event_register;
+    uint32_t wfe_waiting;
 
     /* iwMMXt coprocessor state.  */
     struct {

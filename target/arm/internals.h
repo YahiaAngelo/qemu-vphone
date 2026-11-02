@@ -1347,6 +1347,7 @@ static inline const char *aarch32_mode_name(uint32_t psr)
  * arm_cpu_exec_interrupt(): Implementation of the cpu_exec_inrerrupt hook.
  */
 bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request);
+bool arm_cpu_wfe_wakeup_pending(CPUState *cs);
 
 /**
  * arm_cpu_update_virq: Update CPU_INTERRUPT_VIRQ bit in cs->interrupt_request

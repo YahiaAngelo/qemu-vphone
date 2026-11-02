@@ -312,6 +312,8 @@ typedef struct CPUTLBCommon {
     size_t full_flush_count;
     size_t part_flush_count;
     size_t elide_flush_count;
+    /* The ram_addr page a WFE waits on (a write to it wakes the CPU), or RAM_ADDR_INVALID */
+    uint64_t watch;
 } CPUTLBCommon;
 
 /*

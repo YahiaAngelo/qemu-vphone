@@ -2167,17 +2167,34 @@ static bool trans_WFI(DisasContext *s, arg_WFI *a)
     return true;
 }
 
+/*
+ * vphone-linux: WFE waits for an event (helper_wfe, from Inferno a5620ce),
+ * so SEV and SEVL are real: SEV sets every CPU's event register and wakes
+ * the waiting ones, SEVL sets this CPU's.
+ */
 static bool trans_WFE(DisasContext *s, arg_WFI *a)
 {
-    /*
-     * When running in MTTCG we don't generate jumps to the yield and
-     * WFE helpers as it won't affect the scheduling of other vCPUs.
-     * If we wanted to more completely model WFE/SEV so we don't busy
-     * spin unnecessarily we would need to do something more involved.
-     */
-    if (!(tb_cflags(s->base.tb) & CF_PARALLEL)) {
-        s->base.is_jmp = DISAS_WFE;
+    if (s->ss_active) {
+        /* Act like a NOP under architectural singlestep */
+        return true;
     }
+    gen_a64_update_pc(s, 4);
+    gen_helper_wfe(tcg_env);
+    /* Go back to the main loop to check for interrupts */
+    s->base.is_jmp = DISAS_EXIT;
+    return true;
+}
+
+static bool trans_SEV(DisasContext *s, arg_SEV *a)
+{
+    gen_helper_sev(tcg_env);
+    return true;
+}
+
+static bool trans_SEVL(DisasContext *s, arg_SEVL *a)
+{
+    tcg_gen_st_i32(tcg_constant_i32(1), tcg_env,
+                   offsetof(CPUARMState, event_register));
     return true;
 }
 
@@ -2211,14 +2228,13 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
         return false;
     }
 
-    /*
-     * We rely here on our WFE implementation being a NOP, so we
-     * don't need to do anything different to handle the WFET timeout
-     * from what trans_WFE does.
-     */
-    if (!(tb_cflags(s->base.tb) & CF_PARALLEL)) {
-        s->base.is_jmp = DISAS_WFE;
+    if (s->ss_active) {
+        /* Act like a NOP under architectural singlestep */
+        return true;
     }
+    gen_a64_update_pc(s, 4);
+    gen_helper_wfet(tcg_env, cpu_reg(s, a->rd));
+    s->base.is_jmp = DISAS_EXIT;
     return true;
 }
 
@@ -3142,6 +3158,9 @@ static void gen_load_exclusive(DisasContext *s, int rt, int rt2, int rn,
         tcg_gen_mov_i64(cpu_reg(s, rt), cpu_exclusive_val);
     }
     tcg_gen_mov_i64(cpu_exclusive_addr, clean_addr);
+    /* for WFE: what a store to the monitored address must change */
+    tcg_gen_st_i32(tcg_constant_i32(memop & (MO_SIZE | MO_BSWAP)), tcg_env,
+                   offsetof(CPUARMState, exclusive_memop));
 }
 
 static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
@@ -10929,10 +10948,6 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             break;
         case DISAS_NORETURN:
         case DISAS_SWI:
-            break;
-        case DISAS_WFE:
-            gen_a64_update_pc(dc, 4);
-            gen_helper_wfe(tcg_env);
             break;
         case DISAS_YIELD:
             gen_a64_update_pc(dc, 4);
