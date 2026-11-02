@@ -14,6 +14,9 @@
 #define have_avx1         (cpuinfo & CPUINFO_AVX1)
 #define have_avx2         (cpuinfo & CPUINFO_AVX2)
 #define have_movbe        (cpuinfo & CPUINFO_MOVBE)
+#define have_sse41        (cpuinfo & CPUINFO_SSE41)
+#define have_fma          (cpuinfo & CPUINFO_FMA)
+#define have_f16c         (cpuinfo & CPUINFO_F16C)
 
 /*
  * There are interesting instructions in AVX512, so long as we have AVX512VL,
@@ -40,6 +43,7 @@
 #define TCG_TARGET_HAS_v64              have_avx1
 #define TCG_TARGET_HAS_v128             have_avx1
 #define TCG_TARGET_HAS_v256             have_avx2
+#define TCG_TARGET_HAS_fp               (TCG_TARGET_REG_BITS == 64)
 
 #define TCG_TARGET_HAS_andc_vec         1
 #define TCG_TARGET_HAS_orc_vec          have_avx512vl

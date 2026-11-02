@@ -35,6 +35,7 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
         __cpuid(1, a, b, c, d);
 
         info |= (d & bit_SSE2 ? CPUINFO_SSE2 : 0);
+        info |= (c & bit_SSE4_1 ? CPUINFO_SSE41 : 0);
         info |= (c & bit_OSXSAVE ? CPUINFO_OSXSAVE : 0);
         info |= (c & bit_MOVBE ? CPUINFO_MOVBE : 0);
         info |= (c & bit_POPCNT ? CPUINFO_POPCNT : 0);
@@ -49,6 +50,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
 
             if ((bv & 6) == 6) {
                 info |= CPUINFO_AVX1;
+                info |= (c & bit_FMA ? CPUINFO_FMA : 0);
+                info |= (c & bit_F16C ? CPUINFO_F16C : 0);
                 info |= (b7 & bit_AVX2 ? CPUINFO_AVX2 : 0);
                 info |= (c7 & bit_GFNI ? CPUINFO_GFNI : 0);
 

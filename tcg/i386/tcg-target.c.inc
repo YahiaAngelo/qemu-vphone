@@ -493,6 +493,51 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_XCHG_ax_r32	(0x90)
 #define OPC_XCHG_EvGv   (0x87)
 
+/* Scalar FP: the prefix selects single (P_SIMDF3) or double (P_SIMDF2). */
+#define OPC_SQRTS      (0x51 | P_EXT)
+#define OPC_ADDS       (0x58 | P_EXT)
+#define OPC_MULS       (0x59 | P_EXT)
+#define OPC_CVTS2S     (0x5a | P_EXT) /* prefix of the source type */
+#define OPC_SUBS       (0x5c | P_EXT)
+#define OPC_MINS       (0x5d | P_EXT)
+#define OPC_DIVS       (0x5e | P_EXT)
+#define OPC_MAXS       (0x5f | P_EXT)
+#define OPC_CMPS       (0xc2 | P_EXT)
+#define OPC_MOVS_VxWx  (0x10 | P_EXT)
+#define OPC_MOVS_WxVx  (0x11 | P_EXT)
+#define OPC_CVTSI2S    (0x2a | P_EXT)
+#define OPC_CVTTS2SI   (0x2c | P_EXT)
+#define OPC_UCOMIS     (0x2e | P_EXT) /* P_DATA16 for double */
+#define OPC_COMIS      (0x2f | P_EXT)
+#define OPC_ROUNDSS    (0x0a | P_EXT3A | P_DATA16)
+#define OPC_ROUNDSD    (0x0b | P_EXT3A | P_DATA16)
+#define OPC_MOVAPS     (0x28 | P_EXT)
+#define OPC_ANDPS      (0x54 | P_EXT)
+#define OPC_XORPS      (0x57 | P_EXT)
+#define OPC_ROUNDPS    (0x08 | P_EXT3A | P_DATA16)
+#define OPC_ROUNDPD    (0x09 | P_EXT3A | P_DATA16)
+#define OPC_CVTDQ2PS   (0x5b | P_EXT)
+#define OPC_CVTTPS2DQ  (0x5b | P_EXT | P_SIMDF3)
+#define OPC_CVTPD2PS   (0x5a | P_EXT | P_DATA16)
+#define OPC_CVTPS2PD   (0x5a | P_EXT)
+#define OPC_MOVLHPS    (0x16 | P_EXT)
+#define OPC_MOVHLPS    (0x12 | P_EXT)
+#define OPC_HADDPS     (0x7c | P_EXT | P_SIMDF2)
+#define OPC_HADDPD     (0x7c | P_EXT | P_DATA16)
+#define OPC_MOVMSKPS   (0x50 | P_EXT)
+#define OPC_MOVMSKPD   (0x50 | P_EXT | P_DATA16)
+#define OPC_PMOVMSKB   (0xd7 | P_EXT | P_DATA16)
+#define OPC_PINSRW     (0xc4 | P_EXT | P_DATA16)
+#define OPC_PEXTRW_Mem (0x15 | P_EXT3A | P_DATA16)
+#define OPC_VCVTPH2PS  (0x13 | P_EXT38 | P_DATA16)
+#define OPC_VCVTPS2PH  (0x1d | P_EXT3A | P_DATA16)
+
+/* FMA3 231 forms: dest = vvvv * rm +/- dest; | P_VEXW for double. */
+#define OPC_VFMADD231P  (0xb8 | P_EXT38 | P_DATA16)
+#define OPC_VFMADD231S  (0xb9 | P_EXT38 | P_DATA16)
+#define OPC_VFNMADD231P (0xbc | P_EXT38 | P_DATA16)
+#define OPC_VFNMADD231S (0xbd | P_EXT38 | P_DATA16)
+
 #define OPC_GRP3_Eb     (0xf6)
 #define OPC_GRP3_Ev     (0xf7)
 #define OPC_GRP5        (0xff)
@@ -917,6 +962,51 @@ static inline void tgen_arithr(TCGContext *s, int subop, int dest, int src)
     tcg_out_modrm(s, OPC_ARITH_GvEv + (subop << 3) + ext, dest, src);
 }
 
+static int tcg_fp_prefix(TCGType type)
+{
+    switch (type) {
+        case TCG_TYPE_F32: return P_SIMDF3;
+        case TCG_TYPE_F64: return P_SIMDF2;
+        default          : assert_not_reached();
+    }
+}
+
+static bool tcg_fp_is_vector(TCGType type) { return type == TCG_TYPE_V64 || type == TCG_TYPE_V128; }
+
+/* ss/sd for the scalar types, ps/pd for the vector ones. */
+static int tcg_fp_prefix_vece(TCGType type, unsigned vece)
+{
+    if (tcg_fp_is_vector(type)) { return vece == MO_64 ? P_DATA16 : 0; }
+    return tcg_fp_prefix(type);
+}
+
+/* VEX when available, to avoid SSE/AVX transition penalties. */
+static void tcg_out_sse_move(TCGContext* s, int opc, TCGReg r, TCGReg rm)
+{
+    if (have_avx1) { tcg_out_vex_modrm(s, opc, r, 0, rm); }
+    else {
+        tcg_out_modrm(s, opc, r, rm);
+    }
+}
+
+static void tcg_out_sse_unary(TCGContext* s, int opc, TCGReg r, TCGReg rm)
+{
+    if (have_avx1) { tcg_out_vex_modrm(s, opc, r, rm, rm); }
+    else {
+        tcg_out_modrm(s, opc, r, rm);
+    }
+}
+
+/* The legacy form is destructive: the constraint ties r to v. */
+static void tcg_out_sse_binary(TCGContext* s, int opc, TCGReg r, TCGReg v, TCGReg rm)
+{
+    if (have_avx1) { tcg_out_vex_modrm(s, opc, r, v, rm); }
+    else {
+        tcg_debug_assert(r == v);
+        tcg_out_modrm(s, opc, r, rm);
+    }
+}
+
 static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
 {
     int rexw = 0;
@@ -944,6 +1034,12 @@ static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
         }
         break;
 
+    case TCG_TYPE_F16:
+    case TCG_TYPE_F32:
+    case TCG_TYPE_F64:
+        tcg_debug_assert(ret >= 16 && arg >= 16);
+        tcg_out_sse_move(s, OPC_MOVAPS, ret, arg);
+        break;
     case TCG_TYPE_V64:
         tcg_debug_assert(ret >= 16 && arg >= 16);
         tcg_out_vex_modrm(s, OPC_MOVQ_VqWq, ret, 0, arg);
@@ -971,6 +1067,19 @@ static const int avx2_dup_insn[4] = {
 static bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
                             TCGReg r, TCGReg a)
 {
+    /*
+     * As tcg_out_dupm_vec, the upper half of a V64 zero. Lane 1 of a may
+     * hold anything (the high half of a 64-bit input), so broadcast first.
+     */
+    if (type == TCG_TYPE_V64 && vece >= MO_32) {
+        if (vece == MO_32) {
+            tcg_out_vex_modrm(s, OPC_PSHUFD, r, 0, a);
+            tcg_out8(s, 0); /* [x, x, x, x] */
+            a = r;
+        }
+        tcg_out_vex_modrm(s, OPC_MOVQ_VqWq, r, 0, a); /* [x, x, 0, 0] */
+        return true;
+    }
     if (have_avx2) {
         tcg_out_vex_modrm_type(s, avx2_dup_insn[vece], r, 0, a, type);
     } else {
@@ -1002,6 +1111,20 @@ static bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
 static bool tcg_out_dupm_vec(TCGContext *s, TCGType type, unsigned vece,
                              TCGReg r, TCGReg base, intptr_t offset)
 {
+    /*
+     * The upper half of a V64 stays zero: the packed FP ops compute it too,
+     * and must not raise.
+     */
+    if (type == TCG_TYPE_V64 && vece >= MO_32) {
+        tcg_out_vex_modrm_offset(s, vece == MO_64 ? OPC_MOVQ_VqWq
+                                                  : OPC_MOVD_VyEy,
+                                 r, 0, base, offset);
+        if (vece == MO_32) {
+            tcg_out_vex_modrm(s, OPC_PSHUFD, r, 0, r);
+            tcg_out8(s, 0x50); /* [x, x, 0, 0] */
+        }
+        return true;
+    }
     if (have_avx2) {
         int vex_l = (type == TCG_TYPE_V256 ? P_VEXL : 0);
         tcg_out_vex_modrm_offset(s, avx2_dup_insn[vece] + vex_l,
@@ -1031,16 +1154,36 @@ static bool tcg_out_dupm_vec(TCGContext *s, TCGType type, unsigned vece,
     return true;
 }
 
+static void tcg_out_fp_movi(TCGContext *s, TCGReg ret, int64_t arg)
+{
+    if (arg == 0) {
+        tcg_out_sse_binary(s, OPC_PXOR, ret, ret, ret);
+        return;
+    }
+    if (have_avx1) {
+        tcg_out_vex_modrm_pool(s, OPC_MOVQ_VqWq, ret);
+    } else {
+        tcg_out_modrm_pool(s, OPC_MOVQ_VqWq, ret);
+    }
+    new_pool_label(s, arg, R_386_PC32, s->code_ptr - 4, -4);
+}
+
 static void tcg_out_dupi_vec(TCGContext *s, TCGType type, unsigned vece,
                              TCGReg ret, int64_t arg)
 {
     int vex_l = (type == TCG_TYPE_V256 ? P_VEXL : 0);
 
+    if (type == TCG_TYPE_F16 || type == TCG_TYPE_F32 ||
+        type == TCG_TYPE_F64) {
+        tcg_out_fp_movi(s, ret, arg);
+        return;
+    }
     if (arg == 0) {
         tcg_out_vex_modrm(s, OPC_PXOR, ret, ret, ret);
         return;
     }
-    if (arg == -1) {
+    /* All-ones in the upper half of a V64 would be NaNs to the FP ops. */
+    if (arg == -1 && type != TCG_TYPE_V64) {
         tcg_out_vex_modrm(s, OPC_PCMPEQB + vex_l, ret, ret, ret);
         return;
     }
@@ -1195,6 +1338,24 @@ static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret,
                        TCGReg arg1, intptr_t arg2)
 {
     switch (type) {
+    case TCG_TYPE_F16:
+        /* Zero-extended, as the conversions read four lanes. */
+        tcg_debug_assert(ret >= 16 && have_avx1);
+        tcg_out_vex_modrm(s, OPC_PXOR, ret, ret, ret);
+        tcg_out_vex_modrm_offset(s, OPC_PINSRW, ret, ret, arg1, arg2);
+        tcg_out8(s, 0);
+        break;
+    case TCG_TYPE_F32:
+    case TCG_TYPE_F64:
+        tcg_debug_assert(ret >= 16);
+        if (have_avx1) {
+            tcg_out_vex_modrm_offset(s, OPC_MOVS_VxWx | tcg_fp_prefix(type),
+                                     ret, 0, arg1, arg2);
+        } else {
+            tcg_out_modrm_offset(s, OPC_MOVS_VxWx | tcg_fp_prefix(type),
+                                 ret, arg1, arg2);
+        }
+        break;
     case TCG_TYPE_I32:
         if (ret < 16) {
             tcg_out_modrm_offset(s, OPC_MOVL_GvEv, ret, arg1, arg2);
@@ -1240,6 +1401,22 @@ static void tcg_out_st(TCGContext *s, TCGType type, TCGReg arg,
                        TCGReg arg1, intptr_t arg2)
 {
     switch (type) {
+    case TCG_TYPE_F16:
+        tcg_debug_assert(arg >= 16 && have_avx1);
+        tcg_out_vex_modrm_offset(s, OPC_PEXTRW_Mem, arg, 0, arg1, arg2);
+        tcg_out8(s, 0);
+        break;
+    case TCG_TYPE_F32:
+    case TCG_TYPE_F64:
+        tcg_debug_assert(arg >= 16);
+        if (have_avx1) {
+            tcg_out_vex_modrm_offset(s, OPC_MOVS_WxVx | tcg_fp_prefix(type),
+                                     arg, 0, arg1, arg2);
+        } else {
+            tcg_out_modrm_offset(s, OPC_MOVS_WxVx | tcg_fp_prefix(type),
+                                 arg, arg1, arg2);
+        }
+        break;
     case TCG_TYPE_I32:
         if (arg < 16) {
             tcg_out_modrm_offset(s, OPC_MOVL_EvGv, arg, arg1, arg2);
@@ -3758,6 +3935,403 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
     }
 }
 
+#if TCG_TARGET_HAS_fp
+/* The vector forms need AVX, as TCG only has vector types with it. */
+static bool tcg_can_emit_fp_vector(TCGOpcode opc, TCGType type, unsigned vece)
+{
+    if (!have_avx1 || (vece != MO_32 && vece != MO_64) || (type == TCG_TYPE_V64 && vece == MO_64)) { return false; }
+
+    switch (opc) {
+        case INDEX_op_add_fp   :
+        case INDEX_op_sub_fp   :
+        case INDEX_op_mul_fp   :
+        case INDEX_op_sqrt_fp  :
+        case INDEX_op_min_fp   :
+        case INDEX_op_max_fp   :
+        case INDEX_op_minnum_fp:
+        case INDEX_op_maxnum_fp:
+        case INDEX_op_neg_fp   :
+        case INDEX_op_abs_fp   :
+        case INDEX_op_cmp_fp   :
+        case INDEX_op_rint_fp  :
+        case INDEX_op_addp_fp  :
+        case INDEX_op_fpchk_fp : return true;
+        /* 0 / 0 in the unused upper lanes of a V64 would raise invalid. */
+        case INDEX_op_div_fp: return type == TCG_TYPE_V128;
+        case INDEX_op_fma_fp:
+        case INDEX_op_fms_fp: return have_fma;
+        /* No packed int64 <-> double before AVX-512. */
+        case INDEX_op_cvt_s_fp:
+        case INDEX_op_cvt_fp_s: return vece == MO_32;
+        default               : return false;
+    }
+}
+
+bool tcg_can_emit_fp_op(TCGOpcode opc, TCGType type, unsigned vece)
+{
+    switch (opc) {
+        case INDEX_op_cvtn_fp:
+        case INDEX_op_cvtl_fp:
+            /* vece is the narrow size. */
+            return type == TCG_TYPE_V128 && have_avx1 && (vece == MO_32 || (vece == MO_16 && have_f16c));
+        default: break;
+    }
+
+    if (tcg_fp_is_vector(type)) { return tcg_can_emit_fp_vector(opc, type, vece); }
+    if (type == TCG_TYPE_F16) {
+        /* Only converted to and from single, with F16C. */
+        return have_f16c && (opc == INDEX_op_cvt_fp || opc == INDEX_op_fpchk_fp);
+    }
+    if (type != TCG_TYPE_F32 && type != TCG_TYPE_F64) {
+        return opc == INDEX_op_cvt_f2i_s && (type == TCG_TYPE_I32 || type == TCG_TYPE_I64);
+    }
+
+    switch (opc) {
+        case INDEX_op_fma_fp   :
+        case INDEX_op_fms_fp   : return have_fma;
+        case INDEX_op_add_fp   :
+        case INDEX_op_sub_fp   :
+        case INDEX_op_mul_fp   :
+        case INDEX_op_div_fp   :
+        case INDEX_op_sqrt_fp  :
+        case INDEX_op_min_fp   :
+        case INDEX_op_max_fp   :
+        case INDEX_op_minnum_fp:
+        case INDEX_op_maxnum_fp:
+        case INDEX_op_neg_fp   :
+        case INDEX_op_abs_fp   :
+        case INDEX_op_cmp_fp   :
+        case INDEX_op_fcmp_fp  :
+        case INDEX_op_cvt_fp   :
+        case INDEX_op_cvt_s_i2f: return true;
+        case INDEX_op_rint_fp  : return have_sse41;
+        default                : return false;
+    }
+}
+
+bool tcg_can_emit_fp_cvt(TCGOpcode opc, TCGType type, unsigned other, TCGArg round, TCGArg fbits)
+{
+    bool fp        = type == TCG_TYPE_F32 || type == TCG_TYPE_F64;
+    bool int_other = other == TCG_TYPE_I32 || other == TCG_TYPE_I64;
+
+    if (fbits) { return false; }
+
+    switch (opc) {
+        case INDEX_op_cvt_fp:
+            if (type == TCG_TYPE_F16 || other == TCG_TYPE_F16) {
+                return have_f16c && (type == TCG_TYPE_F32 || other == TCG_TYPE_F32);
+            }
+            break;
+        case INDEX_op_cvt_s_fp: return tcg_can_emit_fp_op(opc, type, other);
+        case INDEX_op_cvt_fp_s: return tcg_can_emit_fp_op(opc, type, other) && round < TCG_FP_ROUND_TIES_AWAY;
+        case INDEX_op_rint_fp:
+            if (tcg_fp_is_vector(type)) {
+                return tcg_can_emit_fp_op(opc, type, other) && round != TCG_FP_ROUND_TIES_AWAY;
+            }
+            break;
+        default: break;
+    }
+    if (!fp) { return false; }
+
+    switch (opc) {
+        case INDEX_op_cvt_s_i2f: return int_other;
+        case INDEX_op_cvt_f2i_s:
+            return int_other && (round == TCG_FP_ROUND_TO_ZERO || (have_sse41 && round < TCG_FP_ROUND_TIES_AWAY));
+        case INDEX_op_cvt_fp : return (other == TCG_TYPE_F32 || other == TCG_TYPE_F64) && other != type;
+        case INDEX_op_rint_fp: return have_sse41 && round != TCG_FP_ROUND_TIES_AWAY;
+        default              : return false;
+    }
+}
+
+/* ROUNDSS immediate: the mode, or bit 2 for MXCSR's; bit 3 suppresses inexact. */
+static int tcg_fp_round_imm(TCGArg round)
+{
+    switch (round) {
+        case TCG_FP_ROUND_NEAREST_EVEN : return 0 | 8;
+        case TCG_FP_ROUND_DOWN         : return 1 | 8;
+        case TCG_FP_ROUND_UP           : return 2 | 8;
+        case TCG_FP_ROUND_TO_ZERO      : return 3 | 8;
+        case TCG_FP_ROUND_CURRENT      : return 4 | 8;
+        case TCG_FP_ROUND_CURRENT_EXACT: return 4;
+        default                        : assert_not_reached();
+    }
+}
+
+static void tcg_out_fp_round(TCGContext* s, TCGType type, TCGReg r, TCGReg rm, int imm)
+{
+    tcg_out_sse_unary(s, type == TCG_TYPE_F32 ? OPC_ROUNDSS : OPC_ROUNDSD, r, rm);
+    tcg_out8(s, imm);
+}
+
+/* VEX 3-operand op with a 16-byte constant from the pool as the last operand. */
+/* A 128-bit pool constant of val in both halves as the rm operand. */
+static void tcg_out_vex_pool128(TCGContext* s, int opc, TCGReg r, TCGReg v, uint64_t val)
+{
+    tcg_out_vex_opc(s, opc, r, v, 0, 0);
+    tcg_out8(s, LOWREGMASK(r) << 3 | 5);
+    tcg_out32(s, 0);
+    new_pool_l2(s, R_386_PC32, s->code_ptr - 4, -4, val, val);
+}
+
+/* Lane bits of the MOVMSK result that belong to the value. */
+static uint32_t tcg_fp_lane_mask(TCGType type, unsigned vece)
+{
+    int lanes = type == TCG_TYPE_V128 ? 16 >> vece : type == TCG_TYPE_V64 ? 8 >> vece : 1;
+
+    /* PMOVMSKB gives two bits per halfword. */
+    if (vece == MO_16) { lanes *= 2; }
+    return (1u << lanes) - 1;
+}
+
+static void tcg_out_fpchk(TCGContext* s, TCGType type, unsigned vece, TCGReg r, TCGReg a, TCGReg b, TCGArg check)
+{
+    static const uint64_t abs_mask[] = {0, 0x7fff, 0x7fffffff, 0x7fffffffffffffffull};
+    static const uint64_t inf[]      = {0, 0x7c00, 0x7f800000, 0x7ff0000000000000ull};
+    static const uint64_t min_norm[] = {0, 0x0400, 0x00800000, 0x0010000000000000ull};
+    int                   gt, eq, msk;
+    uint64_t              limit;
+
+    if (type == TCG_TYPE_F16) { vece = MO_16; }
+    switch (vece) {
+        case MO_16: gt = OPC_PCMPGTW, eq = OPC_PCMPEQW, msk = OPC_PMOVMSKB; break;
+        case MO_32: gt = OPC_PCMPGTD, eq = OPC_PCMPEQD, msk = OPC_MOVMSKPS; break;
+        case MO_64: gt = OPC_PCMPGTQ, eq = OPC_PCMPEQQ, msk = OPC_MOVMSKPD; break;
+        default   : assert_not_reached();
+    }
+
+    switch (check) {
+        case TCG_FP_CHECK_UNORDERED_OR_EQ:
+            tcg_debug_assert(vece != MO_16);
+            tcg_out_vex_modrm(s, OPC_CMPS | (vece == MO_64 ? P_DATA16 : 0), TCG_TMP_VEC, a, b);
+            tcg_out8(s, 8); /* EQ_UQ */
+            break;
+        default:
+            /* On the magnitude's bits, so nothing is raised. */
+            tcg_out_vex_pool128(s, OPC_PAND, TCG_TMP_VEC, a, dup_const(vece, abs_mask[vece]));
+            switch (check) {
+                case TCG_FP_CHECK_NAN:
+                    tcg_out_vex_pool128(s, gt, TCG_TMP_VEC, TCG_TMP_VEC, dup_const(vece, inf[vece]));
+                    break;
+                case TCG_FP_CHECK_MIN_NORMAL:
+                    tcg_out_vex_pool128(s, eq, TCG_TMP_VEC, TCG_TMP_VEC, dup_const(vece, min_norm[vece]));
+                    break;
+                case TCG_FP_CHECK_I32_RANGE:
+                case TCG_FP_CHECK_I64_RANGE:
+                    tcg_debug_assert(vece != MO_16);
+                    /* 2^31 - 1 rounds up to 2^31 in single, and 2^63 is exact in both. */
+                    if (check == TCG_FP_CHECK_I64_RANGE) { limit = vece == MO_32 ? 0x5f000000 : 0x43e0000000000000ull; }
+                    else {
+                        limit = vece == MO_32 ? 0x4f000000 : 0x41dfffffffc00000ull;
+                    }
+                    tcg_out_vex_pool128(s, gt, TCG_TMP_VEC, TCG_TMP_VEC, dup_const(vece, limit - 1));
+                    break;
+                default: assert_not_reached();
+            }
+            break;
+    }
+    tcg_out_vex_modrm(s, msk, r, 0, TCG_TMP_VEC);
+    tgen_arithi(s, ARITH_AND, r, tcg_fp_lane_mask(type, vece), 0);
+}
+
+/* Narrowing writes the bottom half and zeroes the top, or with top merges above the old bottom. */
+static void tcg_out_fp_cvtn(TCGContext* s, unsigned vece, TCGReg d, TCGReg old, TCGReg n, bool top)
+{
+    TCGReg t = top ? TCG_TMP_VEC : d;
+
+    if (vece == MO_16) {
+        tcg_out_vex_modrm(s, OPC_VCVTPS2PH, n, 0, t);
+        tcg_out8(s, 4); /* MXCSR rounding */
+    }
+    else {
+        tcg_out_vex_modrm(s, OPC_CVTPD2PS, t, 0, n);
+    }
+    if (top) { tcg_out_vex_modrm(s, OPC_MOVLHPS, d, old, TCG_TMP_VEC); }
+}
+
+static void tcg_out_fp_cvtl(TCGContext* s, unsigned vece, TCGReg d, TCGReg n, bool top)
+{
+    if (top) {
+        tcg_out_vex_modrm(s, OPC_MOVHLPS, TCG_TMP_VEC, n, n);
+        n = TCG_TMP_VEC;
+    }
+    tcg_out_vex_modrm(s, vece == MO_16 ? OPC_VCVTPH2PS : OPC_CVTPS2PD, d, 0, n);
+}
+
+static void tcg_out_movi32_noflags(TCGContext* s, TCGReg r, uint32_t val)
+{
+    tcg_out_opc(s, OPC_MOVL_Iv + LOWREGMASK(r), 0, r, 0);
+    tcg_out32(s, val);
+}
+
+static void tcg_out_fp_op(TCGContext* s, TCGOpcode opc, TCGType type, unsigned vece, const TCGArg args[TCG_MAX_OP_ARGS],
+                          const int const_args[TCG_MAX_OP_ARGS])
+{
+    TCGReg a0 = args[0], a1 = args[1], a2 = args[2];
+    bool   vec = tcg_fp_is_vector(type);
+    int    pfx;
+
+    switch (opc) {
+        /* type is the integer type, a2 the fp one. */
+        case INDEX_op_cvt_f2i_s: {
+            int    rexw = type == TCG_TYPE_I64 ? P_REXW : 0;
+            TCGReg src  = a1;
+
+            if (args[3] != TCG_FP_ROUND_TO_ZERO) {
+                tcg_out_fp_round(s, (TCGType)a2, TCG_TMP_VEC, a1, tcg_fp_round_imm(args[3]) & ~8);
+                src = TCG_TMP_VEC;
+            }
+            tcg_out_sse_move(s, OPC_CVTTS2SI | tcg_fp_prefix((TCGType)a2) | rexw, a0, src);
+            return;
+        }
+        case INDEX_op_fpchk_fp: tcg_out_fpchk(s, type, vece, a0, a1, a2, args[3]); return;
+        case INDEX_op_cvtn_fp : tcg_out_fp_cvtn(s, vece, a0, a1, a2, args[3]); return;
+        case INDEX_op_cvtl_fp : tcg_out_fp_cvtl(s, vece, a0, a1, a2); return;
+        case INDEX_op_cvt_fp:
+            if (type == TCG_TYPE_F16) {
+                /* Only lane 0 converted: the others are zeroed so they raise nothing. */
+                tcg_out_vex_modrm(s, OPC_XORPS, TCG_TMP_VEC, TCG_TMP_VEC, TCG_TMP_VEC);
+                tcg_out_vex_modrm(s, (OPC_MOVS_VxWx | P_SIMDF3), TCG_TMP_VEC, TCG_TMP_VEC, a1);
+                tcg_out_vex_modrm(s, OPC_VCVTPS2PH, TCG_TMP_VEC, 0, a0);
+                tcg_out8(s, 4);
+                return;
+            }
+            if ((TCGType)a2 == TCG_TYPE_F16) {
+                tcg_out_vex_modrm(s, OPC_PXOR, TCG_TMP_VEC, TCG_TMP_VEC, TCG_TMP_VEC);
+                tcg_out_vex_modrm(s, OPC_PBLENDW, TCG_TMP_VEC, TCG_TMP_VEC, a1);
+                tcg_out8(s, 1);
+                tcg_out_vex_modrm(s, OPC_VCVTPH2PS, a0, 0, TCG_TMP_VEC);
+                return;
+            }
+            break;
+        default: break;
+    }
+
+    pfx = tcg_fp_prefix_vece(type, vece);
+    if (vec) {
+        switch (opc) {
+            case INDEX_op_sqrt_fp: tcg_out_vex_modrm(s, OPC_SQRTS | pfx, a0, 0, a1); return;
+            case INDEX_op_rint_fp:
+                tcg_out_vex_modrm(s, vece == MO_64 ? OPC_ROUNDPD : OPC_ROUNDPS, a0, 0, a1);
+                tcg_out8(s, tcg_fp_round_imm(args[2]));
+                return;
+            case INDEX_op_cvt_s_fp: tcg_out_vex_modrm(s, OPC_CVTDQ2PS, a0, 0, a1); return;
+            case INDEX_op_cvt_fp_s:
+                if (args[2] != TCG_FP_ROUND_TO_ZERO) {
+                    tcg_out_vex_modrm(s, OPC_ROUNDPS, TCG_TMP_VEC, 0, a1);
+                    tcg_out8(s, tcg_fp_round_imm(args[2]) & ~8);
+                    a1 = TCG_TMP_VEC;
+                }
+                tcg_out_vex_modrm(s, OPC_CVTTPS2DQ, a0, 0, a1);
+                return;
+            case INDEX_op_addp_fp:
+                if (type == TCG_TYPE_V64) {
+                    /* [a0+a1, 0, b0+b1, 0], then lanes 0 and 2 moved down over zeros. */
+                    tcg_out_vex_modrm(s, OPC_HADDPS, TCG_TMP_VEC, a1, a2);
+                    tcg_out_vex_modrm(s, OPC_SHUFPS, a0, TCG_TMP_VEC, TCG_TMP_VEC);
+                    tcg_out8(s, 0xd8);
+                }
+                else {
+                    tcg_out_vex_modrm(s, vece == MO_64 ? OPC_HADDPD : OPC_HADDPS, a0, a1, a2);
+                }
+                return;
+            default: break;
+        }
+    }
+
+    switch (opc) {
+        case INDEX_op_fma_fp:
+        case INDEX_op_fms_fp: {
+            bool sub = opc == INDEX_op_fms_fp;
+            int  op  = vec ? (sub ? OPC_VFNMADD231P : OPC_VFMADD231P) : (sub ? OPC_VFNMADD231S : OPC_VFMADD231S);
+            bool dbl = vec ? vece == MO_64 : type == TCG_TYPE_F64;
+
+            /* a0 is tied to the addend a1. */
+            tcg_out_vex_modrm(s, op | (dbl ? P_VEXW : 0), a0, a2, args[3]);
+            return;
+        }
+        default: break;
+    }
+
+    switch (opc) {
+        case INDEX_op_add_fp: tcg_out_sse_binary(s, OPC_ADDS | pfx, a0, a1, a2); break;
+        case INDEX_op_sub_fp: tcg_out_sse_binary(s, OPC_SUBS | pfx, a0, a1, a2); break;
+        case INDEX_op_mul_fp: tcg_out_sse_binary(s, OPC_MULS | pfx, a0, a1, a2); break;
+        case INDEX_op_div_fp: tcg_out_sse_binary(s, OPC_DIVS | pfx, a0, a1, a2); break;
+        /* Unordered and equal inputs are left to the caller. */
+        case INDEX_op_min_fp   :
+        case INDEX_op_minnum_fp: tcg_out_sse_binary(s, OPC_MINS | pfx, a0, a1, a2); break;
+        case INDEX_op_max_fp   :
+        case INDEX_op_maxnum_fp: tcg_out_sse_binary(s, OPC_MAXS | pfx, a0, a1, a2); break;
+        case INDEX_op_sqrt_fp  : tcg_out_sse_unary(s, OPC_SQRTS | pfx, a0, a1); break;
+        case INDEX_op_rint_fp  : tcg_out_fp_round(s, type, a0, a1, tcg_fp_round_imm(a2)); break;
+        case INDEX_op_cvt_fp   : tcg_out_sse_unary(s, OPC_CVTS2S | tcg_fp_prefix((TCGType)a2), a0, a1); break;
+
+        case INDEX_op_neg_fp:
+        case INDEX_op_abs_fp: {
+            bool    neg  = opc == INDEX_op_neg_fp;
+            bool    dbl  = vec ? vece == MO_64 : type == TCG_TYPE_F64;
+            int64_t sign = dbl ? INT64_MIN : INT32_MIN & 0xffffffffu;
+
+            if (vec) {
+                tcg_out_dupi_vec(s, type, dbl ? MO_64 : MO_32, TCG_TMP_VEC,
+                                 dup_const(dbl ? MO_64 : MO_32, neg ? sign : ~sign));
+            }
+            else {
+                tcg_out_fp_movi(s, TCG_TMP_VEC, neg ? sign : ~sign);
+            }
+            if (!have_avx1 && a0 != a1) { tcg_out_sse_move(s, OPC_MOVAPS, a0, a1); }
+            tcg_out_sse_binary(s, neg ? OPC_XORPS : OPC_ANDPS, a0, have_avx1 ? a1 : a0, TCG_TMP_VEC);
+            break;
+        }
+
+        case INDEX_op_cmp_fp: {
+            TCGReg x = a1, y = a2;
+            int    imm;
+
+            switch (args[3]) {
+                case TCG_COND_EQ: imm = 0; break;
+                case TCG_COND_LT: imm = 1; break;
+                case TCG_COND_LE: imm = 2; break;
+                case TCG_COND_GT: imm = 1, x = a2, y = a1; break;
+                case TCG_COND_GE: imm = 2, x = a2, y = a1; break;
+                default         : assert_not_reached();
+            }
+            if (have_avx1) { tcg_out_vex_modrm(s, OPC_CMPS | pfx, a0, x, y); }
+            else {
+                tcg_out_sse_move(s, OPC_MOVAPS, TCG_TMP_VEC, x);
+                tcg_out_modrm(s, OPC_CMPS | pfx, TCG_TMP_VEC, y);
+            }
+            tcg_out8(s, imm);
+            if (!have_avx1) { tcg_out_sse_move(s, OPC_MOVAPS, a0, TCG_TMP_VEC); }
+            break;
+        }
+
+        case INDEX_op_fcmp_fp: {
+            /* Unordered sets ZF, PF and CF, less CF, equal ZF. */
+            TCGLabel* done = gen_new_label();
+            int       op   = (args[3] ? OPC_COMIS : OPC_UCOMIS) | (type == TCG_TYPE_F64 ? P_DATA16 : 0);
+
+            tcg_out_sse_move(s, op, a1, a2);
+            tcg_out_movi32_noflags(s, a0, 0x30000000);
+            tcg_out_jxx(s, JCC_JP, done, true);
+            tcg_out_movi32_noflags(s, a0, 0x80000000);
+            tcg_out_jxx(s, JCC_JB, done, true);
+            tcg_out_movi32_noflags(s, a0, 0x60000000);
+            tcg_out_jxx(s, JCC_JE, done, true);
+            tcg_out_movi32_noflags(s, a0, 0x20000000);
+            tcg_out_label(s, done);
+            break;
+        }
+
+        case INDEX_op_cvt_s_i2f:
+            tcg_out_sse_binary(s, OPC_CVTSI2S | pfx | ((TCGType)a2 == TCG_TYPE_I64 ? P_REXW : 0), a0, a0, a1);
+            break;
+
+        default: assert_not_reached();
+    }
+}
+#endif /* TCG_TARGET_HAS_fp */
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -4099,6 +4673,32 @@ static TCGConstraintSetIndex
 tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 {
     switch (op) {
+        case INDEX_op_add_fp   :
+        case INDEX_op_sub_fp   :
+        case INDEX_op_mul_fp   :
+        case INDEX_op_div_fp   :
+        case INDEX_op_min_fp   :
+        case INDEX_op_max_fp   :
+        case INDEX_op_minnum_fp:
+        case INDEX_op_maxnum_fp: return have_avx1 ? C_O1_I2(x, x, x) : C_O1_I2(x, 0, x);
+        case INDEX_op_sqrt_fp  :
+        case INDEX_op_rint_fp  :
+        case INDEX_op_cvt_fp   :
+        case INDEX_op_neg_fp   :
+        case INDEX_op_abs_fp   : return C_O1_I1(x, x);
+        case INDEX_op_cmp_fp   :
+        case INDEX_op_addp_fp  : return C_O1_I2(x, x, x);
+        case INDEX_op_fcmp_fp  :
+        case INDEX_op_fpchk_fp : return C_O1_I2(r, x, x);
+        case INDEX_op_fma_fp   :
+        case INDEX_op_fms_fp   : return C_O1_I3(x, 0, x, x);
+        case INDEX_op_cvt_s_fp :
+        case INDEX_op_cvt_fp_s :
+        case INDEX_op_cvtl_fp  : return C_O1_I1(x, x);
+        case INDEX_op_cvtn_fp  : return C_O1_I2(x, 0, x);
+        case INDEX_op_cvt_s_i2f: return C_O1_I1(x, r);
+        case INDEX_op_cvt_f2i_s: return C_O1_I1(r, x);
+
     case INDEX_op_ld_vec:
     case INDEX_op_dupm_vec:
         return C_O1_I1(x, r);
@@ -4789,6 +5389,13 @@ static void tcg_target_init(TCGContext *s)
     }
     if (have_avx2) {
         tcg_target_available_regs[TCG_TYPE_V256] = ALL_VECTOR_REGS;
+    }
+    if (TCG_TARGET_HAS_fp) {
+        tcg_target_available_regs[TCG_TYPE_F32] = ALL_VECTOR_REGS;
+        tcg_target_available_regs[TCG_TYPE_F64] = ALL_VECTOR_REGS;
+        if (have_f16c) {
+            tcg_target_available_regs[TCG_TYPE_F16] = ALL_VECTOR_REGS;
+        }
     }
 
     tcg_target_call_clobber_regs = ALL_VECTOR_REGS;
