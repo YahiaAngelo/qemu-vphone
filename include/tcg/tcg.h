@@ -142,8 +142,13 @@ typedef enum TCGType {
     TCG_TYPE_V128,
     TCG_TYPE_V256,
 
+    /* Scalar IEEE values in a vector register (TCG_TARGET_HAS_fp). */
+    TCG_TYPE_F16,
+    TCG_TYPE_F32,
+    TCG_TYPE_F64,
+
     /* Number of different types (integer not enum) */
-#define TCG_TYPE_COUNT  (TCG_TYPE_V256 + 1)
+#define TCG_TYPE_COUNT  (TCG_TYPE_F64 + 1)
 
     /* An alias for the size of the host register.  */
 #if TCG_TARGET_REG_BITS == 32
@@ -169,8 +174,19 @@ typedef enum TCGType {
 static inline int tcg_type_size(TCGType t)
 {
     unsigned i = t;
+
+    switch (t) {
+    case TCG_TYPE_F16:
+        return 2;
+    case TCG_TYPE_F32:
+        return 4;
+    case TCG_TYPE_F64:
+        return 8;
+    default:
+        break;
+    }
     if (i >= TCG_TYPE_V64) {
-        tcg_debug_assert(i < TCG_TYPE_COUNT);
+        tcg_debug_assert(i <= TCG_TYPE_V256);
         i -= TCG_TYPE_V64 - 1;
     }
     return 4 << i;
@@ -723,7 +739,7 @@ typedef struct TCGArgConstraint {
 
 #define TCG_MAX_OP_ARGS 16
 
-/* Bits for TCGOpDef->flags, 8 bits available, all used.  */
+/* Bits for TCGOpDef->flags, 16 bits available.  */
 enum {
     /* Instruction exits the translation block.  */
     TCG_OPF_BB_EXIT      = 0x01,
@@ -747,6 +763,8 @@ enum {
     TCG_OPF_CARRY_OUT    = 0x100,
     /* Instruction consumes carry in. */
     TCG_OPF_CARRY_IN     = 0x200,
+    /* Instruction operands are IEEE floating point, scalar or packed. */
+    TCG_OPF_FLOAT        = 0x400,
 };
 
 typedef struct TCGOpDef {
@@ -952,6 +970,47 @@ void tcg_register_jit(const void *buf, size_t buf_size);
    return > 0 if it is directly supportable;
    return < 0 if we must call tcg_expand_vec_op.  */
 int tcg_can_emit_vec_op(TCGOpcode, TCGType, unsigned);
+bool tcg_can_emit_fp_op(TCGOpcode, TCGType, unsigned);
+
+/*
+ * Conversions and rounding additionally depend on their constant arguments.
+ * other is the integer type for cvt_*_i2f and cvt_f2i_*, otherwise vece.
+ */
+bool tcg_can_emit_fp_cvt(TCGOpcode opc, TCGType type, unsigned other,
+                         TCGArg round, TCGArg fbits);
+
+/*
+ * Whether the floating-point opcodes match AArch64 exactly. Otherwise, a NaN
+ * result, a result of +/- the minimum normal, and min/max of unordered or
+ * equal inputs may differ, with the flags the host raised a subset of the
+ * AArch64 ones; fp -> int is only defined for ordered inputs of magnitude
+ * below 2^(n-1) - 1. Such a host is never put in a flush-to-zero mode.
+ */
+bool tcg_fp_arm_exact(void);
+
+/* What fpchk_fp looks for in any lane; only for hosts that are not exact. */
+typedef enum TCGFPCheck {
+    TCG_FP_CHECK_NAN,
+    TCG_FP_CHECK_MIN_NORMAL,      /* +/- the minimum normal */
+    TCG_FP_CHECK_I32_RANGE,       /* NaN, or magnitude >= 2^31 - 1 rounded up */
+    TCG_FP_CHECK_I64_RANGE,       /* NaN, or magnitude >= 2^63 */
+    TCG_FP_CHECK_UNORDERED_OR_EQ, /* of the two inputs */
+} TCGFPCheck;
+
+/*
+ * Constant rounding argument of the conversion and rint opcodes; the
+ * directed ones match FloatRoundMode.
+ */
+typedef enum TCGFPRound {
+    TCG_FP_ROUND_NEAREST_EVEN = 0,
+    TCG_FP_ROUND_DOWN         = 1,
+    TCG_FP_ROUND_UP           = 2,
+    TCG_FP_ROUND_TO_ZERO      = 3,
+    TCG_FP_ROUND_TIES_AWAY    = 4,
+    /* Round using the ambient mode; _EXACT additionally raises Inexact. */
+    TCG_FP_ROUND_CURRENT       = 5,
+    TCG_FP_ROUND_CURRENT_EXACT = 6,
+} TCGFPRound;
 
 /* Expand the tuple (opc, type, vece) on the given arguments.  */
 void tcg_expand_vec_op(TCGOpcode, TCGType, unsigned, TCGArg, ...);

@@ -89,6 +89,12 @@ bool tcg_can_emit_vecop_list(const TCGOpcode *list,
         }
 #endif
 
+        if (tcg_op_defs[opc].flags & TCG_OPF_FLOAT) {
+            if (tcg_can_emit_fp_op(opc, type, vece)) {
+                continue;
+            }
+            return false;
+        }
         if (tcg_can_emit_vec_op(opc, type, vece)) {
             continue;
         }
@@ -596,6 +602,236 @@ void tcg_gen_mul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     do_op3_nofail(vece, r, a, b, INDEX_op_mul_vec);
 }
+
+/* Floating point (ported from Inferno, clang-format style kept). */
+static void do_fp3(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGOpcode opc)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGTemp* bt   = tcgv_vec_temp(b);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(bt->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(opc, type, vece));
+    vec_gen_3(opc, type, vece, temp_arg(rt), temp_arg(at), temp_arg(bt));
+}
+
+void tcg_gen_add_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_add_fp); }
+
+void tcg_gen_sub_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_sub_fp); }
+
+void tcg_gen_mul_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_mul_fp); }
+
+void tcg_gen_div_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_div_fp); }
+
+void tcg_gen_min_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_min_fp); }
+
+void tcg_gen_max_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_max_fp); }
+
+void tcg_gen_minnum_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_minnum_fp); }
+
+void tcg_gen_maxnum_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_maxnum_fp); }
+
+void tcg_gen_sqrt_fp(unsigned vece, TCGv_vec r, TCGv_vec a)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(INDEX_op_sqrt_fp, type, vece));
+    vec_gen_2(INDEX_op_sqrt_fp, type, vece, temp_arg(rt), temp_arg(at));
+}
+
+static void do_fp_cvt(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg round, TCGArg fbits, TCGOpcode opc)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_cvt(opc, type, vece, round, fbits));
+    vec_gen_3(opc, type, vece, temp_arg(rt), temp_arg(at), opc == INDEX_op_rint_fp ? round : fbits);
+}
+
+void tcg_gen_cmp_fp(TCGCond cond, unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGTemp* bt   = tcgv_vec_temp(b);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(bt->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(INDEX_op_cmp_fp, type, vece));
+    vec_gen_4(INDEX_op_cmp_fp, type, vece, temp_arg(rt), temp_arg(at), temp_arg(bt), cond);
+}
+
+static void do_fp_fma(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec n, TCGv_vec m, TCGOpcode opc)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGTemp* nt   = tcgv_vec_temp(n);
+    TCGTemp* mt   = tcgv_vec_temp(m);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(nt->base_type == type);
+    tcg_debug_assert(mt->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(opc, type, vece));
+    vec_gen_4(opc, type, vece, temp_arg(rt), temp_arg(at), temp_arg(nt), temp_arg(mt));
+}
+
+void tcg_gen_fma_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec n, TCGv_vec m)
+{ do_fp_fma(vece, r, a, n, m, INDEX_op_fma_fp); }
+
+void tcg_gen_fms_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec n, TCGv_vec m)
+{ do_fp_fma(vece, r, a, n, m, INDEX_op_fms_fp); }
+
+void tcg_gen_cvt_i2f(TCGv_vec r, TCGTemp* it, TCGType itype, bool uns, TCGArg fbits)
+{
+    TCGTemp*  rt  = tcgv_vec_temp(r);
+    TCGOpcode opc = uns ? INDEX_op_cvt_u_i2f : INDEX_op_cvt_s_i2f;
+
+    tcg_debug_assert(tcg_can_emit_fp_cvt(opc, rt->base_type, itype, 0, fbits));
+    tcg_gen_op4(opc, rt->base_type, temp_arg(rt), temp_arg(it), itype, fbits);
+}
+
+void tcg_gen_cvt_f2i(TCGTemp* rt, TCGType itype, TCGv_vec a, bool uns, TCGArg round, TCGArg fbits)
+{
+    TCGTemp*  at  = tcgv_vec_temp(a);
+    TCGOpcode opc = uns ? INDEX_op_cvt_f2i_u : INDEX_op_cvt_f2i_s;
+
+    tcg_debug_assert(tcg_can_emit_fp_cvt(opc, at->base_type, itype, round, fbits));
+    tcg_gen_op5(opc, itype, temp_arg(rt), temp_arg(at), at->base_type, round, fbits);
+}
+
+void tcg_gen_cvt_fp(TCGv_vec r, TCGv_vec a)
+{
+    TCGTemp* rt = tcgv_vec_temp(r);
+    TCGTemp* at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(tcg_can_emit_fp_cvt(INDEX_op_cvt_fp, rt->base_type, at->base_type, 0, 0));
+    vec_gen_3(INDEX_op_cvt_fp, rt->base_type, 0, temp_arg(rt), temp_arg(at), at->base_type);
+}
+
+void tcg_gen_rint_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg round)
+{ do_fp_cvt(vece, r, a, round, 0, INDEX_op_rint_fp); }
+
+void tcg_gen_cvt_s_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg fbits)
+{ do_fp_cvt(vece, r, a, 0, fbits, INDEX_op_cvt_s_fp); }
+
+void tcg_gen_cvt_u_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg fbits)
+{ do_fp_cvt(vece, r, a, 0, fbits, INDEX_op_cvt_u_fp); }
+
+static void do_fp_cvt_fp_i(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg round, TCGArg fbits, TCGOpcode opc)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_cvt(opc, type, vece, round, fbits));
+    vec_gen_4(opc, type, vece, temp_arg(rt), temp_arg(at), round, fbits);
+}
+
+void tcg_gen_cvt_fp_s(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg round, TCGArg fbits)
+{ do_fp_cvt_fp_i(vece, r, a, round, fbits, INDEX_op_cvt_fp_s); }
+
+void tcg_gen_cvt_fp_u(unsigned vece, TCGv_vec r, TCGv_vec a, TCGArg round, TCGArg fbits)
+{ do_fp_cvt_fp_i(vece, r, a, round, fbits, INDEX_op_cvt_fp_u); }
+
+static void do_cvtn(TCGOpcode opc, unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec n, bool top)
+{
+    TCGTemp* rt = tcgv_vec_temp(r);
+    TCGTemp* at = tcgv_vec_temp(a);
+    TCGTemp* nt = tcgv_vec_temp(n);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(at->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(nt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcg_can_emit_fp_op(opc, TCG_TYPE_V128, vece));
+    vec_gen_4(opc, TCG_TYPE_V128, vece, temp_arg(rt), temp_arg(at), temp_arg(nt), top);
+}
+
+void tcg_gen_cvtn_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec n, bool top)
+{ do_cvtn(INDEX_op_cvtn_fp, vece, r, a, n, top); }
+
+void tcg_gen_cvtxn_fp(TCGv_vec r, TCGv_vec a, TCGv_vec n, bool top) { do_cvtn(INDEX_op_cvtxn_fp, MO_32, r, a, n, top); }
+
+void tcg_gen_cvtl_fp(unsigned vece, TCGv_vec r, TCGv_vec n, bool top)
+{
+    TCGTemp* rt = tcgv_vec_temp(r);
+    TCGTemp* nt = tcgv_vec_temp(n);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(nt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcg_can_emit_fp_op(INDEX_op_cvtl_fp, TCG_TYPE_V128, vece));
+    vec_gen_3(INDEX_op_cvtl_fp, TCG_TYPE_V128, vece, temp_arg(rt), temp_arg(nt), top);
+}
+
+void tcg_gen_addp_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_addp_fp); }
+
+void tcg_gen_maxp_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_maxp_fp); }
+
+void tcg_gen_minp_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_minp_fp); }
+
+void tcg_gen_maxnump_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{ do_fp3(vece, r, a, b, INDEX_op_maxnump_fp); }
+
+void tcg_gen_minnump_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{ do_fp3(vece, r, a, b, INDEX_op_minnump_fp); }
+
+void tcg_gen_mulx_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_mulx_fp); }
+
+void tcg_gen_recps_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_recps_fp); }
+
+void tcg_gen_rsqrts_fp(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b) { do_fp3(vece, r, a, b, INDEX_op_rsqrts_fp); }
+
+static void do_fp2(unsigned vece, TCGv_vec r, TCGv_vec a, TCGOpcode opc)
+{
+    TCGTemp* rt   = tcgv_vec_temp(r);
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGType  type = rt->base_type;
+
+    tcg_debug_assert(at->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(opc, type, vece));
+    vec_gen_2(opc, type, vece, temp_arg(rt), temp_arg(at));
+}
+
+void tcg_gen_neg_fp(unsigned vece, TCGv_vec r, TCGv_vec a) { do_fp2(vece, r, a, INDEX_op_neg_fp); }
+
+void tcg_gen_abs_fp(unsigned vece, TCGv_vec r, TCGv_vec a) { do_fp2(vece, r, a, INDEX_op_abs_fp); }
+
+void tcg_gen_recpe_fp(unsigned vece, TCGv_vec r, TCGv_vec a) { do_fp2(vece, r, a, INDEX_op_recpe_fp); }
+
+void tcg_gen_rsqrte_fp(unsigned vece, TCGv_vec r, TCGv_vec a) { do_fp2(vece, r, a, INDEX_op_rsqrte_fp); }
+
+void tcg_gen_recpx_fp(unsigned vece, TCGv_vec r, TCGv_vec a) { do_fp2(vece, r, a, INDEX_op_recpx_fp); }
+
+void tcg_gen_fcmp_fp(TCGv_i32 r, TCGv_vec a, TCGv_vec b, bool signal)
+{
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGTemp* bt   = tcgv_vec_temp(b);
+    TCGType  type = at->base_type;
+
+    tcg_debug_assert(bt->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(INDEX_op_fcmp_fp, type, 0));
+    vec_gen_4(INDEX_op_fcmp_fp, type, 0, tcgv_i32_arg(r), temp_arg(at), temp_arg(bt), signal);
+}
+
+void tcg_gen_fpchk_fp(TCGv_i32 r, unsigned vece, TCGv_vec a, TCGv_vec b, TCGFPCheck check)
+{
+    TCGTemp* at   = tcgv_vec_temp(a);
+    TCGTemp* bt   = tcgv_vec_temp(b);
+    TCGType  type = at->base_type;
+
+    tcg_debug_assert(bt->base_type == type);
+    tcg_debug_assert(tcg_can_emit_fp_op(INDEX_op_fpchk_fp, type, vece));
+    vec_gen_4(INDEX_op_fpchk_fp, type, vece, tcgv_i32_arg(r), temp_arg(at), temp_arg(bt), check);
+}
+
 
 void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {

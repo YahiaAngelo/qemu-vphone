@@ -181,6 +181,70 @@ DEF(cmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 
+/*
+ * Floating point, scalar (TCG_TYPE_F*) or packed (TCG_TYPE_V*), raising
+ * IEEE flags in the host's status register: see tcg_can_emit_fp_op().
+ */
+DEF(add_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(sub_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(mul_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(div_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(sqrt_fp, 1, 1, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(rint_fp, 1, 1, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+DEF(min_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(max_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(minnum_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(maxnum_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+DEF(addp_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(maxp_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(minp_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(maxnump_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(minnump_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+DEF(neg_fp, 1, 1, 0, TCG_OPF_FLOAT)
+DEF(abs_fp, 1, 1, 0, TCG_OPF_FLOAT)
+
+DEF(mulx_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(recps_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(rsqrts_fp, 1, 2, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(recpe_fp, 1, 1, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(rsqrte_fp, 1, 1, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(recpx_fp, 1, 1, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+DEF(fma_fp, 1, 3, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(fms_fp, 1, 3, 0, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+DEF(cmp_fp, 1, 2, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+/* Scalar compare into an integer: NZCV in bits 31:28. carg: signal on quiet NaN. */
+DEF(fcmp_fp, 1, 2, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+/* Nonzero integer if any lane matches; carg: TCGFPCheck. Only signaling NaNs may raise. */
+DEF(fpchk_fp, 1, 2, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+DEF(cvt_fp, 1, 1, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+/* Same-width int <-> fp. cargs: fbits; fp -> int adds rounding first. */
+DEF(cvt_s_fp, 1, 1, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvt_u_fp, 1, 1, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvt_fp_s, 1, 1, 2, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvt_fp_u, 1, 1, 2, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+/*
+ * Vector precision change between vece and vece + 1. Narrowing writes the
+ * bottom half (zeroing the top) or, with the top carg, the top half of the
+ * first input; lengthening reads the bottom or top half.
+ */
+DEF(cvtn_fp, 1, 2, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvtl_fp, 1, 1, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+/* As cvtn_fp, double to single rounding to odd. */
+DEF(cvtxn_fp, 1, 2, 1, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
+/* Conversions against a general register. cargs: the integer type, the rounding (f2i only), fbits. */
+DEF(cvt_s_i2f, 1, 1, 2, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvt_u_i2f, 1, 1, 2, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvt_f2i_s, 1, 1, 3, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+DEF(cvt_f2i_u, 1, 1, 3, TCG_OPF_FLOAT | TCG_OPF_SIDE_EFFECTS)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"

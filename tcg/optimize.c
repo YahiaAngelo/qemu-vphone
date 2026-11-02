@@ -379,6 +379,9 @@ static bool tcg_opt_gen_mov(OptContext *ctx, TCGOp *op, TCGArg dst, TCGArg src)
     case TCG_TYPE_V64:
     case TCG_TYPE_V128:
     case TCG_TYPE_V256:
+    case TCG_TYPE_F16:
+    case TCG_TYPE_F32:
+    case TCG_TYPE_F64:
         /* TCGOP_TYPE and TCGOP_VECE remain unchanged.  */
         new_op = INDEX_op_mov_vec;
         break;

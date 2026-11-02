@@ -41,6 +41,12 @@
 #else
 #define TCG_TARGET_MAYBE_vec            1
 #endif
+#ifndef TCG_TARGET_HAS_fp
+#define TCG_TARGET_HAS_fp               0
+#endif
+#ifndef TCG_TARGET_FP_ARM_EXACT
+#define TCG_TARGET_FP_ARM_EXACT         0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
