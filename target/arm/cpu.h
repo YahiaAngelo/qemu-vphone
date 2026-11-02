@@ -764,6 +764,7 @@ typedef struct CPUArchState {
     /* WFE's event register (SEV, SEVL, exception return), and a WFE waiting on it */
     uint32_t event_register;
     uint32_t wfe_waiting;
+    int64_t wfe_halt_ns;    /* host time the WFE halted at (VPHONE_WFE_STATS) */
 
     /* iwMMXt coprocessor state.  */
     struct {

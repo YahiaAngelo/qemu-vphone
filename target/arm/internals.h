@@ -1349,6 +1349,22 @@ static inline const char *aarch32_mode_name(uint32_t psr)
 bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request);
 bool arm_cpu_wfe_wakeup_pending(CPUState *cs);
 
+/* VPHONE_WFE_STATS=1 (diagnostic): what WFEs do (op_helper.c), how long they halt (cpu.c). */
+enum {
+    WFES_EXEC, WFES_EVENT, WFES_PENDING, WFES_TIMEOUT, WFES_NOHOST, WFES_CLEARED,
+    WFES_RACE, WFES_HALT, WFES_HALT_MON, WFES_D10US, WFES_D100US, WFES_D1MS,
+    WFES_DLONG, WFES_DNONE, WFES_SEV, WFES_SEV_KICK, WFES_TIMER,
+    WFES_H10US, WFES_H100US, WFES_H1MS, WFES_HLONG, WFES_HALT_NS, WFES_N
+};
+extern int arm_wfe_stats;
+extern uint64_t arm_wfe_stat[WFES_N];
+static inline void arm_wfe_count(int i, uint64_t n)
+{
+    if (unlikely(arm_wfe_stats > 0)) {
+        qatomic_add(&arm_wfe_stat[i], n);
+    }
+}
+
 /**
  * arm_cpu_update_virq: Update CPU_INTERRUPT_VIRQ bit in cs->interrupt_request
  *

@@ -1102,6 +1102,7 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
  * of the page is missed; WFE's 1 ms backstop timer covers that case.
  */
 static unsigned tlb_ram_watchers;
+uint64_t tlb_watch_kicks;   /* wakes sent by a store to a watched page (diagnostic) */
 
 static bool tlb_ram_watched(ram_addr_t page)
 {
@@ -1129,6 +1130,7 @@ static void tlb_ram_watch_notify(ram_addr_t page)
         if (qatomic_cmpxchg(&cpu->neg.tlb.c.watch, page,
                             RAM_ADDR_INVALID) == page) {
             qatomic_dec(&tlb_ram_watchers);
+            qatomic_inc(&tlb_watch_kicks);
             /*
              * Under the BQL, which the halted vCPU holds from its has_work
              * check to its wait: a kick in between would be lost.

@@ -687,6 +687,12 @@ bool arm_cpu_exec_halt(CPUState *cs)
         if (cpu->wfxt_timer) {
             timer_del(cpu->wfxt_timer);
         }
+        if (unlikely(arm_wfe_stats > 0) && qatomic_read(&cpu->env.wfe_waiting)) {
+            int64_t ns = get_clock() - cpu->env.wfe_halt_ns;
+            arm_wfe_count(WFES_HALT_NS, ns);
+            arm_wfe_count(ns < 10000 ? WFES_H10US : ns < 100000 ? WFES_H100US :
+                          ns < 1000000 ? WFES_H1MS : WFES_HLONG, 1);
+        }
         qatomic_set(&cpu->env.wfe_waiting, 0);
         tlb_unwatch_ram_write(cs);
     }
@@ -705,6 +711,9 @@ static void arm_wfxt_timer_cb(void *opaque)
      * pending interrupt), and the TCG accelerator's cpu_exec_interrupt()
      * function auto-clears the CPU_INTERRUPT_EXITTB flag for us.
      */
+    if (qatomic_read(&cpu->env.wfe_waiting)) {
+        arm_wfe_count(WFES_TIMER, 1);
+    }
     cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
 }
 

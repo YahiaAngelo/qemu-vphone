@@ -459,6 +459,27 @@ void HELPER(wfit)(CPUARMState *env, uint64_t timeout)
  * before.
  */
 static int wfe_mode = -1;
+int arm_wfe_stats = -1;
+uint64_t arm_wfe_stat[WFES_N];
+
+static void wfe_stats_print(void)
+{
+    uint64_t *c = arm_wfe_stat;
+    uint64_t halts = MAX(qatomic_read(&c[WFES_HALT]), 1);
+
+    fprintf(stderr, "wfe: exec %" PRIu64 " | return: event %" PRIu64 " pending %" PRIu64
+            " timeout %" PRIu64 " nohost %" PRIu64 " cleared %" PRIu64 " race %" PRIu64
+            " | halt %" PRIu64 " (monitor %" PRIu64 ") deadline <10us %" PRIu64
+            " <100us %" PRIu64 " <1ms %" PRIu64 " >=1ms %" PRIu64 " none %" PRIu64
+            " | halted <10us %" PRIu64 " <100us %" PRIu64 " <1ms %" PRIu64 " >=1ms %" PRIu64
+            " mean %" PRIu64 "us | sev %" PRIu64 " kicks %" PRIu64 " timer %" PRIu64
+            " watch %" PRIu64 "\n",
+            c[WFES_EXEC], c[WFES_EVENT], c[WFES_PENDING], c[WFES_TIMEOUT], c[WFES_NOHOST],
+            c[WFES_CLEARED], c[WFES_RACE], c[WFES_HALT], c[WFES_HALT_MON], c[WFES_D10US],
+            c[WFES_D100US], c[WFES_D1MS], c[WFES_DLONG], c[WFES_DNONE], c[WFES_H10US],
+            c[WFES_H100US], c[WFES_H1MS], c[WFES_HLONG], c[WFES_HALT_NS] / halts / 1000,
+            c[WFES_SEV], c[WFES_SEV_KICK], c[WFES_TIMER], tlb_watch_kicks);
+}
 
 /* Counter ticks until the next event-stream event, or UINT64_MAX if off. */
 static uint64_t wfe_event_stream_ticks(uint64_t ctl, uint64_t cnt)
@@ -513,17 +534,29 @@ static void do_wfe(CPUARMState *env, uint64_t timeout, int ti)
     if (unlikely(wfe_mode < 0)) {
         const char *e = getenv("VPHONE_WFE");
         wfe_mode = !(e && *e == '0');
+        e = getenv("VPHONE_WFE_STATS");
+        arm_wfe_stats = e && *e && *e != '0';
+    }
+    if (unlikely(arm_wfe_stats > 0) &&
+        (qatomic_fetch_inc(&arm_wfe_stat[WFES_EXEC]) & 0xfffff) == 0xfffff) {
+        wfe_stats_print();
     }
     if (!wfe_mode || cpu->wfxt_timer == NULL) {
         return;
     }
     if (qatomic_xchg(&env->event_register, 0)) {
+        arm_wfe_count(WFES_EVENT, 1);
         return;
     }
 
     cntval = gt_get_countervalue(env);
     cntvct = cntval - gt_direct_access_timer_offset(env, GTIMER_VIRT);
-    if (arm_cpu_wfe_wakeup_pending(cs) || cntvct >= timeout) {
+    if (arm_cpu_wfe_wakeup_pending(cs)) {
+        arm_wfe_count(WFES_PENDING, 1);
+        return;
+    }
+    if (cntvct >= timeout) {
+        arm_wfe_count(WFES_TIMEOUT, 1);
         return;
     }
 
@@ -534,8 +567,23 @@ static void do_wfe(CPUARMState *env, uint64_t timeout, int ti)
     }
 
     ticks = timeout == UINT64_MAX ? UINT64_MAX : timeout - cntvct;
-    ticks = MIN(ticks, wfe_event_stream_ticks(env->cp15.c14_cntkctl, cntvct));
-    ticks = MIN(ticks, wfe_event_stream_ticks(env->cp15.cnthctl_el2, cntval));
+    /*
+     * XNU runs the event stream every few microseconds, so every WFE would
+     * wake within ~10 us, which costs a vCPU thread about as much as the
+     * spin it replaces. A WFE on the exclusive monitor is woken by the store
+     * that changes the monitored word (the cputlb watch), and the backstop
+     * below covers a missed one: with VPHONE_WFE_EVSTREAM=0 (experiment) such
+     * a WFE does not wake for the event stream.
+     */
+    static int evstream = -1;
+    if (unlikely(evstream < 0)) {
+        const char *e = getenv("VPHONE_WFE_EVSTREAM");
+        evstream = !(e && *e == '0');
+    }
+    if (evstream || env->exclusive_addr == -1) {
+        ticks = MIN(ticks, wfe_event_stream_ticks(env->cp15.c14_cntkctl, cntvct));
+        ticks = MIN(ticks, wfe_event_stream_ticks(env->cp15.cnthctl_el2, cntval));
+    }
     if (ticks > cpu->gt_cntfrq_hz * 1000000ULL) {   /* past ~11 days: no deadline */
         delta_ns = INT64_MAX;
     } else {
@@ -553,10 +601,12 @@ static void do_wfe(CPUARMState *env, uint64_t timeout, int ti)
                                      arm_env_mmu_index(env));
         }
         if (host == NULL || !tlb_watch_ram_write(cs, env->exclusive_addr, host)) {
+            arm_wfe_count(WFES_NOHOST, 1);
             return;
         }
         if (wfe_monitor_cleared(env, host)) {
             tlb_unwatch_ram_write(cs);
+            arm_wfe_count(WFES_CLEARED, 1);
             return;
         }
         delta_ns = MIN(delta_ns, WFE_MONITOR_BACKSTOP_NS);
@@ -574,9 +624,19 @@ static void do_wfe(CPUARMState *env, uint64_t timeout, int ti)
         qatomic_set(&env->wfe_waiting, 0);
         tlb_unwatch_ram_write(cs);
         timer_del(cpu->wfxt_timer);
+        arm_wfe_count(WFES_RACE, 1);
         return;
     }
 
+    if (unlikely(arm_wfe_stats > 0)) {
+        arm_wfe_count(WFES_HALT, 1);
+        arm_wfe_count(WFES_HALT_MON, env->exclusive_addr != -1);
+        arm_wfe_count(delta_ns == INT64_MAX ? WFES_DNONE :
+                      delta_ns < 10000 ? WFES_D10US :
+                      delta_ns < 100000 ? WFES_D100US :
+                      delta_ns < 1000000 ? WFES_D1MS : WFES_DLONG, 1);
+        env->wfe_halt_ns = get_clock();
+    }
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);
@@ -602,7 +662,11 @@ void HELPER(sev)(CPUARMState *env)
 
         qatomic_set(&other->event_register, 1);
         smp_mb();
+        if (cs == self) {
+            arm_wfe_count(WFES_SEV, 1);
+        }
         if (cs != self && qatomic_read(&other->wfe_waiting)) {
+            arm_wfe_count(WFES_SEV_KICK, 1);
             /* the BQL closes the gap between its has_work check and its wait */
             BQL_LOCK_GUARD();
             cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);

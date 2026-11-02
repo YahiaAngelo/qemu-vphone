@@ -30,6 +30,7 @@ void tlb_protect_code(ram_addr_t ram_addr);
 void tlb_unprotect_code(ram_addr_t ram_addr);
 bool tlb_watch_ram_write(CPUState *cpu, vaddr addr, void *host);
 void tlb_unwatch_ram_write(CPUState *cpu);
+extern uint64_t tlb_watch_kicks;
 #endif
 
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length);
