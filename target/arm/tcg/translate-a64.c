@@ -21,6 +21,7 @@
 #include "tcg/tcg-op-common.h"
 #include "translate.h"
 #include "translate-a64.h"
+#include "host-fpcr.h"
 #include "qemu/log.h"
 #include "arm_ldst.h"
 #include "semihosting/semihost.h"
@@ -5462,6 +5463,352 @@ typedef struct FPScalar {
     void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_i64, TCGv_ptr);
 } FPScalar;
 
+/*
+ * vphone-linux: native A64 FP / Neon (ported from Inferno 2eed395).
+ *
+ * Where the host can do an FP operation with one or a few instructions, it
+ * is emitted as the TCG INDEX_op_*_fp opcodes instead of a softfloat helper
+ * call. The host's rounding mode follows FPCR.RMode and its exception flags
+ * are folded into FPSR (host-fpcr.h). The x86 host is not exact (see
+ * tcg_fp_arm_exact()): a NaN result (whose payload/sign and default-NaN
+ * rules differ), a result of +/- the minimum normal (where x86 detects
+ * tininess after rounding and Arm before), min/max of unordered or equal
+ * inputs, and fp -> int of a NaN or out-of-range input are detected in
+ * generated code, which then branches to the unchanged helper path ("the
+ * guard"). The helper path recomputes from the untouched inputs; the flags
+ * the native attempt raised are a subset of what the helper raises.
+ *
+ * Only with FPCR.{AH,NEP,FIZ} clear, and FZ clear on an inexact host (x86
+ * has no input-flush that matches Arm), and when arm_native_fp_enabled
+ * (VPHONE_NATIVE_FP, default on).
+ */
+typedef void GenFPVec3Fn(unsigned, TCGv_vec, TCGv_vec, TCGv_vec);
+
+static bool fp_native_ok(DisasContext *s)
+{
+    return arm_native_fp_enabled && !s->fpcr_ah && !s->fpcr_nep &&
+           !s->fpcr_fiz && (tcg_fp_arm_exact() || !s->fpcr_fz);
+}
+
+/* For paths without a guarded softfloat fallback. */
+static bool fp_native_exact_ok(DisasContext *s)
+{
+    return fp_native_ok(s) && tcg_fp_arm_exact();
+}
+
+/* What an op needs on a host that is not exact; see tcg_fp_arm_exact(). */
+typedef enum FPGuardKind {
+    FP_GUARD_NONE,
+    FP_GUARD_RESULT,
+    FP_GUARD_MINMAX,
+    FP_GUARD_F2I,
+    FP_GUARD_UNAVAILABLE,
+} FPGuardKind;
+
+static FPGuardKind fp_guard_kind(TCGOpcode opc)
+{
+    switch (opc) {
+    case INDEX_op_cmp_fp:
+    case INDEX_op_fcmp_fp:
+    case INDEX_op_neg_fp:
+    case INDEX_op_abs_fp:
+    case INDEX_op_cvt_s_fp:
+    case INDEX_op_cvt_s_i2f:
+        return FP_GUARD_NONE;
+    case INDEX_op_add_fp:
+    case INDEX_op_sub_fp:
+    case INDEX_op_mul_fp:
+    case INDEX_op_div_fp:
+    case INDEX_op_sqrt_fp:
+    case INDEX_op_rint_fp:
+    case INDEX_op_fma_fp:
+    case INDEX_op_fms_fp:
+    case INDEX_op_addp_fp:
+    case INDEX_op_cvt_fp:
+    case INDEX_op_cvtn_fp:
+    case INDEX_op_cvtl_fp:
+        return FP_GUARD_RESULT;
+    case INDEX_op_min_fp:
+    case INDEX_op_max_fp:
+    case INDEX_op_minnum_fp:
+    case INDEX_op_maxnum_fp:
+        return FP_GUARD_MINMAX;
+    case INDEX_op_cvt_fp_s:
+    case INDEX_op_cvt_f2i_s:
+        return FP_GUARD_F2I;
+    default:
+        return FP_GUARD_UNAVAILABLE;
+    }
+}
+
+static bool fp_native_op_ok(DisasContext *s, TCGOpcode opc)
+{
+    return fp_native_ok(s) &&
+           (tcg_fp_arm_exact() || fp_guard_kind(opc) != FP_GUARD_UNAVAILABLE);
+}
+
+/* AHP and FZ16 are not available to a host that is not exact. */
+static bool fp16_cvt_native_ok(DisasContext *s)
+{
+    return tcg_fp_arm_exact() || (!s->fpcr_ahp && !s->fpcr_fz16);
+}
+
+/* TCG_TYPE_COUNT where there is no native type. */
+static TCGType fp_scalar_type(DisasContext *s, MemOp esz)
+{
+    switch (esz) {
+    case MO_16:
+        return dc_isar_feature(aa64_fp16, s) ? TCG_TYPE_F16 : TCG_TYPE_COUNT;
+    case MO_32:
+        return TCG_TYPE_F32;
+    case MO_64:
+        return TCG_TYPE_F64;
+    default:
+        return TCG_TYPE_COUNT;
+    }
+}
+
+/* On hosts that are not exact, results that may differ branch to softfloat. */
+typedef struct FPGuard {
+    TCGLabel *slow;
+    TCGLabel *done;
+    FPGuardKind kind;
+} FPGuard;
+
+static void fp_guard_begin(FPGuard *g, TCGOpcode opc)
+{
+    g->kind = fp_guard_kind(opc);
+    g->slow = tcg_fp_arm_exact() || g->kind == FP_GUARD_NONE
+              ? NULL : gen_new_label();
+    g->done = NULL;
+}
+
+static bool fp_guard_scalar(TCGv_vec a)
+{
+    TCGType type = tcgv_vec_temp(a)->base_type;
+
+    return type == TCG_TYPE_F32 || type == TCG_TYPE_F64;
+}
+
+static void fp_guard_check(FPGuard *g, unsigned vece, TCGv_vec a, TCGv_vec b,
+                           TCGFPCheck check)
+{
+    TCGv_i32 hit = tcg_temp_new_i32();
+
+    tcg_gen_fpchk_fp(hit, vece, a, b, check);
+    tcg_gen_brcondi_i32(TCG_COND_NE, hit, 0, g->slow);
+}
+
+static void fp_guard_nzcv(FPGuard *g, TCGv_vec a, TCGv_vec b, uint32_t mask)
+{
+    TCGv_i32 nzcv = tcg_temp_new_i32();
+
+    tcg_gen_fcmp_fp(nzcv, a, b, false);
+    tcg_gen_andi_i32(nzcv, nzcv, mask);
+    tcg_gen_brcondi_i32(TCG_COND_NE, nzcv, 0, g->slow);
+}
+
+/* A NaN, or +/- the minimum normal. */
+static void fp_guard_result(FPGuard *g, unsigned vece, TCGv_vec r)
+{
+    TCGType type = tcgv_vec_temp(r)->base_type;
+    TCGv_vec t;
+
+    if (!g->slow || g->kind != FP_GUARD_RESULT) {
+        return;
+    }
+    if (!fp_guard_scalar(r)) {
+        fp_guard_check(g, vece, r, r, TCG_FP_CHECK_NAN);
+        fp_guard_check(g, vece, r, r, TCG_FP_CHECK_MIN_NORMAL);
+        return;
+    }
+
+    fp_guard_nzcv(g, r, r, PSTATE_V);
+    t = tcg_temp_new_vec(type);
+    tcg_gen_abs_fp(0, t, r);
+    fp_guard_nzcv(g, t,
+                  type == TCG_TYPE_F32
+                  ? tcg_constant_vec(type, MO_32, 0x00800000)
+                  : tcg_constant_vec(type, MO_64, 0x0010000000000000ull),
+                  PSTATE_Z);
+}
+
+/* Before the op: min/max of unordered or equal inputs, fp -> int range. */
+static void fp_guard_inputs(FPGuard *g, unsigned vece, TCGv_vec a, TCGv_vec b)
+{
+    if (!g->slow) {
+        return;
+    }
+    switch (g->kind) {
+    case FP_GUARD_MINMAX:
+        if (fp_guard_scalar(a)) {
+            fp_guard_nzcv(g, a, b, PSTATE_V | PSTATE_Z);
+        } else {
+            fp_guard_check(g, vece, a, b, TCG_FP_CHECK_UNORDERED_OR_EQ);
+        }
+        break;
+    case FP_GUARD_F2I:
+        tcg_debug_assert(!fp_guard_scalar(a));
+        fp_guard_check(g, vece, a, a, vece == MO_64 ? TCG_FP_CHECK_I64_RANGE
+                                                    : TCG_FP_CHECK_I32_RANGE);
+        break;
+    default:
+        break;
+    }
+}
+
+/* A NaN, or a magnitude that could round out of range. */
+static void fp_guard_f2i(FPGuard *g, TCGType itype, TCGv_vec a)
+{
+    TCGType type = tcgv_vec_temp(a)->base_type;
+    TCGv_vec t, limit;
+
+    if (!g->slow) {
+        return;
+    }
+
+    switch (type) {
+    case TCG_TYPE_F32:
+        /* 2^63 or 2^31 */
+        limit = tcg_constant_vec(type, MO_32, itype == TCG_TYPE_I64
+                                              ? 0x5f000000 : 0x4f000000);
+        break;
+    case TCG_TYPE_F64:
+        /* 2^63 or 2^31 - 1 */
+        limit = tcg_constant_vec(type, MO_64, itype == TCG_TYPE_I64
+                                              ? 0x43e0000000000000ull
+                                              : 0x41dfffffffc00000ull);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    t = tcg_temp_new_vec(type);
+    tcg_gen_abs_fp(0, t, a);
+    /* C is clear only for |a| < limit: unordered, equal, greater set it. */
+    fp_guard_nzcv(g, t, limit, PSTATE_C);
+}
+
+static void fp_guard_end(FPGuard *g)
+{
+    if (!g->slow) {
+        return;
+    }
+    g->done = gen_new_label();
+    tcg_gen_br(g->done);
+    gen_set_label(g->slow);
+}
+
+static void fp_guard_finish(FPGuard *g)
+{
+    if (g->done) {
+        gen_set_label(g->done);
+    }
+}
+
+static void gen_vec_fadd(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_add_fp(vece, d, n, m);
+}
+
+static void gen_vec_fsub(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_sub_fp(vece, d, n, m);
+}
+
+static void gen_vec_fmul(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_mul_fp(vece, d, n, m);
+}
+
+static void gen_vec_fdiv(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_div_fp(vece, d, n, m);
+}
+
+static void gen_vec_fmaxnm(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_maxnum_fp(vece, d, n, m);
+}
+
+static void gen_vec_fminnm(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_minnum_fp(vece, d, n, m);
+}
+
+static void gen_vec_fmax(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_max_fp(vece, d, n, m);
+}
+
+static void gen_vec_fmin(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_min_fp(vece, d, n, m);
+}
+
+static void gen_vec_fcmeq(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_cmp_fp(TCG_COND_EQ, vece, d, n, m);
+}
+
+static void gen_vec_fcmge(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_cmp_fp(TCG_COND_GE, vece, d, n, m);
+}
+
+static void gen_vec_fcmgt(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_cmp_fp(TCG_COND_GT, vece, d, n, m);
+}
+
+static void gen_vec_fmulx(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_mulx_fp(vece, d, n, m);
+}
+
+static void gen_vec_frecps(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_recps_fp(vece, d, n, m);
+}
+
+static void gen_vec_frsqrts(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_rsqrts_fp(vece, d, n, m);
+}
+
+/* FPNeg(FPMul()): the rounding happens before the negation. */
+static void gen_vec_fnmul(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_mul_fp(vece, d, n, m);
+    tcg_gen_neg_fp(vece, d, d);
+}
+
+static void gen_vec_fabd(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_sub_fp(vece, d, n, m);
+    tcg_gen_abs_fp(vece, d, d);
+}
+
+static void gen_vec_facg(TCGCond cond, unsigned vece, TCGv_vec d,
+                         TCGv_vec n, TCGv_vec m)
+{
+    TCGv_vec tn = tcg_temp_new_vec_matching(d);
+    TCGv_vec tm = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_abs_fp(vece, tn, n);
+    tcg_gen_abs_fp(vece, tm, m);
+    tcg_gen_cmp_fp(cond, vece, d, tn, tm);
+}
+
+static void gen_vec_facge(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    gen_vec_facg(TCG_COND_GE, vece, d, n, m);
+}
+
+static void gen_vec_facgt(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    gen_vec_facg(TCG_COND_GT, vece, d, n, m);
+}
+
 static bool do_fp3_scalar_with_fpsttype(DisasContext *s, arg_rrr_e *a,
                                         const FPScalar *f, int mergereg,
                                         ARMFPStatusFlavour fpsttype)
@@ -5516,13 +5863,88 @@ static bool do_fp3_scalar_ah_2fn(DisasContext *s, arg_rrr_e *a,
                                        mergereg, select_ah_fpst(s, a->esz));
 }
 
-/* Some insns need to call different helpers when FPCR.AH == 1 */
-static bool do_fp3_scalar_2fn(DisasContext *s, arg_rrr_e *a,
-                              const FPScalar *fnormal,
-                              const FPScalar *fah,
-                              int mergereg)
+
+static bool do_fp3_scalar_native(DisasContext *s, arg_rrr_e *a, TCGOpcode opc,
+                                 TCGOpcode opc2, GenFPVec3Fn *gen, FPGuard *g)
 {
-    return do_fp3_scalar(s, a, s->fpcr_ah ? fah : fnormal, mergereg);
+    TCGType type;
+    TCGv_vec t0, t1;
+
+    if (!fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    type = fp_scalar_type(s, a->esz);
+    if (type == TCG_TYPE_COUNT || !tcg_can_emit_fp_op(opc, type, 0)) {
+        return false;
+    }
+    if (opc2 && !tcg_can_emit_fp_op(opc2, type, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    t0 = tcg_temp_new_vec(type);
+    t1 = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(t0, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_ld_vec(t1, tcg_env, vec_full_reg_offset(s, a->rm));
+
+    fp_guard_begin(g, opc);
+    fp_guard_inputs(g, 0, t0, t1);
+    gen(0, t0, t0, t1);
+    fp_guard_result(g, 0, t0);
+
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(t0, tcg_env, vec_full_reg_offset(s, a->rd));
+    fp_guard_end(g);
+    return true;
+}
+
+static bool do_fp3_scalar_native_or_helper(DisasContext *s, arg_rrr_e *a,
+                                           const FPScalar *f, int mergereg,
+                                           TCGOpcode opc, TCGOpcode opc2,
+                                           GenFPVec3Fn *gen)
+{
+    FPGuard g = {};
+
+    if (!do_fp3_scalar_native(s, a, opc, opc2, gen, &g)) {
+        return do_fp3_scalar(s, a, f, mergereg);
+    }
+    if (g.slow) {
+        do_fp3_scalar(s, a, f, mergereg);
+        fp_guard_finish(&g);
+    }
+    return true;
+}
+
+static bool do_fp3_scalar_2fn_native_or_helper(DisasContext *s, arg_rrr_e *a,
+                                               const FPScalar *fnormal,
+                                               const FPScalar *fah,
+                                               int mergereg, TCGOpcode opc,
+                                               TCGOpcode opc2,
+                                               GenFPVec3Fn *gen)
+{
+    return do_fp3_scalar_native_or_helper(s, a, s->fpcr_ah ? fah : fnormal,
+                                          mergereg, opc, opc2, gen);
+}
+
+static bool do_fp3_scalar_ah_2fn_native_or_helper(DisasContext *s,
+                                                  arg_rrr_e *a,
+                                                  const FPScalar *fnormal,
+                                                  const FPScalar *fah,
+                                                  int mergereg, TCGOpcode opc,
+                                                  GenFPVec3Fn *gen)
+{
+    FPGuard g = {};
+
+    if (!do_fp3_scalar_native(s, a, opc, 0, gen, &g)) {
+        return do_fp3_scalar_ah_2fn(s, a, fnormal, fah, mergereg);
+    }
+    if (g.slow) {
+        do_fp3_scalar_ah_2fn(s, a, fnormal, fah, mergereg);
+        fp_guard_finish(&g);
+    }
+    return true;
 }
 
 static const FPScalar f_scalar_fadd = {
@@ -5530,28 +5952,32 @@ static const FPScalar f_scalar_fadd = {
     gen_helper_vfp_adds,
     gen_helper_vfp_addd,
 };
-TRANS(FADD_s, do_fp3_scalar, a, &f_scalar_fadd, a->rn)
+TRANS(FADD_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fadd, a->rn,
+      INDEX_op_add_fp, 0, gen_vec_fadd)
 
 static const FPScalar f_scalar_fsub = {
     gen_helper_vfp_subh,
     gen_helper_vfp_subs,
     gen_helper_vfp_subd,
 };
-TRANS(FSUB_s, do_fp3_scalar, a, &f_scalar_fsub, a->rn)
+TRANS(FSUB_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fsub, a->rn,
+      INDEX_op_sub_fp, 0, gen_vec_fsub)
 
 static const FPScalar f_scalar_fdiv = {
     gen_helper_vfp_divh,
     gen_helper_vfp_divs,
     gen_helper_vfp_divd,
 };
-TRANS(FDIV_s, do_fp3_scalar, a, &f_scalar_fdiv, a->rn)
+TRANS(FDIV_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fdiv, a->rn,
+      INDEX_op_div_fp, 0, gen_vec_fdiv)
 
 static const FPScalar f_scalar_fmul = {
     gen_helper_vfp_mulh,
     gen_helper_vfp_muls,
     gen_helper_vfp_muld,
 };
-TRANS(FMUL_s, do_fp3_scalar, a, &f_scalar_fmul, a->rn)
+TRANS(FMUL_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fmul, a->rn,
+      INDEX_op_mul_fp, 0, gen_vec_fmul)
 
 static const FPScalar f_scalar_fmax = {
     gen_helper_vfp_maxh,
@@ -5563,7 +5989,8 @@ static const FPScalar f_scalar_fmax_ah = {
     gen_helper_vfp_ah_maxs,
     gen_helper_vfp_ah_maxd,
 };
-TRANS(FMAX_s, do_fp3_scalar_2fn, a, &f_scalar_fmax, &f_scalar_fmax_ah, a->rn)
+TRANS(FMAX_s, do_fp3_scalar_2fn_native_or_helper, a, &f_scalar_fmax,
+      &f_scalar_fmax_ah, a->rn, INDEX_op_max_fp, 0, gen_vec_fmax)
 
 static const FPScalar f_scalar_fmin = {
     gen_helper_vfp_minh,
@@ -5575,28 +6002,32 @@ static const FPScalar f_scalar_fmin_ah = {
     gen_helper_vfp_ah_mins,
     gen_helper_vfp_ah_mind,
 };
-TRANS(FMIN_s, do_fp3_scalar_2fn, a, &f_scalar_fmin, &f_scalar_fmin_ah, a->rn)
+TRANS(FMIN_s, do_fp3_scalar_2fn_native_or_helper, a, &f_scalar_fmin,
+      &f_scalar_fmin_ah, a->rn, INDEX_op_min_fp, 0, gen_vec_fmin)
 
 static const FPScalar f_scalar_fmaxnm = {
     gen_helper_vfp_maxnumh,
     gen_helper_vfp_maxnums,
     gen_helper_vfp_maxnumd,
 };
-TRANS(FMAXNM_s, do_fp3_scalar, a, &f_scalar_fmaxnm, a->rn)
+TRANS(FMAXNM_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fmaxnm, a->rn,
+      INDEX_op_maxnum_fp, 0, gen_vec_fmaxnm)
 
 static const FPScalar f_scalar_fminnm = {
     gen_helper_vfp_minnumh,
     gen_helper_vfp_minnums,
     gen_helper_vfp_minnumd,
 };
-TRANS(FMINNM_s, do_fp3_scalar, a, &f_scalar_fminnm, a->rn)
+TRANS(FMINNM_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fminnm, a->rn,
+      INDEX_op_minnum_fp, 0, gen_vec_fminnm)
 
 static const FPScalar f_scalar_fmulx = {
     gen_helper_advsimd_mulxh,
     gen_helper_vfp_mulxs,
     gen_helper_vfp_mulxd,
 };
-TRANS(FMULX_s, do_fp3_scalar, a, &f_scalar_fmulx, a->rn)
+TRANS(FMULX_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fmulx, a->rn,
+      INDEX_op_mulx_fp, 0, gen_vec_fmulx)
 
 static void gen_fnmul_h(TCGv_i32 d, TCGv_i32 n, TCGv_i32 m, TCGv_ptr s)
 {
@@ -5644,42 +6075,49 @@ static const FPScalar f_scalar_ah_fnmul = {
     gen_fnmul_ah_s,
     gen_fnmul_ah_d,
 };
-TRANS(FNMUL_s, do_fp3_scalar_2fn, a, &f_scalar_fnmul, &f_scalar_ah_fnmul, a->rn)
+TRANS(FNMUL_s, do_fp3_scalar_2fn_native_or_helper, a, &f_scalar_fnmul,
+      &f_scalar_ah_fnmul, a->rn, INDEX_op_mul_fp, INDEX_op_neg_fp,
+      gen_vec_fnmul)
 
 static const FPScalar f_scalar_fcmeq = {
     gen_helper_advsimd_ceq_f16,
     gen_helper_neon_ceq_f32,
     gen_helper_neon_ceq_f64,
 };
-TRANS(FCMEQ_s, do_fp3_scalar, a, &f_scalar_fcmeq, a->rm)
+TRANS(FCMEQ_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fcmeq, a->rm,
+      INDEX_op_cmp_fp, 0, gen_vec_fcmeq)
 
 static const FPScalar f_scalar_fcmge = {
     gen_helper_advsimd_cge_f16,
     gen_helper_neon_cge_f32,
     gen_helper_neon_cge_f64,
 };
-TRANS(FCMGE_s, do_fp3_scalar, a, &f_scalar_fcmge, a->rm)
+TRANS(FCMGE_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fcmge, a->rm,
+      INDEX_op_cmp_fp, 0, gen_vec_fcmge)
 
 static const FPScalar f_scalar_fcmgt = {
     gen_helper_advsimd_cgt_f16,
     gen_helper_neon_cgt_f32,
     gen_helper_neon_cgt_f64,
 };
-TRANS(FCMGT_s, do_fp3_scalar, a, &f_scalar_fcmgt, a->rm)
+TRANS(FCMGT_s, do_fp3_scalar_native_or_helper, a, &f_scalar_fcmgt, a->rm,
+      INDEX_op_cmp_fp, 0, gen_vec_fcmgt)
 
 static const FPScalar f_scalar_facge = {
     gen_helper_advsimd_acge_f16,
     gen_helper_neon_acge_f32,
     gen_helper_neon_acge_f64,
 };
-TRANS(FACGE_s, do_fp3_scalar, a, &f_scalar_facge, a->rm)
+TRANS(FACGE_s, do_fp3_scalar_native_or_helper, a, &f_scalar_facge, a->rm,
+      INDEX_op_cmp_fp, INDEX_op_abs_fp, gen_vec_facge)
 
 static const FPScalar f_scalar_facgt = {
     gen_helper_advsimd_acgt_f16,
     gen_helper_neon_acgt_f32,
     gen_helper_neon_acgt_f64,
 };
-TRANS(FACGT_s, do_fp3_scalar, a, &f_scalar_facgt, a->rm)
+TRANS(FACGT_s, do_fp3_scalar_native_or_helper, a, &f_scalar_facgt, a->rm,
+      INDEX_op_cmp_fp, INDEX_op_abs_fp, gen_vec_facgt)
 
 static void gen_fabd_h(TCGv_i32 d, TCGv_i32 n, TCGv_i32 m, TCGv_ptr s)
 {
@@ -5727,7 +6165,9 @@ static const FPScalar f_scalar_ah_fabd = {
     gen_fabd_ah_s,
     gen_fabd_ah_d,
 };
-TRANS(FABD_s, do_fp3_scalar_2fn, a, &f_scalar_fabd, &f_scalar_ah_fabd, a->rn)
+TRANS(FABD_s, do_fp3_scalar_2fn_native_or_helper, a, &f_scalar_fabd,
+      &f_scalar_ah_fabd, a->rn, INDEX_op_sub_fp, INDEX_op_abs_fp,
+      gen_vec_fabd)
 
 static const FPScalar f_scalar_frecps = {
     gen_helper_recpsf_f16,
@@ -5739,8 +6179,9 @@ static const FPScalar f_scalar_ah_frecps = {
     gen_helper_recpsf_ah_f32,
     gen_helper_recpsf_ah_f64,
 };
-TRANS(FRECPS_s, do_fp3_scalar_ah_2fn, a,
-      &f_scalar_frecps, &f_scalar_ah_frecps, a->rn)
+TRANS(FRECPS_s, do_fp3_scalar_ah_2fn_native_or_helper, a,
+      &f_scalar_frecps, &f_scalar_ah_frecps, a->rn,
+      INDEX_op_recps_fp, gen_vec_frecps)
 
 static const FPScalar f_scalar_frsqrts = {
     gen_helper_rsqrtsf_f16,
@@ -5752,12 +6193,48 @@ static const FPScalar f_scalar_ah_frsqrts = {
     gen_helper_rsqrtsf_ah_f32,
     gen_helper_rsqrtsf_ah_f64,
 };
-TRANS(FRSQRTS_s, do_fp3_scalar_ah_2fn, a,
-      &f_scalar_frsqrts, &f_scalar_ah_frsqrts, a->rn)
+TRANS(FRSQRTS_s, do_fp3_scalar_ah_2fn_native_or_helper, a,
+      &f_scalar_frsqrts, &f_scalar_ah_frsqrts, a->rn,
+      INDEX_op_rsqrts_fp, gen_vec_frsqrts)
+
+static bool do_fcmp0_s_native(DisasContext *s, arg_rr_e *a, TCGCond cond,
+                              bool swap)
+{
+    TCGType type;
+    TCGv_vec tn, tz, td;
+
+    if (!fp_native_ok(s)) {
+        return false;
+    }
+    type = fp_scalar_type(s, a->esz);
+    if (type == TCG_TYPE_COUNT || !tcg_can_emit_fp_op(INDEX_op_cmp_fp, type, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    tn = tcg_temp_new_vec(type);
+    td = tcg_temp_new_vec(type);
+    tz = tcg_constant_vec(type, a->esz, 0);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    if (swap) {
+        tcg_gen_cmp_fp(cond, 0, td, tz, tn);
+    } else {
+        tcg_gen_cmp_fp(cond, 0, td, tn, tz);
+    }
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(td, tcg_env, vec_full_reg_offset(s, a->rd));
+    return true;
+}
 
 static bool do_fcmp0_s(DisasContext *s, arg_rr_e *a,
-                       const FPScalar *f, bool swap)
+                       const FPScalar *f, bool swap, TCGCond cond)
 {
+    if (do_fcmp0_s_native(s, a, cond, swap)) {
+        return true;
+    }
+
     switch (a->esz) {
     case MO_64:
         if (fp_access_check(s)) {
@@ -5804,11 +6281,11 @@ static bool do_fcmp0_s(DisasContext *s, arg_rr_e *a,
     return true;
 }
 
-TRANS(FCMEQ0_s, do_fcmp0_s, a, &f_scalar_fcmeq, false)
-TRANS(FCMGT0_s, do_fcmp0_s, a, &f_scalar_fcmgt, false)
-TRANS(FCMGE0_s, do_fcmp0_s, a, &f_scalar_fcmge, false)
-TRANS(FCMLT0_s, do_fcmp0_s, a, &f_scalar_fcmgt, true)
-TRANS(FCMLE0_s, do_fcmp0_s, a, &f_scalar_fcmge, true)
+TRANS(FCMEQ0_s, do_fcmp0_s, a, &f_scalar_fcmeq, false, TCG_COND_EQ)
+TRANS(FCMGT0_s, do_fcmp0_s, a, &f_scalar_fcmgt, false, TCG_COND_GT)
+TRANS(FCMGE0_s, do_fcmp0_s, a, &f_scalar_fcmge, false, TCG_COND_GE)
+TRANS(FCMLT0_s, do_fcmp0_s, a, &f_scalar_fcmgt, true, TCG_COND_GT)
+TRANS(FCMLE0_s, do_fcmp0_s, a, &f_scalar_fcmge, true, TCG_COND_GE)
 
 static bool do_satacc_s(DisasContext *s, arg_rrr_e *a,
                 MemOp sgn_n, MemOp sgn_m,
@@ -6029,19 +6506,215 @@ static bool do_fp3_vector(DisasContext *s, arg_qrrr_e *a, int data,
                                        FPST_A64_F16 : FPST_A64);
 }
 
-static bool do_fp3_vector_2fn(DisasContext *s, arg_qrrr_e *a, int data,
-                              gen_helper_gvec_3_ptr * const fnormal[3],
-                              gen_helper_gvec_3_ptr * const fah[3])
+
+
+static bool fp_vector_native_ok(DisasContext *s, bool q, MemOp esz,
+                                TCGOpcode opc, TCGOpcode opc2)
 {
-    return do_fp3_vector(s, a, data, s->fpcr_ah ? fah : fnormal);
+    TCGType type = q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+
+    return fp_native_op_ok(s, opc) && tcg_can_emit_fp_op(opc, type, esz) &&
+           (!opc2 || tcg_can_emit_fp_op(opc2, type, esz));
 }
 
-static bool do_fp3_vector_ah_2fn(DisasContext *s, arg_qrrr_e *a, int data,
-                                 gen_helper_gvec_3_ptr * const fnormal[3],
-                                 gen_helper_gvec_3_ptr * const fah[3])
+static void fp_vector_store(DisasContext *s, bool q, int rd, TCGv_vec t,
+                            FPGuard *g)
 {
-    return do_fp3_vector_with_fpsttype(s, a, data, s->fpcr_ah ? fah : fnormal,
-                                       select_ah_fpst(s, a->esz));
+    tcg_gen_st_vec(t, tcg_env, vec_full_reg_offset(s, rd));
+    clear_vec_high(s, q, rd);
+    fp_guard_end(g);
+}
+
+/* The caller has done the access check. */
+static bool do_fp3_vector_native(DisasContext *s, arg_qrrr_e *a,
+                                 TCGOpcode opc, TCGOpcode opc2,
+                                 GenFPVec3Fn *gen, FPGuard *g)
+{
+    TCGType type = a->q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    TCGv_vec tn, tm;
+
+    if (!fp_vector_native_ok(s, a->q, a->esz, opc, opc2)) {
+        return false;
+    }
+
+    tn = tcg_temp_new_vec(type);
+    tm = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_ld_vec(tm, tcg_env, vec_full_reg_offset(s, a->rm));
+    fp_guard_begin(g, opc);
+    fp_guard_inputs(g, a->esz, tn, tm);
+    gen(a->esz, tn, tn, tm);
+    fp_guard_result(g, a->esz, tn);
+    fp_vector_store(s, a->q, a->rd, tn, g);
+    return true;
+}
+
+static void gen_vec_fmla(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec n,
+                         TCGv_vec m)
+{
+    tcg_gen_fma_fp(vece, d, a, n, m);
+}
+
+static void gen_vec_fmls(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec n,
+                         TCGv_vec m)
+{
+    tcg_gen_fms_fp(vece, d, a, n, m);
+}
+
+typedef void GenFPVec4Fn(unsigned, TCGv_vec, TCGv_vec, TCGv_vec, TCGv_vec);
+
+static bool do_fp4_vector_native_or_helper(DisasContext *s, arg_qrrr_e *a,
+                                           int data,
+                                           gen_helper_gvec_3_ptr * const fns[3],
+                                           TCGOpcode opc, GenFPVec4Fn *fniv)
+{
+    MemOp esz = a->esz;
+    ARMFPStatusFlavour fpsttype = esz == MO_16 ? FPST_A64_F16 : FPST_A64;
+    int check = fp_access_check_vector_hsd(s, a->q, esz);
+    TCGType type = a->q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    FPGuard g = {};
+
+    if (check <= 0) {
+        return check == 0;
+    }
+
+    if (fp_vector_native_ok(s, a->q, esz, opc, 0)) {
+        TCGv_vec td = tcg_temp_new_vec(type);
+        TCGv_vec tn = tcg_temp_new_vec(type);
+        TCGv_vec tm = tcg_temp_new_vec(type);
+
+        tcg_gen_ld_vec(td, tcg_env, vec_full_reg_offset(s, a->rd));
+        tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+        tcg_gen_ld_vec(tm, tcg_env, vec_full_reg_offset(s, a->rm));
+        fp_guard_begin(&g, opc);
+        fniv(esz, td, td, tn, tm);
+        fp_guard_result(&g, esz, td);
+        fp_vector_store(s, a->q, a->rd, td, &g);
+        if (!g.slow) {
+            return true;
+        }
+    }
+    gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm, fpsttype, data,
+                      fns[esz - 1]);
+    fp_guard_finish(&g);
+    return true;
+}
+
+static bool do_fp4_vector_2fn_native_or_helper(DisasContext *s,
+                                               arg_qrrr_e *a, int data,
+                                               gen_helper_gvec_3_ptr * const fnormal[3],
+                                               gen_helper_gvec_3_ptr * const fah[3],
+                                               TCGOpcode opc,
+                                               GenFPVec4Fn *fniv)
+{
+    return do_fp4_vector_native_or_helper(s, a, data,
+                                          s->fpcr_ah ? fah : fnormal,
+                                          opc, fniv);
+}
+
+static bool do_fp3_vector_native2_or_helper(DisasContext *s, arg_qrrr_e *a,
+                                            int data,
+                                            gen_helper_gvec_3_ptr * const fns[3],
+                                            TCGOpcode opc, TCGOpcode opc2,
+                                            GenFPVec3Fn *fniv)
+{
+    MemOp esz = a->esz;
+    ARMFPStatusFlavour fpsttype = esz == MO_16 ? FPST_A64_F16 : FPST_A64;
+    int check = fp_access_check_vector_hsd(s, a->q, esz);
+    FPGuard g = {};
+
+    if (check <= 0) {
+        return check == 0;
+    }
+    if (do_fp3_vector_native(s, a, opc, opc2, fniv, &g) && !g.slow) {
+        return true;
+    }
+
+    gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm, fpsttype, data,
+                      fns[esz - 1]);
+    fp_guard_finish(&g);
+    return true;
+}
+
+static bool do_fp3_vector_native_or_helper(DisasContext *s, arg_qrrr_e *a,
+                                           int data,
+                                           gen_helper_gvec_3_ptr * const fns[3],
+                                           TCGOpcode opc, GenFPVec3Fn *fniv)
+{
+    return do_fp3_vector_native2_or_helper(s, a, data, fns, opc, 0, fniv);
+}
+
+static bool do_fp3_vector_2fn_native2_or_helper(DisasContext *s,
+                                                arg_qrrr_e *a, int data,
+                                                gen_helper_gvec_3_ptr * const fnormal[3],
+                                                gen_helper_gvec_3_ptr * const fah[3],
+                                                TCGOpcode opc, TCGOpcode opc2,
+                                                GenFPVec3Fn *fniv)
+{
+    return do_fp3_vector_native2_or_helper(s, a, data,
+                                           s->fpcr_ah ? fah : fnormal,
+                                           opc, opc2, fniv);
+}
+
+static bool do_fp3_vector_2fn_native_or_helper(DisasContext *s,
+                                               arg_qrrr_e *a, int data,
+                                               gen_helper_gvec_3_ptr * const fnormal[3],
+                                               gen_helper_gvec_3_ptr * const fah[3],
+                                               TCGOpcode opc,
+                                               GenFPVec3Fn *fniv)
+{
+    return do_fp3_vector_native_or_helper(s, a, data,
+                                          s->fpcr_ah ? fah : fnormal,
+                                          opc, fniv);
+}
+
+static bool do_fp3_vector_ah_2fn_native_or_helper(DisasContext *s,
+                                                  arg_qrrr_e *a, int data,
+                                                  gen_helper_gvec_3_ptr * const fnormal[3],
+                                                  gen_helper_gvec_3_ptr * const fah[3],
+                                                  TCGOpcode opc,
+                                                  GenFPVec3Fn *fniv)
+{
+    MemOp esz = a->esz;
+    int check = fp_access_check_vector_hsd(s, a->q, esz);
+    FPGuard g = {};
+
+    if (check <= 0) {
+        return check == 0;
+    }
+    if (do_fp3_vector_native(s, a, opc, 0, fniv, &g) && !g.slow) {
+        return true;
+    }
+
+    gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm, select_ah_fpst(s, esz),
+                      data, (s->fpcr_ah ? fah : fnormal)[esz - 1]);
+    fp_guard_finish(&g);
+    return true;
+}
+
+static void gen_vec_faddp(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_addp_fp(vece, d, n, m);
+}
+
+static void gen_vec_fmaxp(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_maxp_fp(vece, d, n, m);
+}
+
+static void gen_vec_fminp(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_minp_fp(vece, d, n, m);
+}
+
+static void gen_vec_fmaxnmp(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_maxnump_fp(vece, d, n, m);
+}
+
+static void gen_vec_fminnmp(unsigned vece, TCGv_vec d, TCGv_vec n, TCGv_vec m)
+{
+    tcg_gen_minnump_fp(vece, d, n, m);
 }
 
 static gen_helper_gvec_3_ptr * const f_vector_fadd[3] = {
@@ -6049,28 +6722,32 @@ static gen_helper_gvec_3_ptr * const f_vector_fadd[3] = {
     gen_helper_gvec_fadd_s,
     gen_helper_gvec_fadd_d,
 };
-TRANS(FADD_v, do_fp3_vector, a, 0, f_vector_fadd)
+TRANS(FADD_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fadd,
+      INDEX_op_add_fp, gen_vec_fadd)
 
 static gen_helper_gvec_3_ptr * const f_vector_fsub[3] = {
     gen_helper_gvec_fsub_h,
     gen_helper_gvec_fsub_s,
     gen_helper_gvec_fsub_d,
 };
-TRANS(FSUB_v, do_fp3_vector, a, 0, f_vector_fsub)
+TRANS(FSUB_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fsub,
+      INDEX_op_sub_fp, gen_vec_fsub)
 
 static gen_helper_gvec_3_ptr * const f_vector_fdiv[3] = {
     gen_helper_gvec_fdiv_h,
     gen_helper_gvec_fdiv_s,
     gen_helper_gvec_fdiv_d,
 };
-TRANS(FDIV_v, do_fp3_vector, a, 0, f_vector_fdiv)
+TRANS(FDIV_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fdiv,
+      INDEX_op_div_fp, gen_vec_fdiv)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmul[3] = {
     gen_helper_gvec_fmul_h,
     gen_helper_gvec_fmul_s,
     gen_helper_gvec_fmul_d,
 };
-TRANS(FMUL_v, do_fp3_vector, a, 0, f_vector_fmul)
+TRANS(FMUL_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fmul,
+      INDEX_op_mul_fp, gen_vec_fmul)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmax[3] = {
     gen_helper_gvec_fmax_h,
@@ -6082,7 +6759,8 @@ static gen_helper_gvec_3_ptr * const f_vector_fmax_ah[3] = {
     gen_helper_gvec_ah_fmax_s,
     gen_helper_gvec_ah_fmax_d,
 };
-TRANS(FMAX_v, do_fp3_vector_2fn, a, 0, f_vector_fmax, f_vector_fmax_ah)
+TRANS(FMAX_v, do_fp3_vector_2fn_native_or_helper, a, 0, f_vector_fmax,
+      f_vector_fmax_ah, INDEX_op_max_fp, gen_vec_fmax)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmin[3] = {
     gen_helper_gvec_fmin_h,
@@ -6094,35 +6772,40 @@ static gen_helper_gvec_3_ptr * const f_vector_fmin_ah[3] = {
     gen_helper_gvec_ah_fmin_s,
     gen_helper_gvec_ah_fmin_d,
 };
-TRANS(FMIN_v, do_fp3_vector_2fn, a, 0, f_vector_fmin, f_vector_fmin_ah)
+TRANS(FMIN_v, do_fp3_vector_2fn_native_or_helper, a, 0, f_vector_fmin,
+      f_vector_fmin_ah, INDEX_op_min_fp, gen_vec_fmin)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmaxnm[3] = {
     gen_helper_gvec_fmaxnum_h,
     gen_helper_gvec_fmaxnum_s,
     gen_helper_gvec_fmaxnum_d,
 };
-TRANS(FMAXNM_v, do_fp3_vector, a, 0, f_vector_fmaxnm)
+TRANS(FMAXNM_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fmaxnm,
+      INDEX_op_maxnum_fp, gen_vec_fmaxnm)
 
 static gen_helper_gvec_3_ptr * const f_vector_fminnm[3] = {
     gen_helper_gvec_fminnum_h,
     gen_helper_gvec_fminnum_s,
     gen_helper_gvec_fminnum_d,
 };
-TRANS(FMINNM_v, do_fp3_vector, a, 0, f_vector_fminnm)
+TRANS(FMINNM_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fminnm,
+      INDEX_op_minnum_fp, gen_vec_fminnm)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmulx[3] = {
     gen_helper_gvec_fmulx_h,
     gen_helper_gvec_fmulx_s,
     gen_helper_gvec_fmulx_d,
 };
-TRANS(FMULX_v, do_fp3_vector, a, 0, f_vector_fmulx)
+TRANS(FMULX_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fmulx,
+      INDEX_op_mulx_fp, gen_vec_fmulx)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmla[3] = {
     gen_helper_gvec_vfma_h,
     gen_helper_gvec_vfma_s,
     gen_helper_gvec_vfma_d,
 };
-TRANS(FMLA_v, do_fp3_vector, a, 0, f_vector_fmla)
+TRANS(FMLA_v, do_fp4_vector_native_or_helper, a, 0, f_vector_fmla,
+      INDEX_op_fma_fp, gen_vec_fmla)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmls[3] = {
     gen_helper_gvec_vfms_h,
@@ -6134,42 +6817,48 @@ static gen_helper_gvec_3_ptr * const f_vector_fmls_ah[3] = {
     gen_helper_gvec_ah_vfms_s,
     gen_helper_gvec_ah_vfms_d,
 };
-TRANS(FMLS_v, do_fp3_vector_2fn, a, 0, f_vector_fmls, f_vector_fmls_ah)
+TRANS(FMLS_v, do_fp4_vector_2fn_native_or_helper, a, 0, f_vector_fmls,
+      f_vector_fmls_ah, INDEX_op_fms_fp, gen_vec_fmls)
 
 static gen_helper_gvec_3_ptr * const f_vector_fcmeq[3] = {
     gen_helper_gvec_fceq_h,
     gen_helper_gvec_fceq_s,
     gen_helper_gvec_fceq_d,
 };
-TRANS(FCMEQ_v, do_fp3_vector, a, 0, f_vector_fcmeq)
+TRANS(FCMEQ_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fcmeq,
+      INDEX_op_cmp_fp, gen_vec_fcmeq)
 
 static gen_helper_gvec_3_ptr * const f_vector_fcmge[3] = {
     gen_helper_gvec_fcge_h,
     gen_helper_gvec_fcge_s,
     gen_helper_gvec_fcge_d,
 };
-TRANS(FCMGE_v, do_fp3_vector, a, 0, f_vector_fcmge)
+TRANS(FCMGE_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fcmge,
+      INDEX_op_cmp_fp, gen_vec_fcmge)
 
 static gen_helper_gvec_3_ptr * const f_vector_fcmgt[3] = {
     gen_helper_gvec_fcgt_h,
     gen_helper_gvec_fcgt_s,
     gen_helper_gvec_fcgt_d,
 };
-TRANS(FCMGT_v, do_fp3_vector, a, 0, f_vector_fcmgt)
+TRANS(FCMGT_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fcmgt,
+      INDEX_op_cmp_fp, gen_vec_fcmgt)
 
 static gen_helper_gvec_3_ptr * const f_vector_facge[3] = {
     gen_helper_gvec_facge_h,
     gen_helper_gvec_facge_s,
     gen_helper_gvec_facge_d,
 };
-TRANS(FACGE_v, do_fp3_vector, a, 0, f_vector_facge)
+TRANS(FACGE_v, do_fp3_vector_native2_or_helper, a, 0, f_vector_facge,
+      INDEX_op_cmp_fp, INDEX_op_abs_fp, gen_vec_facge)
 
 static gen_helper_gvec_3_ptr * const f_vector_facgt[3] = {
     gen_helper_gvec_facgt_h,
     gen_helper_gvec_facgt_s,
     gen_helper_gvec_facgt_d,
 };
-TRANS(FACGT_v, do_fp3_vector, a, 0, f_vector_facgt)
+TRANS(FACGT_v, do_fp3_vector_native2_or_helper, a, 0, f_vector_facgt,
+      INDEX_op_cmp_fp, INDEX_op_abs_fp, gen_vec_facgt)
 
 static gen_helper_gvec_3_ptr * const f_vector_fabd[3] = {
     gen_helper_gvec_fabd_h,
@@ -6181,7 +6870,8 @@ static gen_helper_gvec_3_ptr * const f_vector_ah_fabd[3] = {
     gen_helper_gvec_ah_fabd_s,
     gen_helper_gvec_ah_fabd_d,
 };
-TRANS(FABD_v, do_fp3_vector_2fn, a, 0, f_vector_fabd, f_vector_ah_fabd)
+TRANS(FABD_v, do_fp3_vector_2fn_native2_or_helper, a, 0, f_vector_fabd,
+      f_vector_ah_fabd, INDEX_op_sub_fp, INDEX_op_abs_fp, gen_vec_fabd)
 
 static gen_helper_gvec_3_ptr * const f_vector_frecps[3] = {
     gen_helper_gvec_recps_h,
@@ -6193,7 +6883,8 @@ static gen_helper_gvec_3_ptr * const f_vector_ah_frecps[3] = {
     gen_helper_gvec_ah_recps_s,
     gen_helper_gvec_ah_recps_d,
 };
-TRANS(FRECPS_v, do_fp3_vector_ah_2fn, a, 0, f_vector_frecps, f_vector_ah_frecps)
+TRANS(FRECPS_v, do_fp3_vector_ah_2fn_native_or_helper, a, 0,
+      f_vector_frecps, f_vector_ah_frecps, INDEX_op_recps_fp, gen_vec_frecps)
 
 static gen_helper_gvec_3_ptr * const f_vector_frsqrts[3] = {
     gen_helper_gvec_rsqrts_h,
@@ -6205,14 +6896,17 @@ static gen_helper_gvec_3_ptr * const f_vector_ah_frsqrts[3] = {
     gen_helper_gvec_ah_rsqrts_s,
     gen_helper_gvec_ah_rsqrts_d,
 };
-TRANS(FRSQRTS_v, do_fp3_vector_ah_2fn, a, 0, f_vector_frsqrts, f_vector_ah_frsqrts)
+TRANS(FRSQRTS_v, do_fp3_vector_ah_2fn_native_or_helper, a, 0,
+      f_vector_frsqrts, f_vector_ah_frsqrts, INDEX_op_rsqrts_fp,
+      gen_vec_frsqrts)
 
 static gen_helper_gvec_3_ptr * const f_vector_faddp[3] = {
     gen_helper_gvec_faddp_h,
     gen_helper_gvec_faddp_s,
     gen_helper_gvec_faddp_d,
 };
-TRANS(FADDP_v, do_fp3_vector, a, 0, f_vector_faddp)
+TRANS(FADDP_v, do_fp3_vector_native_or_helper, a, 0, f_vector_faddp,
+      INDEX_op_addp_fp, gen_vec_faddp)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmaxp[3] = {
     gen_helper_gvec_fmaxp_h,
@@ -6224,7 +6918,8 @@ static gen_helper_gvec_3_ptr * const f_vector_ah_fmaxp[3] = {
     gen_helper_gvec_ah_fmaxp_s,
     gen_helper_gvec_ah_fmaxp_d,
 };
-TRANS(FMAXP_v, do_fp3_vector_2fn, a, 0, f_vector_fmaxp, f_vector_ah_fmaxp)
+TRANS(FMAXP_v, do_fp3_vector_2fn_native_or_helper, a, 0, f_vector_fmaxp,
+      f_vector_ah_fmaxp, INDEX_op_maxp_fp, gen_vec_fmaxp)
 
 static gen_helper_gvec_3_ptr * const f_vector_fminp[3] = {
     gen_helper_gvec_fminp_h,
@@ -6236,21 +6931,24 @@ static gen_helper_gvec_3_ptr * const f_vector_ah_fminp[3] = {
     gen_helper_gvec_ah_fminp_s,
     gen_helper_gvec_ah_fminp_d,
 };
-TRANS(FMINP_v, do_fp3_vector_2fn, a, 0, f_vector_fminp, f_vector_ah_fminp)
+TRANS(FMINP_v, do_fp3_vector_2fn_native_or_helper, a, 0, f_vector_fminp,
+      f_vector_ah_fminp, INDEX_op_minp_fp, gen_vec_fminp)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmaxnmp[3] = {
     gen_helper_gvec_fmaxnump_h,
     gen_helper_gvec_fmaxnump_s,
     gen_helper_gvec_fmaxnump_d,
 };
-TRANS(FMAXNMP_v, do_fp3_vector, a, 0, f_vector_fmaxnmp)
+TRANS(FMAXNMP_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fmaxnmp,
+      INDEX_op_maxnump_fp, gen_vec_fmaxnmp)
 
 static gen_helper_gvec_3_ptr * const f_vector_fminnmp[3] = {
     gen_helper_gvec_fminnump_h,
     gen_helper_gvec_fminnump_s,
     gen_helper_gvec_fminnump_d,
 };
-TRANS(FMINNMP_v, do_fp3_vector, a, 0, f_vector_fminnmp)
+TRANS(FMINNMP_v, do_fp3_vector_native_or_helper, a, 0, f_vector_fminnmp,
+      INDEX_op_minnump_fp, gen_vec_fminnmp)
 
 static bool do_fmlal(DisasContext *s, arg_qrrr_e *a, bool is_s, bool is_2)
 {
@@ -6792,7 +7490,8 @@ TRANS_FEAT(PMULL_p64, aa64_pmull, do_pmull, a, gen_helper_gvec_pmull_q)
  * Advanced SIMD scalar/vector x indexed element
  */
 
-static bool do_fp3_scalar_idx(DisasContext *s, arg_rrx_e *a, const FPScalar *f)
+static bool do_fp3_scalar_idx_fallback(DisasContext *s, arg_rrx_e *a,
+                                       const FPScalar *f)
 {
     switch (a->esz) {
     case MO_64:
@@ -6834,10 +7533,59 @@ static bool do_fp3_scalar_idx(DisasContext *s, arg_rrx_e *a, const FPScalar *f)
     return true;
 }
 
-TRANS(FMUL_si, do_fp3_scalar_idx, a, &f_scalar_fmul)
-TRANS(FMULX_si, do_fp3_scalar_idx, a, &f_scalar_fmulx)
+static bool do_fp3_scalar_idx_native(DisasContext *s, arg_rrx_e *a,
+                                     TCGOpcode opc, GenFPVec3Fn *gen,
+                                     FPGuard *g)
+{
+    TCGType type = fp_scalar_type(s, a->esz);
+    TCGv_vec tn, tm;
 
-static bool do_fmla_scalar_idx(DisasContext *s, arg_rrx_e *a, bool neg)
+    if (!fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    if (type == TCG_TYPE_COUNT || !tcg_can_emit_fp_op(opc, type, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    tn = tcg_temp_new_vec(type);
+    tm = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_ld_vec(tm, tcg_env, vec_reg_offset(s, a->rm, a->idx, a->esz));
+    fp_guard_begin(g, opc);
+    gen(0, tn, tn, tm);
+    fp_guard_result(g, 0, tn);
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(tn, tcg_env, vec_full_reg_offset(s, a->rd));
+    fp_guard_end(g);
+    return true;
+}
+
+static bool do_fp3_scalar_idx(DisasContext *s, arg_rrx_e *a,
+                              const FPScalar *f, TCGOpcode opc,
+                              GenFPVec3Fn *gen)
+{
+    FPGuard g = {};
+
+    if (do_fp3_scalar_idx_native(s, a, opc, gen, &g)) {
+        if (g.slow) {
+            do_fp3_scalar_idx_fallback(s, a, f);
+            fp_guard_finish(&g);
+        }
+        return true;
+    }
+    return do_fp3_scalar_idx_fallback(s, a, f);
+}
+
+TRANS(FMUL_si, do_fp3_scalar_idx, a, &f_scalar_fmul, INDEX_op_mul_fp,
+      gen_vec_fmul)
+TRANS(FMULX_si, do_fp3_scalar_idx, a, &f_scalar_fmulx, INDEX_op_mulx_fp,
+      gen_vec_fmulx)
+
+static bool do_fmla_scalar_idx_fallback(DisasContext *s, arg_rrx_e *a,
+                                        bool neg)
 {
     switch (a->esz) {
     case MO_64:
@@ -6890,6 +7638,56 @@ static bool do_fmla_scalar_idx(DisasContext *s, arg_rrx_e *a, bool neg)
         tcg_debug_assert_not_reached();
     }
     return true;
+}
+
+static bool do_fmla_scalar_idx_native(DisasContext *s, arg_rrx_e *a,
+                                      bool neg, FPGuard *g)
+{
+    TCGOpcode opc = neg ? INDEX_op_fms_fp : INDEX_op_fma_fp;
+    TCGType type = fp_scalar_type(s, a->esz);
+    TCGv_vec ta, tn, tm;
+
+    if (!fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    if (type == TCG_TYPE_COUNT || !tcg_can_emit_fp_op(opc, type, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    ta = tcg_temp_new_vec(type);
+    tn = tcg_temp_new_vec(type);
+    tm = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(ta, tcg_env, vec_full_reg_offset(s, a->rd));
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_ld_vec(tm, tcg_env, vec_reg_offset(s, a->rm, a->idx, a->esz));
+    fp_guard_begin(g, opc);
+    if (neg) {
+        tcg_gen_fms_fp(0, ta, ta, tn, tm);
+    } else {
+        tcg_gen_fma_fp(0, ta, ta, tn, tm);
+    }
+    fp_guard_result(g, 0, ta);
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(ta, tcg_env, vec_full_reg_offset(s, a->rd));
+    fp_guard_end(g);
+    return true;
+}
+
+static bool do_fmla_scalar_idx(DisasContext *s, arg_rrx_e *a, bool neg)
+{
+    FPGuard g = {};
+
+    if (do_fmla_scalar_idx_native(s, a, neg, &g)) {
+        if (g.slow) {
+            do_fmla_scalar_idx_fallback(s, a, neg);
+            fp_guard_finish(&g);
+        }
+        return true;
+    }
+    return do_fmla_scalar_idx_fallback(s, a, neg);
 }
 
 TRANS(FMLA_si, do_fmla_scalar_idx, a, false)
@@ -6968,19 +7766,67 @@ TRANS(SQDMLAL_si, do_scalar_muladd_widening_idx, a,
 TRANS(SQDMLSL_si, do_scalar_muladd_widening_idx, a,
       a->esz == MO_16 ? gen_sqdmlsl_h : gen_sqdmlsl_s, true)
 
+/* The caller has done the access check. */
+static bool do_fp3_vector_idx_native(DisasContext *s, arg_qrrx_e *a,
+                                     TCGOpcode opc, FPGuard *g)
+{
+    TCGType type = a->q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    TCGv_vec tn, tm, td;
+
+    if (!fp_vector_native_ok(s, a->q, a->esz, opc, 0)) {
+        return false;
+    }
+
+    tn = tcg_temp_new_vec(type);
+    tm = tcg_temp_new_vec(type);
+    td = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_dup_mem_vec(a->esz, tm, tcg_env,
+                        vec_reg_offset(s, a->rm, a->idx, a->esz));
+    fp_guard_begin(g, opc);
+    switch (opc) {
+    case INDEX_op_mul_fp:
+        tcg_gen_mul_fp(a->esz, td, tn, tm);
+        break;
+    case INDEX_op_mulx_fp:
+        tcg_gen_mulx_fp(a->esz, td, tn, tm);
+        break;
+    case INDEX_op_fma_fp:
+    case INDEX_op_fms_fp:
+        tcg_gen_ld_vec(td, tcg_env, vec_full_reg_offset(s, a->rd));
+        if (opc == INDEX_op_fms_fp) {
+            tcg_gen_fms_fp(a->esz, td, td, tn, tm);
+        } else {
+            tcg_gen_fma_fp(a->esz, td, td, tn, tm);
+        }
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    fp_guard_result(g, a->esz, td);
+    fp_vector_store(s, a->q, a->rd, td, g);
+    return true;
+}
+
 static bool do_fp3_vector_idx(DisasContext *s, arg_qrrx_e *a,
-                              gen_helper_gvec_3_ptr * const fns[3])
+                              gen_helper_gvec_3_ptr * const fns[3],
+                              TCGOpcode opc)
 {
     MemOp esz = a->esz;
     int check = fp_access_check_vector_hsd(s, a->q, esz);
+    FPGuard g = {};
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (do_fp3_vector_idx_native(s, a, opc, &g) && !g.slow) {
+        return true;
     }
 
     gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm,
                       esz == MO_16 ? FPST_A64_F16 : FPST_A64,
                       a->idx, fns[esz - 1]);
+    fp_guard_finish(&g);
     return true;
 }
 
@@ -6989,14 +7835,14 @@ static gen_helper_gvec_3_ptr * const f_vector_idx_fmul[3] = {
     gen_helper_gvec_fmul_idx_s,
     gen_helper_gvec_fmul_idx_d,
 };
-TRANS(FMUL_vi, do_fp3_vector_idx, a, f_vector_idx_fmul)
+TRANS(FMUL_vi, do_fp3_vector_idx, a, f_vector_idx_fmul, INDEX_op_mul_fp)
 
 static gen_helper_gvec_3_ptr * const f_vector_idx_fmulx[3] = {
     gen_helper_gvec_fmulx_idx_h,
     gen_helper_gvec_fmulx_idx_s,
     gen_helper_gvec_fmulx_idx_d,
 };
-TRANS(FMULX_vi, do_fp3_vector_idx, a, f_vector_idx_fmulx)
+TRANS(FMULX_vi, do_fp3_vector_idx, a, f_vector_idx_fmulx, INDEX_op_mulx_fp)
 
 static bool do_fmla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool neg)
 {
@@ -7013,14 +7859,20 @@ static bool do_fmla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool neg)
     };
     MemOp esz = a->esz;
     int check = fp_access_check_vector_hsd(s, a->q, esz);
+    FPGuard g = {};
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (do_fp3_vector_idx_native(s, a, neg ? INDEX_op_fms_fp : INDEX_op_fma_fp,
+                                 &g) && !g.slow) {
+        return true;
     }
 
     gen_gvec_op4_fpst(s, a->q, a->rd, a->rn, a->rm, a->rd,
                       esz == MO_16 ? FPST_A64_F16 : FPST_A64,
                       a->idx, fns[neg ? 1 + s->fpcr_ah : 0][esz - 1]);
+    fp_guard_finish(&g);
     return true;
 }
 
@@ -7045,10 +7897,52 @@ TRANS_FEAT(FMLSL_vi, aa64_fhm, do_fmlal_idx, a, true, false)
 TRANS_FEAT(FMLAL2_vi, aa64_fhm, do_fmlal_idx, a, false, true)
 TRANS_FEAT(FMLSL2_vi, aa64_fhm, do_fmlal_idx, a, true, true)
 
+/* acc is add_vec or sub_vec for the accumulating forms, else 0. */
+static bool do_mul_vector_idx_native(DisasContext *s, arg_qrrx_e *a,
+                                     TCGOpcode acc)
+{
+    TCGType type = a->q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    const TCGOpcode list[2] = { INDEX_op_mul_vec, 0 };
+    const TCGOpcode *hold_list;
+    TCGv_vec td, tn, tm;
+
+    if (!arm_native_fp_enabled ||
+        tcg_can_emit_vec_op(INDEX_op_mul_vec, type, a->esz) <= 0) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    td = tcg_temp_new_vec(type);
+    tn = tcg_temp_new_vec(type);
+    tm = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_dup_mem_vec(a->esz, tm, tcg_env,
+                        vec_reg_offset(s, a->rm, a->idx, a->esz));
+    hold_list = tcg_swap_vecop_list(list);
+    tcg_gen_mul_vec(a->esz, tn, tn, tm);
+    tcg_swap_vecop_list(hold_list);
+    if (acc) {
+        tcg_gen_ld_vec(td, tcg_env, vec_full_reg_offset(s, a->rd));
+        if (acc == INDEX_op_add_vec) {
+            tcg_gen_add_vec(a->esz, tn, td, tn);
+        } else {
+            tcg_gen_sub_vec(a->esz, tn, td, tn);
+        }
+    }
+    tcg_gen_st_vec(tn, tcg_env, vec_full_reg_offset(s, a->rd));
+    clear_vec_high(s, a->q, a->rd);
+    return true;
+}
+
 static bool do_int3_vector_idx(DisasContext *s, arg_qrrx_e *a,
                                gen_helper_gvec_3 * const fns[2])
 {
     assert(a->esz == MO_16 || a->esz == MO_32);
+    if (do_mul_vector_idx_native(s, a, 0)) {
+        return true;
+    }
     if (fp_access_check(s)) {
         gen_gvec_op3_ool(s, a->q, a->rd, a->rn, a->rm, a->idx, fns[a->esz - 1]);
     }
@@ -7069,6 +7963,10 @@ static bool do_mla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool sub)
     };
 
     assert(a->esz == MO_16 || a->esz == MO_32);
+    if (do_mul_vector_idx_native(s, a, sub ? INDEX_op_sub_vec
+                                           : INDEX_op_add_vec)) {
+        return true;
+    }
     if (fp_access_check(s)) {
         gen_gvec_op4_ool(s, a->q, a->rd, a->rn, a->rm, a->rd,
                          a->idx, fns[a->esz - 1][sub]);
@@ -7194,7 +8092,8 @@ static bool trans_FCMLA_vi(DisasContext *s, arg_FCMLA_vi *a)
  * Advanced SIMD scalar pairwise
  */
 
-static bool do_fp3_scalar_pair(DisasContext *s, arg_rr_e *a, const FPScalar *f)
+static bool do_fp3_scalar_pair_fallback(DisasContext *s, arg_rr_e *a,
+                                        const FPScalar *f)
 {
     switch (a->esz) {
     case MO_64:
@@ -7239,18 +8138,70 @@ static bool do_fp3_scalar_pair(DisasContext *s, arg_rr_e *a, const FPScalar *f)
     return true;
 }
 
-static bool do_fp3_scalar_pair_2fn(DisasContext *s, arg_rr_e *a,
-                                   const FPScalar *fnormal,
-                                   const FPScalar *fah)
+/* Paired with zero so the unused lanes are 0 op 0, which raises nothing. */
+static bool do_fp3_scalar_pair_native(DisasContext *s, arg_rr_e *a,
+                                      TCGOpcode opc, GenFPVec3Fn *gen,
+                                      FPGuard *g)
 {
-    return do_fp3_scalar_pair(s, a, s->fpcr_ah ? fah : fnormal);
+    TCGType type = a->esz == MO_64 ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    TCGv_vec t;
+
+    if (a->esz == MO_16 && !dc_isar_feature(aa64_fp16, s)) {
+        return false;
+    }
+    if (!fp_vector_native_ok(s, type == TCG_TYPE_V128, a->esz, opc, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    t = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(t, tcg_env, vec_full_reg_offset(s, a->rn));
+    if (a->esz == MO_16) {
+        tcg_gen_and_vec(MO_64, t, t, tcg_constant_vec(type, MO_64, 0xffffffffu));
+    }
+    fp_guard_begin(g, opc);
+    gen(a->esz, t, t, tcg_constant_vec(type, a->esz, 0));
+    fp_guard_result(g, a->esz, t);
+    fp_vector_store(s, type == TCG_TYPE_V128, a->rd, t, g);
+    return true;
 }
 
-TRANS(FADDP_s, do_fp3_scalar_pair, a, &f_scalar_fadd)
-TRANS(FMAXP_s, do_fp3_scalar_pair_2fn, a, &f_scalar_fmax, &f_scalar_fmax_ah)
-TRANS(FMINP_s, do_fp3_scalar_pair_2fn, a, &f_scalar_fmin, &f_scalar_fmin_ah)
-TRANS(FMAXNMP_s, do_fp3_scalar_pair, a, &f_scalar_fmaxnm)
-TRANS(FMINNMP_s, do_fp3_scalar_pair, a, &f_scalar_fminnm)
+static bool do_fp3_scalar_pair(DisasContext *s, arg_rr_e *a,
+                               const FPScalar *f, TCGOpcode opc,
+                               GenFPVec3Fn *gen)
+{
+    FPGuard g = {};
+
+    if (do_fp3_scalar_pair_native(s, a, opc, gen, &g)) {
+        if (g.slow) {
+            do_fp3_scalar_pair_fallback(s, a, f);
+            fp_guard_finish(&g);
+        }
+        return true;
+    }
+    return do_fp3_scalar_pair_fallback(s, a, f);
+}
+
+static bool do_fp3_scalar_pair_2fn(DisasContext *s, arg_rr_e *a,
+                                   const FPScalar *fnormal,
+                                   const FPScalar *fah,
+                                   TCGOpcode opc, GenFPVec3Fn *gen)
+{
+    return do_fp3_scalar_pair(s, a, s->fpcr_ah ? fah : fnormal, opc, gen);
+}
+
+TRANS(FADDP_s, do_fp3_scalar_pair, a, &f_scalar_fadd,
+      INDEX_op_addp_fp, gen_vec_faddp)
+TRANS(FMAXP_s, do_fp3_scalar_pair_2fn, a, &f_scalar_fmax, &f_scalar_fmax_ah,
+      INDEX_op_maxp_fp, gen_vec_fmaxp)
+TRANS(FMINP_s, do_fp3_scalar_pair_2fn, a, &f_scalar_fmin, &f_scalar_fmin_ah,
+      INDEX_op_minp_fp, gen_vec_fminp)
+TRANS(FMAXNMP_s, do_fp3_scalar_pair, a, &f_scalar_fmaxnm,
+      INDEX_op_maxnump_fp, gen_vec_fmaxnmp)
+TRANS(FMINNMP_s, do_fp3_scalar_pair, a, &f_scalar_fminnm,
+      INDEX_op_minnump_fp, gen_vec_fminnmp)
 
 static bool trans_ADDP_s(DisasContext *s, arg_rr_e *a)
 {
@@ -7350,7 +8301,70 @@ static bool trans_EXT_q(DisasContext *s, arg_EXT_q *a)
  * Floating-point data-processing (3 source)
  */
 
+static bool do_fmadd_native(DisasContext *s, arg_rrrr_e *a, bool neg_a,
+                            bool neg_n, FPGuard *g)
+{
+    TCGOpcode opc = neg_n ? INDEX_op_fms_fp : INDEX_op_fma_fp;
+    TCGType type;
+    TCGv_vec tn, tm, ta;
+
+    if (!fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    type = fp_scalar_type(s, a->esz);
+    if (type == TCG_TYPE_COUNT || !tcg_can_emit_fp_op(opc, type, 0)) {
+        return false;
+    }
+    if (neg_a && !tcg_can_emit_fp_op(INDEX_op_neg_fp, type, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    tn = tcg_temp_new_vec(type);
+    tm = tcg_temp_new_vec(type);
+    ta = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    tcg_gen_ld_vec(tm, tcg_env, vec_full_reg_offset(s, a->rm));
+    tcg_gen_ld_vec(ta, tcg_env, vec_full_reg_offset(s, a->ra));
+    if (neg_a) {
+        tcg_gen_neg_fp(0, ta, ta);
+    }
+
+    fp_guard_begin(g, opc);
+    if (neg_n) {
+        tcg_gen_fms_fp(0, ta, ta, tn, tm);
+    } else {
+        tcg_gen_fma_fp(0, ta, ta, tn, tm);
+    }
+    fp_guard_result(g, 0, ta);
+
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(ta, tcg_env, vec_full_reg_offset(s, a->rd));
+    fp_guard_end(g);
+    return true;
+}
+
+static bool do_fmadd_fallback(DisasContext *s, arg_rrrr_e *a, bool neg_a,
+                              bool neg_n);
+
 static bool do_fmadd(DisasContext *s, arg_rrrr_e *a, bool neg_a, bool neg_n)
+{
+    FPGuard g = {};
+
+    if (do_fmadd_native(s, a, neg_a, neg_n, &g)) {
+        if (g.slow) {
+            do_fmadd_fallback(s, a, neg_a, neg_n);
+            fp_guard_finish(&g);
+        }
+        return true;
+    }
+    return do_fmadd_fallback(s, a, neg_a, neg_n);
+}
+
+static bool do_fmadd_fallback(DisasContext *s, arg_rrrr_e *a, bool neg_a,
+                              bool neg_n)
 {
     TCGv_ptr fpst;
 
@@ -7499,10 +8513,46 @@ static TCGv_i32 do_reduction_op(DisasContext *s, int rn, MemOp esz,
     }
 }
 
+/* No guard: only on a host that is exact. */
+static bool do_fp_reduction_native(DisasContext *s, arg_qrr_e *a,
+                                   TCGOpcode opc, GenFPVec3Fn *gen)
+{
+    TCGType type = a->q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    int elts = (a->q ? 16 : 8) >> a->esz;
+    TCGv_vec t;
+    TCGv_i32 res;
+
+    if (!fp_native_exact_ok(s) || !tcg_can_emit_fp_op(opc, type, a->esz)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    t = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(t, tcg_env, vec_full_reg_offset(s, a->rn));
+    for (; elts > 1; elts >>= 1) {
+        gen(a->esz, t, t, t);
+    }
+
+    res = tcg_temp_new_i32();
+    tcg_gen_st_vec(t, tcg_env, vec_full_reg_offset(s, a->rd));
+    tcg_gen_ld_i32(res, tcg_env, vec_reg_offset(s, a->rd, 0, MO_32));
+    if (a->esz == MO_16) {
+        tcg_gen_ext16u_i32(res, res);
+    }
+    write_fp_sreg(s, a->rd, res);
+    return true;
+}
+
 static bool do_fp_reduction(DisasContext *s, arg_qrr_e *a,
                             NeonGenTwoSingleOpFn *fnormal,
-                            NeonGenTwoSingleOpFn *fah)
+                            NeonGenTwoSingleOpFn *fah,
+                            TCGOpcode opc, GenFPVec3Fn *gen)
 {
+    if (do_fp_reduction_native(s, a, opc, gen)) {
+        return true;
+    }
     if (fp_access_check(s)) {
         MemOp esz = a->esz;
         int elts = (a->q ? 16 : 8) >> esz;
@@ -7515,20 +8565,28 @@ static bool do_fp_reduction(DisasContext *s, arg_qrr_e *a,
 }
 
 TRANS_FEAT(FMAXNMV_h, aa64_fp16, do_fp_reduction, a,
-           gen_helper_vfp_maxnumh, gen_helper_vfp_maxnumh)
+           gen_helper_vfp_maxnumh, gen_helper_vfp_maxnumh,
+           INDEX_op_maxnump_fp, gen_vec_fmaxnmp)
 TRANS_FEAT(FMINNMV_h, aa64_fp16, do_fp_reduction, a,
-           gen_helper_vfp_minnumh, gen_helper_vfp_minnumh)
+           gen_helper_vfp_minnumh, gen_helper_vfp_minnumh,
+           INDEX_op_minnump_fp, gen_vec_fminnmp)
 TRANS_FEAT(FMAXV_h, aa64_fp16, do_fp_reduction, a,
-           gen_helper_vfp_maxh, gen_helper_vfp_ah_maxh)
+           gen_helper_vfp_maxh, gen_helper_vfp_ah_maxh,
+           INDEX_op_maxp_fp, gen_vec_fmaxp)
 TRANS_FEAT(FMINV_h, aa64_fp16, do_fp_reduction, a,
-           gen_helper_vfp_minh, gen_helper_vfp_ah_minh)
+           gen_helper_vfp_minh, gen_helper_vfp_ah_minh,
+           INDEX_op_minp_fp, gen_vec_fminp)
 
 TRANS(FMAXNMV_s, do_fp_reduction, a,
-      gen_helper_vfp_maxnums, gen_helper_vfp_maxnums)
+      gen_helper_vfp_maxnums, gen_helper_vfp_maxnums,
+      INDEX_op_maxnump_fp, gen_vec_fmaxnmp)
 TRANS(FMINNMV_s, do_fp_reduction, a,
-      gen_helper_vfp_minnums, gen_helper_vfp_minnums)
-TRANS(FMAXV_s, do_fp_reduction, a, gen_helper_vfp_maxs, gen_helper_vfp_ah_maxs)
-TRANS(FMINV_s, do_fp_reduction, a, gen_helper_vfp_mins, gen_helper_vfp_ah_mins)
+      gen_helper_vfp_minnums, gen_helper_vfp_minnums,
+      INDEX_op_minnump_fp, gen_vec_fminnmp)
+TRANS(FMAXV_s, do_fp_reduction, a, gen_helper_vfp_maxs, gen_helper_vfp_ah_maxs,
+      INDEX_op_maxp_fp, gen_vec_fmaxp)
+TRANS(FMINV_s, do_fp_reduction, a, gen_helper_vfp_mins, gen_helper_vfp_ah_mins,
+      INDEX_op_minp_fp, gen_vec_fminp)
 
 /*
  * Floating-point Immediate
@@ -7552,12 +8610,54 @@ static bool trans_FMOVI_s(DisasContext *s, arg_FMOVI_s *a)
  * Floating point compare, conditional compare
  */
 
+/* The caller has done the access check. */
+static bool handle_fp_compare_native(DisasContext *s, int size,
+                                     unsigned int rn, unsigned int rm,
+                                     bool cmp_with_zero, bool signal_all_nans)
+{
+    TCGType type = fp_scalar_type(s, size);
+    TCGv_vec tn, tm;
+    TCGv_i32 nzcv;
+    TCGv_i64 flags;
+
+    if (!fp_native_ok(s)) {
+        return false;
+    }
+    if (type == TCG_TYPE_COUNT ||
+        !tcg_can_emit_fp_op(INDEX_op_fcmp_fp, type, 0)) {
+        return false;
+    }
+
+    tn = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, rn));
+    if (cmp_with_zero) {
+        tm = tcg_constant_vec(type, size, 0);
+    } else {
+        tm = tcg_temp_new_vec(type);
+        tcg_gen_ld_vec(tm, tcg_env, vec_full_reg_offset(s, rm));
+    }
+
+    nzcv = tcg_temp_new_i32();
+    flags = tcg_temp_new_i64();
+    tcg_gen_fcmp_fp(nzcv, tn, tm, signal_all_nans);
+    tcg_gen_extu_i32_i64(flags, nzcv);
+    gen_set_nzcv(flags);
+    return true;
+}
+
 static void handle_fp_compare(DisasContext *s, int size,
                               unsigned int rn, unsigned int rm,
                               bool cmp_with_zero, bool signal_all_nans)
 {
-    TCGv_i64 tcg_flags = tcg_temp_new_i64();
-    TCGv_ptr fpst = fpstatus_ptr(size == MO_16 ? FPST_A64_F16 : FPST_A64);
+    TCGv_i64 tcg_flags;
+    TCGv_ptr fpst;
+
+    if (handle_fp_compare_native(s, size, rn, rm, cmp_with_zero,
+                                 signal_all_nans)) {
+        return;
+    }
+    tcg_flags = tcg_temp_new_i64();
+    fpst = fpstatus_ptr(size == MO_16 ? FPST_A64_F16 : FPST_A64);
 
     if (size == MO_64) {
         TCGv_i64 tcg_vn, tcg_vm;
@@ -9338,31 +10438,142 @@ static bool do_fp1_scalar_ah(DisasContext *s, arg_rr_e *a,
     return do_fp1_scalar_with_fpsttype(s, a, f, rmode, select_ah_fpst(s, a->esz));
 }
 
+typedef void GenFPVec2Op(unsigned, TCGv_vec, TCGv_vec);
+
+static bool do_fp1_scalar_native(DisasContext *s, arg_rr_e *a, TCGOpcode opc,
+                                 TCGArg round, GenFPVec2Op *gen, FPGuard *g)
+{
+    TCGType type;
+    TCGv_vec t0;
+
+    if (!fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    type = fp_scalar_type(s, a->esz);
+    if (type == TCG_TYPE_COUNT) {
+        return false;
+    }
+    if (opc == INDEX_op_rint_fp
+        ? !tcg_can_emit_fp_cvt(opc, type, 0, round, 0)
+        : !tcg_can_emit_fp_op(opc, type, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    t0 = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(t0, tcg_env, vec_full_reg_offset(s, a->rn));
+    fp_guard_begin(g, opc);
+    gen(0, t0, t0);
+    fp_guard_result(g, 0, t0);
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(t0, tcg_env, vec_full_reg_offset(s, a->rd));
+    fp_guard_end(g);
+    return true;
+}
+
+static void gen_vec_fsqrt(unsigned vece, TCGv_vec d, TCGv_vec n)
+{
+    tcg_gen_sqrt_fp(vece, d, n);
+}
+
+#define DEF_GEN_VEC_FRINT(NAME, ROUND)                          \
+    static void NAME(unsigned vece, TCGv_vec d, TCGv_vec n)     \
+    {                                                           \
+        tcg_gen_rint_fp(vece, d, n, ROUND);                     \
+    }
+
+DEF_GEN_VEC_FRINT(gen_vec_frintn, TCG_FP_ROUND_NEAREST_EVEN)
+DEF_GEN_VEC_FRINT(gen_vec_frintp, TCG_FP_ROUND_UP)
+DEF_GEN_VEC_FRINT(gen_vec_frintm, TCG_FP_ROUND_DOWN)
+DEF_GEN_VEC_FRINT(gen_vec_frintz, TCG_FP_ROUND_TO_ZERO)
+DEF_GEN_VEC_FRINT(gen_vec_frinta, TCG_FP_ROUND_TIES_AWAY)
+DEF_GEN_VEC_FRINT(gen_vec_frinti, TCG_FP_ROUND_CURRENT)
+DEF_GEN_VEC_FRINT(gen_vec_frintx, TCG_FP_ROUND_CURRENT_EXACT)
+
+/* round is the one gen uses, for rint_fp. */
+static bool do_fp1_scalar_native_or_helper(DisasContext *s, arg_rr_e *a,
+                                           const FPScalar1 *f, int rmode,
+                                           TCGOpcode opc, TCGArg round,
+                                           GenFPVec2Op *gen)
+{
+    FPGuard g = {};
+
+    if (!do_fp1_scalar_native(s, a, opc, round, gen, &g)) {
+        return do_fp1_scalar(s, a, f, rmode);
+    }
+    if (g.slow) {
+        do_fp1_scalar(s, a, f, rmode);
+        fp_guard_finish(&g);
+    }
+    return true;
+}
+
+static bool do_fp1_scalar_ah_native_or_helper(DisasContext *s, arg_rr_e *a,
+                                              const FPScalar1 *f, int rmode,
+                                              TCGOpcode opc, GenFPVec2Op *gen)
+{
+    FPGuard g = {};
+
+    if (!do_fp1_scalar_native(s, a, opc, 0, gen, &g)) {
+        return do_fp1_scalar_ah(s, a, f, rmode);
+    }
+    if (g.slow) {
+        do_fp1_scalar_ah(s, a, f, rmode);
+        fp_guard_finish(&g);
+    }
+    return true;
+}
+
+static void gen_vec_frecpe(unsigned vece, TCGv_vec d, TCGv_vec n)
+{
+    tcg_gen_recpe_fp(vece, d, n);
+}
+
+static void gen_vec_frsqrte(unsigned vece, TCGv_vec d, TCGv_vec n)
+{
+    tcg_gen_rsqrte_fp(vece, d, n);
+}
+
+static void gen_vec_frecpx(unsigned vece, TCGv_vec d, TCGv_vec n)
+{
+    tcg_gen_recpx_fp(vece, d, n);
+}
+
 static const FPScalar1 f_scalar_fsqrt = {
     gen_helper_vfp_sqrth,
     gen_helper_vfp_sqrts,
     gen_helper_vfp_sqrtd,
 };
-TRANS(FSQRT_s, do_fp1_scalar, a, &f_scalar_fsqrt, -1)
+TRANS(FSQRT_s, do_fp1_scalar_native_or_helper, a, &f_scalar_fsqrt, -1,
+      INDEX_op_sqrt_fp, 0, gen_vec_fsqrt)
 
 static const FPScalar1 f_scalar_frint = {
     gen_helper_advsimd_rinth,
     gen_helper_rints,
     gen_helper_rintd,
 };
-TRANS(FRINTN_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_TIEEVEN)
-TRANS(FRINTP_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_POSINF)
-TRANS(FRINTM_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_NEGINF)
-TRANS(FRINTZ_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_ZERO)
-TRANS(FRINTA_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_TIEAWAY)
-TRANS(FRINTI_s, do_fp1_scalar, a, &f_scalar_frint, -1)
+TRANS(FRINTN_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frint, FPROUNDING_TIEEVEN,
+      INDEX_op_rint_fp, TCG_FP_ROUND_NEAREST_EVEN, gen_vec_frintn)
+TRANS(FRINTP_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frint, FPROUNDING_POSINF,
+      INDEX_op_rint_fp, TCG_FP_ROUND_UP, gen_vec_frintp)
+TRANS(FRINTM_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frint, FPROUNDING_NEGINF,
+      INDEX_op_rint_fp, TCG_FP_ROUND_DOWN, gen_vec_frintm)
+TRANS(FRINTZ_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frint, FPROUNDING_ZERO,
+      INDEX_op_rint_fp, TCG_FP_ROUND_TO_ZERO, gen_vec_frintz)
+TRANS(FRINTA_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frint, FPROUNDING_TIEAWAY,
+      INDEX_op_rint_fp, TCG_FP_ROUND_TIES_AWAY, gen_vec_frinta)
+TRANS(FRINTI_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frint, -1,
+      INDEX_op_rint_fp, TCG_FP_ROUND_CURRENT, gen_vec_frinti)
 
 static const FPScalar1 f_scalar_frintx = {
     gen_helper_advsimd_rinth_exact,
     gen_helper_rints_exact,
     gen_helper_rintd_exact,
 };
-TRANS(FRINTX_s, do_fp1_scalar, a, &f_scalar_frintx, -1)
+TRANS(FRINTX_s, do_fp1_scalar_native_or_helper, a, &f_scalar_frintx, -1,
+      INDEX_op_rint_fp, TCG_FP_ROUND_CURRENT_EXACT, gen_vec_frintx)
 
 static bool trans_BFCVT_s(DisasContext *s, arg_rr_e *a)
 {
@@ -9414,16 +10625,18 @@ static const FPScalar1 f_scalar_frecpe_rpres = {
     gen_helper_recpe_rpres_f32,
     gen_helper_recpe_f64,
 };
-TRANS(FRECPE_s, do_fp1_scalar_ah, a,
+TRANS(FRECPE_s, do_fp1_scalar_ah_native_or_helper, a,
       s->fpcr_ah && dc_isar_feature(aa64_rpres, s) ?
-      &f_scalar_frecpe_rpres : &f_scalar_frecpe, -1)
+      &f_scalar_frecpe_rpres : &f_scalar_frecpe, -1,
+      INDEX_op_recpe_fp, gen_vec_frecpe)
 
 static const FPScalar1 f_scalar_frecpx = {
     gen_helper_frecpx_f16,
     gen_helper_frecpx_f32,
     gen_helper_frecpx_f64,
 };
-TRANS(FRECPX_s, do_fp1_scalar_ah, a, &f_scalar_frecpx, -1)
+TRANS(FRECPX_s, do_fp1_scalar_ah_native_or_helper, a, &f_scalar_frecpx, -1,
+      INDEX_op_recpx_fp, gen_vec_frecpx)
 
 static const FPScalar1 f_scalar_frsqrte = {
     gen_helper_rsqrte_f16,
@@ -9435,11 +10648,12 @@ static const FPScalar1 f_scalar_frsqrte_rpres = {
     gen_helper_rsqrte_rpres_f32,
     gen_helper_rsqrte_f64,
 };
-TRANS(FRSQRTE_s, do_fp1_scalar_ah, a,
+TRANS(FRSQRTE_s, do_fp1_scalar_ah_native_or_helper, a,
       s->fpcr_ah && dc_isar_feature(aa64_rpres, s) ?
-      &f_scalar_frsqrte_rpres : &f_scalar_frsqrte, -1)
+      &f_scalar_frsqrte_rpres : &f_scalar_frsqrte, -1,
+      INDEX_op_rsqrte_fp, gen_vec_frsqrte)
 
-static bool trans_FCVT_s_ds(DisasContext *s, arg_rr *a)
+static bool do_fcvt_s_ds(DisasContext *s, arg_rr *a)
 {
     if (fp_access_check(s)) {
         TCGv_i32 tcg_rn = read_fp_sreg(s, a->rn);
@@ -9452,7 +10666,7 @@ static bool trans_FCVT_s_ds(DisasContext *s, arg_rr *a)
     return true;
 }
 
-static bool trans_FCVT_s_hs(DisasContext *s, arg_rr *a)
+static bool do_fcvt_s_hs(DisasContext *s, arg_rr *a)
 {
     if (fp_access_check(s)) {
         TCGv_i32 tmp = read_fp_sreg(s, a->rn);
@@ -9466,7 +10680,7 @@ static bool trans_FCVT_s_hs(DisasContext *s, arg_rr *a)
     return true;
 }
 
-static bool trans_FCVT_s_sd(DisasContext *s, arg_rr *a)
+static bool do_fcvt_s_sd(DisasContext *s, arg_rr *a)
 {
     if (fp_access_check(s)) {
         TCGv_i64 tcg_rn = read_fp_dreg(s, a->rn);
@@ -9479,7 +10693,7 @@ static bool trans_FCVT_s_sd(DisasContext *s, arg_rr *a)
     return true;
 }
 
-static bool trans_FCVT_s_hd(DisasContext *s, arg_rr *a)
+static bool do_fcvt_s_hd(DisasContext *s, arg_rr *a)
 {
     if (fp_access_check(s)) {
         TCGv_i64 tcg_rn = read_fp_dreg(s, a->rn);
@@ -9494,7 +10708,7 @@ static bool trans_FCVT_s_hd(DisasContext *s, arg_rr *a)
     return true;
 }
 
-static bool trans_FCVT_s_sh(DisasContext *s, arg_rr *a)
+static bool do_fcvt_s_sh(DisasContext *s, arg_rr *a)
 {
     if (fp_access_check(s)) {
         TCGv_i32 tcg_rn = read_fp_hreg(s, a->rn);
@@ -9508,7 +10722,7 @@ static bool trans_FCVT_s_sh(DisasContext *s, arg_rr *a)
     return true;
 }
 
-static bool trans_FCVT_s_dh(DisasContext *s, arg_rr *a)
+static bool do_fcvt_s_dh(DisasContext *s, arg_rr *a)
 {
     if (fp_access_check(s)) {
         TCGv_i32 tcg_rn = read_fp_hreg(s, a->rn);
@@ -9522,12 +10736,92 @@ static bool trans_FCVT_s_dh(DisasContext *s, arg_rr *a)
     return true;
 }
 
+static bool do_fcvt_s_native(DisasContext *s, arg_rr *a, TCGType dst,
+                             TCGType src, FPGuard *g)
+{
+    TCGv_vec tn, td;
+
+    if (!fp_native_op_ok(s, INDEX_op_cvt_fp)) {
+        return false;
+    }
+    if ((dst == TCG_TYPE_F16 || src == TCG_TYPE_F16) &&
+        !fp16_cvt_native_ok(s)) {
+        return false;
+    }
+    if (!tcg_can_emit_fp_cvt(INDEX_op_cvt_fp, dst, src, 0, 0)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    tn = tcg_temp_new_vec(src);
+    td = tcg_temp_new_vec(dst);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    fp_guard_begin(g, INDEX_op_cvt_fp);
+    tcg_gen_cvt_fp(td, tn);
+    fp_guard_result(g, 0, td);
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(td, tcg_env, vec_full_reg_offset(s, a->rd));
+    fp_guard_end(g);
+    return true;
+}
+
+static bool do_fcvt_s(DisasContext *s, arg_rr *a, TCGType dst, TCGType src,
+                      bool (*fallback)(DisasContext *, arg_rr *))
+{
+    FPGuard g = {};
+
+    if (!do_fcvt_s_native(s, a, dst, src, &g)) {
+        return fallback(s, a);
+    }
+    if (g.slow) {
+        fallback(s, a);
+        fp_guard_finish(&g);
+    }
+    return true;
+}
+
+TRANS(FCVT_s_ds, do_fcvt_s, a, TCG_TYPE_F64, TCG_TYPE_F32, do_fcvt_s_ds)
+TRANS(FCVT_s_hs, do_fcvt_s, a, TCG_TYPE_F16, TCG_TYPE_F32, do_fcvt_s_hs)
+TRANS(FCVT_s_sd, do_fcvt_s, a, TCG_TYPE_F32, TCG_TYPE_F64, do_fcvt_s_sd)
+TRANS(FCVT_s_hd, do_fcvt_s, a, TCG_TYPE_F16, TCG_TYPE_F64, do_fcvt_s_hd)
+TRANS(FCVT_s_sh, do_fcvt_s, a, TCG_TYPE_F32, TCG_TYPE_F16, do_fcvt_s_sh)
+TRANS(FCVT_s_dh, do_fcvt_s, a, TCG_TYPE_F64, TCG_TYPE_F16, do_fcvt_s_dh)
+
+/* The caller has done the access check. */
+static bool do_cvtf_scalar_native(DisasContext *s, MemOp esz, int rd,
+                                  int shift, TCGv_i64 tcg_int, bool is_signed)
+{
+    TCGOpcode opc = is_signed ? INDEX_op_cvt_s_i2f : INDEX_op_cvt_u_i2f;
+    TCGType ftype = fp_scalar_type(s, esz);
+    TCGv_vec td;
+
+    if (ftype == TCG_TYPE_COUNT || !fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    if (!tcg_can_emit_fp_cvt(opc, ftype, TCG_TYPE_I64, 0, shift)) {
+        return false;
+    }
+
+    td = tcg_temp_new_vec(ftype);
+    tcg_gen_cvt_i2f(td, tcgv_i64_temp(tcg_int), TCG_TYPE_I64, !is_signed,
+                    shift);
+    clear_vec(s, rd);
+    tcg_gen_st_vec(td, tcg_env, vec_full_reg_offset(s, rd));
+    return true;
+}
+
 static bool do_cvtf_scalar(DisasContext *s, MemOp esz, int rd, int shift,
                            TCGv_i64 tcg_int, bool is_signed)
 {
     TCGv_ptr tcg_fpstatus;
     TCGv_i32 tcg_shift, tcg_single;
     TCGv_i64 tcg_double;
+
+    if (do_cvtf_scalar_native(s, esz, rd, shift, tcg_int, is_signed)) {
+        return true;
+    }
 
     tcg_fpstatus = fpstatus_ptr(esz == MO_16 ? FPST_A64_F16 : FPST_A64);
     tcg_shift = tcg_constant_i32(shift);
@@ -9617,9 +10911,94 @@ static bool do_cvtf_f(DisasContext *s, arg_fcvt *a, bool is_signed)
 TRANS(SCVTF_f, do_cvtf_f, a, true)
 TRANS(UCVTF_f, do_cvtf_f, a, false)
 
+/* ARMFPRounding is the FPCR.RMode encoding, which is not TCGFPRound's order. */
+static bool arm_rmode_to_tcg(ARMFPRounding rmode, TCGArg *out)
+{
+    switch (rmode) {
+    case FPROUNDING_TIEEVEN:
+        *out = TCG_FP_ROUND_NEAREST_EVEN;
+        return true;
+    case FPROUNDING_POSINF:
+        *out = TCG_FP_ROUND_UP;
+        return true;
+    case FPROUNDING_NEGINF:
+        *out = TCG_FP_ROUND_DOWN;
+        return true;
+    case FPROUNDING_ZERO:
+        *out = TCG_FP_ROUND_TO_ZERO;
+        return true;
+    case FPROUNDING_TIEAWAY:
+        *out = TCG_FP_ROUND_TIES_AWAY;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The caller has done the access check. */
+static bool do_fcvt_scalar_native(DisasContext *s, MemOp out, MemOp esz,
+                                  TCGv_i64 tcg_out, int shift, int rn,
+                                  ARMFPRounding rmode, FPGuard *g)
+{
+    bool uns = !(out & MO_SIGN);
+    TCGOpcode opc = uns ? INDEX_op_cvt_f2i_u : INDEX_op_cvt_f2i_s;
+    TCGType ftype = fp_scalar_type(s, esz);
+    TCGType itype = (out & ~MO_SIGN) == MO_64 ? TCG_TYPE_I64 : TCG_TYPE_I32;
+    TCGArg round;
+    TCGv_vec tn;
+
+    if ((out & ~MO_SIGN) < MO_32 || ftype == TCG_TYPE_COUNT) {
+        return false;
+    }
+    if (!arm_rmode_to_tcg(rmode, &round) || !fp_native_op_ok(s, opc)) {
+        return false;
+    }
+    if (!tcg_can_emit_fp_cvt(opc, ftype, itype, round, shift)) {
+        return false;
+    }
+
+    tn = tcg_temp_new_vec(ftype);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, rn));
+
+    fp_guard_begin(g, opc);
+    fp_guard_f2i(g, itype, tn);
+    if (itype == TCG_TYPE_I64) {
+        tcg_gen_cvt_f2i(tcgv_i64_temp(tcg_out), TCG_TYPE_I64, tn, uns,
+                        round, shift);
+    } else {
+        TCGv_i32 t32 = tcg_temp_new_i32();
+
+        tcg_gen_cvt_f2i(tcgv_i32_temp(t32), TCG_TYPE_I32, tn, uns,
+                        round, shift);
+        tcg_gen_extu_i32_i64(tcg_out, t32);
+    }
+    fp_guard_end(g);
+    return true;
+}
+
+static void do_fcvt_scalar_fallback(DisasContext *s, MemOp out, MemOp esz,
+                                    TCGv_i64 tcg_out, int shift, int rn,
+                                    ARMFPRounding rmode);
+
 static void do_fcvt_scalar(DisasContext *s, MemOp out, MemOp esz,
                            TCGv_i64 tcg_out, int shift, int rn,
                            ARMFPRounding rmode)
+{
+    FPGuard g = {};
+
+    if (do_fcvt_scalar_native(s, out, esz, tcg_out, shift, rn, rmode, &g)) {
+        if (g.slow) {
+            do_fcvt_scalar_fallback(s, out, esz, tcg_out, shift, rn, rmode);
+            fp_guard_finish(&g);
+        }
+        return;
+    }
+    do_fcvt_scalar_fallback(s, out, esz, tcg_out, shift, rn, rmode);
+}
+
+static void do_fcvt_scalar_fallback(DisasContext *s, MemOp out, MemOp esz,
+                                    TCGv_i64 tcg_out, int shift, int rn,
+                                    ARMFPRounding rmode)
 {
     TCGv_ptr tcg_fpstatus;
     TCGv_i32 tcg_shift, tcg_rmode, tcg_single;
@@ -9751,6 +11130,34 @@ TRANS(FCVTAU_g, do_fcvt_g, a, FPROUNDING_TIEAWAY, false)
  * instead of output to general register.  Input and output element
  * size are always equal.
  */
+/* Same width in the vector register, as the result saturates to 16 bits. */
+static bool do_fcvt_f_h_native(DisasContext *s, arg_fcvt *a,
+                               ARMFPRounding rmode, bool is_signed)
+{
+    TCGOpcode opc = is_signed ? INDEX_op_cvt_fp_s : INDEX_op_cvt_fp_u;
+    TCGArg round;
+    TCGv_vec t;
+
+    if (a->esz != MO_16 || a->shift || !fp_native_exact_ok(s)) {
+        return false;
+    }
+    if (!arm_rmode_to_tcg(rmode, &round) ||
+        !tcg_can_emit_fp_op(opc, TCG_TYPE_F16, 0)) {
+        return false;
+    }
+
+    t = tcg_temp_new_vec(TCG_TYPE_F16);
+    tcg_gen_ld_vec(t, tcg_env, vec_full_reg_offset(s, a->rn));
+    if (is_signed) {
+        tcg_gen_cvt_fp_s(0, t, t, round, 0);
+    } else {
+        tcg_gen_cvt_fp_u(0, t, t, round, 0);
+    }
+    clear_vec(s, a->rd);
+    tcg_gen_st_vec(t, tcg_env, vec_full_reg_offset(s, a->rd));
+    return true;
+}
+
 static bool do_fcvt_f(DisasContext *s, arg_fcvt *a,
                       ARMFPRounding rmode, bool is_signed)
 {
@@ -9759,6 +11166,9 @@ static bool do_fcvt_f(DisasContext *s, arg_fcvt *a,
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (do_fcvt_f_h_native(s, a, rmode, is_signed)) {
+        return true;
     }
 
     tcg_int = tcg_temp_new_i64();
@@ -10178,7 +11588,39 @@ static ArithOneOp * const f_scalar_fcvtxn[] = {
     NULL,
     gen_fcvtxn_sd,
 };
-TRANS(FCVTN_v, do_2misc_narrow_vector, a, f_vector_fcvtn)
+static bool trans_FCVTN_v(DisasContext *s, arg_qrr_e *a)
+{
+    TCGv_vec tn, td;
+    FPGuard g = {};
+
+    /* esz is the narrow size. */
+    if (!fp_native_op_ok(s, INDEX_op_cvtn_fp) ||
+        (a->esz == MO_16 && !fp16_cvt_native_ok(s)) ||
+        !tcg_can_emit_fp_op(INDEX_op_cvtn_fp, TCG_TYPE_V128, a->esz)) {
+        return do_2misc_narrow_vector(s, a, f_vector_fcvtn);
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    tn = tcg_temp_new_vec(TCG_TYPE_V128);
+    td = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    if (a->q) {
+        tcg_gen_ld_vec(td, tcg_env, vec_full_reg_offset(s, a->rd));
+    } else {
+        tcg_gen_dupi_vec(MO_64, td, 0);
+    }
+    fp_guard_begin(&g, INDEX_op_cvtn_fp);
+    tcg_gen_cvtn_fp(a->esz, td, td, tn, a->q);
+    fp_guard_result(&g, a->esz, td);
+    fp_vector_store(s, true, a->rd, td, &g);
+    if (g.slow) {
+        do_2misc_narrow_vector(s, a, f_vector_fcvtn);
+        fp_guard_finish(&g);
+    }
+    return true;
+}
 TRANS(FCVTXN_v, do_2misc_narrow_vector, a, f_scalar_fcvtxn)
 
 static void gen_bfcvtn_hs(TCGv_i64 d, TCGv_i64 n)
@@ -10305,15 +11747,67 @@ static bool do_fp1_vector(DisasContext *s, arg_qrr_e *a,
     return true;
 }
 
-TRANS(FSQRT_v, do_fp1_vector, a, &f_scalar_fsqrt, -1)
+/* One input; inputs that fp -> int may get wrong are checked first. */
+static void do_fp_vector2_native(DisasContext *s, bool q, MemOp esz, int rd,
+                                 int rn, TCGOpcode opc, GenFPVec2Op *gen,
+                                 FPGuard *g)
+{
+    TCGType type = q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    TCGv_vec t = tcg_temp_new_vec(type);
 
-TRANS(FRINTN_v, do_fp1_vector, a, &f_scalar_frint, FPROUNDING_TIEEVEN)
-TRANS(FRINTP_v, do_fp1_vector, a, &f_scalar_frint, FPROUNDING_POSINF)
-TRANS(FRINTM_v, do_fp1_vector, a, &f_scalar_frint, FPROUNDING_NEGINF)
-TRANS(FRINTZ_v, do_fp1_vector, a, &f_scalar_frint, FPROUNDING_ZERO)
-TRANS(FRINTA_v, do_fp1_vector, a, &f_scalar_frint, FPROUNDING_TIEAWAY)
-TRANS(FRINTI_v, do_fp1_vector, a, &f_scalar_frint, -1)
-TRANS(FRINTX_v, do_fp1_vector, a, &f_scalar_frintx, -1)
+    tcg_gen_ld_vec(t, tcg_env, vec_full_reg_offset(s, rn));
+    fp_guard_begin(g, opc);
+    fp_guard_inputs(g, esz, t, t);
+    gen(esz, t, t);
+    fp_guard_result(g, esz, t);
+    fp_vector_store(s, q, rd, t, g);
+}
+
+static bool do_fp1_vector_native_or_helper(DisasContext *s, arg_qrr_e *a,
+                                           const FPScalar1 *f, int rmode,
+                                           TCGOpcode opc, TCGArg round,
+                                           GenFPVec2Op *fniv)
+{
+    TCGType type = a->q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    int check = fp_access_check_vector_hsd(s, a->q, a->esz);
+    FPGuard g = {};
+
+    if (check <= 0) {
+        return check == 0;
+    }
+    if (!fp_native_op_ok(s, opc) ||
+        (opc == INDEX_op_rint_fp
+         ? !tcg_can_emit_fp_cvt(opc, type, a->esz, round, 0)
+         : !tcg_can_emit_fp_op(opc, type, a->esz))) {
+        return do_fp1_vector(s, a, f, rmode);
+    }
+    do_fp_vector2_native(s, a->q, a->esz, a->rd, a->rn, opc, fniv, &g);
+    if (g.slow) {
+        do_fp1_vector(s, a, f, rmode);
+        fp_guard_finish(&g);
+    }
+    return true;
+}
+
+TRANS(FSQRT_v, do_fp1_vector_native_or_helper, a, &f_scalar_fsqrt, -1,
+      INDEX_op_sqrt_fp, 0, gen_vec_fsqrt)
+
+TRANS(FRINTN_v, do_fp1_vector_native_or_helper, a, &f_scalar_frint,
+      FPROUNDING_TIEEVEN, INDEX_op_rint_fp, TCG_FP_ROUND_NEAREST_EVEN,
+      gen_vec_frintn)
+TRANS(FRINTP_v, do_fp1_vector_native_or_helper, a, &f_scalar_frint,
+      FPROUNDING_POSINF, INDEX_op_rint_fp, TCG_FP_ROUND_UP, gen_vec_frintp)
+TRANS(FRINTM_v, do_fp1_vector_native_or_helper, a, &f_scalar_frint,
+      FPROUNDING_NEGINF, INDEX_op_rint_fp, TCG_FP_ROUND_DOWN, gen_vec_frintm)
+TRANS(FRINTZ_v, do_fp1_vector_native_or_helper, a, &f_scalar_frint,
+      FPROUNDING_ZERO, INDEX_op_rint_fp, TCG_FP_ROUND_TO_ZERO, gen_vec_frintz)
+TRANS(FRINTA_v, do_fp1_vector_native_or_helper, a, &f_scalar_frint,
+      FPROUNDING_TIEAWAY, INDEX_op_rint_fp, TCG_FP_ROUND_TIES_AWAY,
+      gen_vec_frinta)
+TRANS(FRINTI_v, do_fp1_vector_native_or_helper, a, &f_scalar_frint, -1,
+      INDEX_op_rint_fp, TCG_FP_ROUND_CURRENT, gen_vec_frinti)
+TRANS(FRINTX_v, do_fp1_vector_native_or_helper, a, &f_scalar_frintx, -1,
+      INDEX_op_rint_fp, TCG_FP_ROUND_CURRENT_EXACT, gen_vec_frintx)
 
 TRANS_FEAT(FRINT32Z_v, aa64_frint, do_fp1_vector, a,
            &f_scalar_frint32, FPROUNDING_ZERO)
@@ -10359,41 +11853,193 @@ static bool do_gvec_op2_ah_fpst(DisasContext *s, MemOp esz, bool is_q,
                                           fns, select_ah_fpst(s, esz));
 }
 
+static void gen_vec_scvtf(unsigned vece, TCGv_vec d, TCGv_vec n)
+{
+    tcg_gen_cvt_s_fp(vece, d, n, 0);
+}
+
+static void gen_vec_ucvtf(unsigned vece, TCGv_vec d, TCGv_vec n)
+{
+    tcg_gen_cvt_u_fp(vece, d, n, 0);
+}
+
+#define DEF_GEN_VEC_FCVT(NAME, GEN, ROUND)                      \
+    static void NAME(unsigned vece, TCGv_vec d, TCGv_vec n)     \
+    {                                                           \
+        GEN(vece, d, n, ROUND, 0);                              \
+    }
+
+DEF_GEN_VEC_FCVT(gen_vec_fcvtns, tcg_gen_cvt_fp_s, TCG_FP_ROUND_NEAREST_EVEN)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtnu, tcg_gen_cvt_fp_u, TCG_FP_ROUND_NEAREST_EVEN)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtps, tcg_gen_cvt_fp_s, TCG_FP_ROUND_UP)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtpu, tcg_gen_cvt_fp_u, TCG_FP_ROUND_UP)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtms, tcg_gen_cvt_fp_s, TCG_FP_ROUND_DOWN)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtmu, tcg_gen_cvt_fp_u, TCG_FP_ROUND_DOWN)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtzs, tcg_gen_cvt_fp_s, TCG_FP_ROUND_TO_ZERO)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtzu, tcg_gen_cvt_fp_u, TCG_FP_ROUND_TO_ZERO)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtas, tcg_gen_cvt_fp_s, TCG_FP_ROUND_TIES_AWAY)
+DEF_GEN_VEC_FCVT(gen_vec_fcvtau, tcg_gen_cvt_fp_u, TCG_FP_ROUND_TIES_AWAY)
+
+static bool do_gvec_op2_native_or_helper(DisasContext *s, MemOp esz,
+                                         bool is_q, int rd, int rn, int data,
+                                         gen_helper_gvec_2_ptr * const fns[3],
+                                         TCGOpcode opc, GenFPVec2Op *fniv)
+{
+    TCGType type = is_q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    int check = fp_access_check_vector_hsd(s, is_q, esz);
+    FPGuard g = {};
+
+    if (check <= 0) {
+        return check == 0;
+    }
+
+    /* data is the FloatRoundMode, which TCGFPRound matches. */
+    if (fp_native_op_ok(s, opc) &&
+        (opc == INDEX_op_cmp_fp
+         ? tcg_can_emit_fp_op(opc, type, esz)
+         : tcg_can_emit_fp_cvt(opc, type, esz, data, 0))) {
+        do_fp_vector2_native(s, is_q, esz, rd, rn, opc, fniv, &g);
+        if (!g.slow) {
+            return true;
+        }
+    }
+    do_gvec_op2_fpst(s, esz, is_q, rd, rn, data, fns);
+    fp_guard_finish(&g);
+    return true;
+}
+
+/* No guard: only on a host that is exact. */
+static bool do_gvec_op2_ah_native_or_helper(DisasContext *s, MemOp esz,
+                                            bool is_q, int rd, int rn,
+                                            int data,
+                                            gen_helper_gvec_2_ptr * const fns[3],
+                                            TCGOpcode opc, GenFPVec2Op *fniv)
+{
+    int check = fp_access_check_vector_hsd(s, is_q, esz);
+    TCGOpcode list[2] = { opc, 0 };
+    GVecGen2 op = { .fniv = fniv, .opt_opc = list, .vece = esz };
+
+    if (check <= 0) {
+        return check == 0;
+    }
+    if (fp_native_exact_ok(s) &&
+        tcg_can_emit_fp_op(opc, is_q ? TCG_TYPE_V128 : TCG_TYPE_V64, esz)) {
+        tcg_gen_gvec_2(vec_full_reg_offset(s, rd), vec_full_reg_offset(s, rn),
+                       is_q ? 16 : 8, vec_full_reg_size(s), &op);
+        return true;
+    }
+    return do_gvec_op2_ah_fpst(s, esz, is_q, rd, rn, data, fns);
+}
+
+/* No guard: only on a host that is exact. */
+static bool do_gvec_op2_fixed_native_or_helper(DisasContext *s, MemOp esz,
+                                               bool is_q, int rd, int rn,
+                                               int fbits,
+                                               gen_helper_gvec_2_ptr * const fns[3],
+                                               TCGOpcode opc,
+                                               void (*fniv)(unsigned, TCGv_vec,
+                                                            TCGv_vec, int64_t))
+{
+    int check = fp_access_check_vector_hsd(s, is_q, esz);
+    TCGOpcode list[2] = { opc, 0 };
+    GVecGen2i op = { .fniv = fniv, .opt_opc = list, .vece = esz };
+
+    if (check <= 0) {
+        return check == 0;
+    }
+    if (fp_native_exact_ok(s) &&
+        tcg_can_emit_fp_cvt(opc, is_q ? TCG_TYPE_V128 : TCG_TYPE_V64, esz,
+                            opc == INDEX_op_cvt_fp_s || opc == INDEX_op_cvt_fp_u
+                            ? TCG_FP_ROUND_TO_ZERO : 0, fbits)) {
+        tcg_gen_gvec_2i(vec_full_reg_offset(s, rd), vec_full_reg_offset(s, rn),
+                        is_q ? 16 : 8, vec_full_reg_size(s), fbits, &op);
+        return true;
+    }
+    return do_gvec_op2_fpst(s, esz, is_q, rd, rn, fbits, fns);
+}
+
+static void gen_vec_scvtf_fixed(unsigned vece, TCGv_vec d, TCGv_vec n,
+                                int64_t fbits)
+{
+    tcg_gen_cvt_s_fp(vece, d, n, fbits);
+}
+
+static void gen_vec_ucvtf_fixed(unsigned vece, TCGv_vec d, TCGv_vec n,
+                                int64_t fbits)
+{
+    tcg_gen_cvt_u_fp(vece, d, n, fbits);
+}
+
+static void gen_vec_fcvtzs_fixed(unsigned vece, TCGv_vec d, TCGv_vec n,
+                                 int64_t fbits)
+{
+    tcg_gen_cvt_fp_s(vece, d, n, TCG_FP_ROUND_TO_ZERO, fbits);
+}
+
+static void gen_vec_fcvtzu_fixed(unsigned vece, TCGv_vec d, TCGv_vec n,
+                                 int64_t fbits)
+{
+    tcg_gen_cvt_fp_u(vece, d, n, TCG_FP_ROUND_TO_ZERO, fbits);
+}
+
+#define DEF_GEN_VEC_FCMP0(NAME, COND, SWAP)                     \
+    static void NAME(unsigned vece, TCGv_vec d, TCGv_vec n)     \
+    {                                                           \
+        TCGv_vec z = tcg_constant_vec_matching(d, vece, 0);     \
+        if (SWAP) {                                             \
+            tcg_gen_cmp_fp(COND, vece, d, z, n);                \
+        } else {                                                \
+            tcg_gen_cmp_fp(COND, vece, d, n, z);                \
+        }                                                       \
+    }
+
+DEF_GEN_VEC_FCMP0(gen_vec_fcmeq0, TCG_COND_EQ, false)
+DEF_GEN_VEC_FCMP0(gen_vec_fcmgt0, TCG_COND_GT, false)
+DEF_GEN_VEC_FCMP0(gen_vec_fcmge0, TCG_COND_GE, false)
+DEF_GEN_VEC_FCMP0(gen_vec_fcmlt0, TCG_COND_GT, true)
+DEF_GEN_VEC_FCMP0(gen_vec_fcmle0, TCG_COND_GE, true)
+
 static gen_helper_gvec_2_ptr * const f_scvtf_v[] = {
     gen_helper_gvec_vcvt_sh,
     gen_helper_gvec_vcvt_sf,
     gen_helper_gvec_vcvt_sd,
 };
-TRANS(SCVTF_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, 0, f_scvtf_v)
-TRANS(SCVTF_vf, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, a->shift, f_scvtf_v)
+TRANS(SCVTF_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, 0, f_scvtf_v,
+      INDEX_op_cvt_s_fp, gen_vec_scvtf)
+TRANS(SCVTF_vf, do_gvec_op2_fixed_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, a->shift, f_scvtf_v,
+      INDEX_op_cvt_s_fp, gen_vec_scvtf_fixed)
 
 static gen_helper_gvec_2_ptr * const f_ucvtf_v[] = {
     gen_helper_gvec_vcvt_uh,
     gen_helper_gvec_vcvt_uf,
     gen_helper_gvec_vcvt_ud,
 };
-TRANS(UCVTF_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, 0, f_ucvtf_v)
-TRANS(UCVTF_vf, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, a->shift, f_ucvtf_v)
+TRANS(UCVTF_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, 0, f_ucvtf_v,
+      INDEX_op_cvt_u_fp, gen_vec_ucvtf)
+TRANS(UCVTF_vf, do_gvec_op2_fixed_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, a->shift, f_ucvtf_v,
+      INDEX_op_cvt_u_fp, gen_vec_ucvtf_fixed)
 
 static gen_helper_gvec_2_ptr * const f_fcvtzs_vf[] = {
     gen_helper_gvec_vcvt_rz_hs,
     gen_helper_gvec_vcvt_rz_fs,
     gen_helper_gvec_vcvt_rz_ds,
 };
-TRANS(FCVTZS_vf, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, a->shift, f_fcvtzs_vf)
+TRANS(FCVTZS_vf, do_gvec_op2_fixed_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, a->shift, f_fcvtzs_vf,
+      INDEX_op_cvt_fp_s, gen_vec_fcvtzs_fixed)
 
 static gen_helper_gvec_2_ptr * const f_fcvtzu_vf[] = {
     gen_helper_gvec_vcvt_rz_hu,
     gen_helper_gvec_vcvt_rz_fu,
     gen_helper_gvec_vcvt_rz_du,
 };
-TRANS(FCVTZU_vf, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, a->shift, f_fcvtzu_vf)
+TRANS(FCVTZU_vf, do_gvec_op2_fixed_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, a->shift, f_fcvtzu_vf,
+      INDEX_op_cvt_fp_u, gen_vec_fcvtzu_fixed)
 
 static gen_helper_gvec_2_ptr * const f_fcvt_s_vi[] = {
     gen_helper_gvec_vcvt_rm_sh,
@@ -10407,61 +12053,76 @@ static gen_helper_gvec_2_ptr * const f_fcvt_u_vi[] = {
     gen_helper_gvec_vcvt_rm_ud,
 };
 
-TRANS(FCVTNS_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_nearest_even, f_fcvt_s_vi)
-TRANS(FCVTNU_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_nearest_even, f_fcvt_u_vi)
-TRANS(FCVTPS_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_up, f_fcvt_s_vi)
-TRANS(FCVTPU_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_up, f_fcvt_u_vi)
-TRANS(FCVTMS_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_down, f_fcvt_s_vi)
-TRANS(FCVTMU_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_down, f_fcvt_u_vi)
-TRANS(FCVTZS_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_to_zero, f_fcvt_s_vi)
-TRANS(FCVTZU_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_to_zero, f_fcvt_u_vi)
-TRANS(FCVTAS_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_ties_away, f_fcvt_s_vi)
-TRANS(FCVTAU_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_ties_away, f_fcvt_u_vi)
+TRANS(FCVTNS_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_nearest_even, f_fcvt_s_vi,
+      INDEX_op_cvt_fp_s, gen_vec_fcvtns)
+TRANS(FCVTNU_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_nearest_even, f_fcvt_u_vi,
+      INDEX_op_cvt_fp_u, gen_vec_fcvtnu)
+TRANS(FCVTPS_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_up, f_fcvt_s_vi,
+      INDEX_op_cvt_fp_s, gen_vec_fcvtps)
+TRANS(FCVTPU_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_up, f_fcvt_u_vi,
+      INDEX_op_cvt_fp_u, gen_vec_fcvtpu)
+TRANS(FCVTMS_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_down, f_fcvt_s_vi,
+      INDEX_op_cvt_fp_s, gen_vec_fcvtms)
+TRANS(FCVTMU_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_down, f_fcvt_u_vi,
+      INDEX_op_cvt_fp_u, gen_vec_fcvtmu)
+TRANS(FCVTZS_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_to_zero, f_fcvt_s_vi,
+      INDEX_op_cvt_fp_s, gen_vec_fcvtzs)
+TRANS(FCVTZU_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_to_zero, f_fcvt_u_vi,
+      INDEX_op_cvt_fp_u, gen_vec_fcvtzu)
+TRANS(FCVTAS_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_ties_away, f_fcvt_s_vi,
+      INDEX_op_cvt_fp_s, gen_vec_fcvtas)
+TRANS(FCVTAU_vi, do_gvec_op2_native_or_helper,
+      a->esz, a->q, a->rd, a->rn, float_round_ties_away, f_fcvt_u_vi,
+      INDEX_op_cvt_fp_u, gen_vec_fcvtau)
 
 static gen_helper_gvec_2_ptr * const f_fceq0[] = {
     gen_helper_gvec_fceq0_h,
     gen_helper_gvec_fceq0_s,
     gen_helper_gvec_fceq0_d,
 };
-TRANS(FCMEQ0_v, do_gvec_op2_fpst, a->esz, a->q, a->rd, a->rn, 0, f_fceq0)
+TRANS(FCMEQ0_v, do_gvec_op2_native_or_helper, a->esz, a->q, a->rd, a->rn, 0,
+      f_fceq0, INDEX_op_cmp_fp, gen_vec_fcmeq0)
 
 static gen_helper_gvec_2_ptr * const f_fcgt0[] = {
     gen_helper_gvec_fcgt0_h,
     gen_helper_gvec_fcgt0_s,
     gen_helper_gvec_fcgt0_d,
 };
-TRANS(FCMGT0_v, do_gvec_op2_fpst, a->esz, a->q, a->rd, a->rn, 0, f_fcgt0)
+TRANS(FCMGT0_v, do_gvec_op2_native_or_helper, a->esz, a->q, a->rd, a->rn, 0,
+      f_fcgt0, INDEX_op_cmp_fp, gen_vec_fcmgt0)
 
 static gen_helper_gvec_2_ptr * const f_fcge0[] = {
     gen_helper_gvec_fcge0_h,
     gen_helper_gvec_fcge0_s,
     gen_helper_gvec_fcge0_d,
 };
-TRANS(FCMGE0_v, do_gvec_op2_fpst, a->esz, a->q, a->rd, a->rn, 0, f_fcge0)
+TRANS(FCMGE0_v, do_gvec_op2_native_or_helper, a->esz, a->q, a->rd, a->rn, 0,
+      f_fcge0, INDEX_op_cmp_fp, gen_vec_fcmge0)
 
 static gen_helper_gvec_2_ptr * const f_fclt0[] = {
     gen_helper_gvec_fclt0_h,
     gen_helper_gvec_fclt0_s,
     gen_helper_gvec_fclt0_d,
 };
-TRANS(FCMLT0_v, do_gvec_op2_fpst, a->esz, a->q, a->rd, a->rn, 0, f_fclt0)
+TRANS(FCMLT0_v, do_gvec_op2_native_or_helper, a->esz, a->q, a->rd, a->rn, 0,
+      f_fclt0, INDEX_op_cmp_fp, gen_vec_fcmlt0)
 
 static gen_helper_gvec_2_ptr * const f_fcle0[] = {
     gen_helper_gvec_fcle0_h,
     gen_helper_gvec_fcle0_s,
     gen_helper_gvec_fcle0_d,
 };
-TRANS(FCMLE0_v, do_gvec_op2_fpst, a->esz, a->q, a->rd, a->rn, 0, f_fcle0)
+TRANS(FCMLE0_v, do_gvec_op2_native_or_helper, a->esz, a->q, a->rd, a->rn, 0,
+      f_fcle0, INDEX_op_cmp_fp, gen_vec_fcmle0)
 
 static gen_helper_gvec_2_ptr * const f_frecpe[] = {
     gen_helper_gvec_frecpe_h,
@@ -10473,8 +12134,10 @@ static gen_helper_gvec_2_ptr * const f_frecpe_rpres[] = {
     gen_helper_gvec_frecpe_rpres_s,
     gen_helper_gvec_frecpe_d,
 };
-TRANS(FRECPE_v, do_gvec_op2_ah_fpst, a->esz, a->q, a->rd, a->rn, 0,
-      s->fpcr_ah && dc_isar_feature(aa64_rpres, s) ? f_frecpe_rpres : f_frecpe)
+TRANS(FRECPE_v, do_gvec_op2_ah_native_or_helper, a->esz, a->q, a->rd, a->rn,
+      0, s->fpcr_ah && dc_isar_feature(aa64_rpres, s) ? f_frecpe_rpres
+                                                         : f_frecpe,
+      INDEX_op_recpe_fp, gen_vec_frecpe)
 
 static gen_helper_gvec_2_ptr * const f_frsqrte[] = {
     gen_helper_gvec_frsqrte_h,
@@ -10486,10 +12149,52 @@ static gen_helper_gvec_2_ptr * const f_frsqrte_rpres[] = {
     gen_helper_gvec_frsqrte_rpres_s,
     gen_helper_gvec_frsqrte_d,
 };
-TRANS(FRSQRTE_v, do_gvec_op2_ah_fpst, a->esz, a->q, a->rd, a->rn, 0,
-      s->fpcr_ah && dc_isar_feature(aa64_rpres, s) ? f_frsqrte_rpres : f_frsqrte)
+TRANS(FRSQRTE_v, do_gvec_op2_ah_native_or_helper, a->esz, a->q, a->rd, a->rn,
+      0, s->fpcr_ah && dc_isar_feature(aa64_rpres, s) ? f_frsqrte_rpres
+                                                         : f_frsqrte,
+      INDEX_op_rsqrte_fp, gen_vec_frsqrte)
+
+static bool trans_FCVTL_v_fallback(DisasContext *s, arg_qrr_e *a);
+
+static bool trans_FCVTL_v_native(DisasContext *s, arg_qrr_e *a, FPGuard *g)
+{
+    TCGv_vec tn, td;
+
+    /* esz is the wide size. */
+    if (!fp_native_op_ok(s, INDEX_op_cvtl_fp) ||
+        (a->esz == MO_32 && !fp16_cvt_native_ok(s)) ||
+        !tcg_can_emit_fp_op(INDEX_op_cvtl_fp, TCG_TYPE_V128, a->esz - 1)) {
+        return false;
+    }
+    if (!fp_access_check(s)) {
+        return true;
+    }
+
+    tn = tcg_temp_new_vec(TCG_TYPE_V128);
+    td = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(tn, tcg_env, vec_full_reg_offset(s, a->rn));
+    fp_guard_begin(g, INDEX_op_cvtl_fp);
+    tcg_gen_cvtl_fp(a->esz - 1, td, tn, a->q);
+    fp_guard_result(g, a->esz, td);
+    fp_vector_store(s, true, a->rd, td, g);
+    return true;
+}
 
 static bool trans_FCVTL_v(DisasContext *s, arg_qrr_e *a)
+{
+    FPGuard g = {};
+
+    if (trans_FCVTL_v_native(s, a, &g)) {
+        if (g.slow) {
+            trans_FCVTL_v_fallback(s, a);
+            fp_guard_finish(&g);
+        }
+        return true;
+    }
+    return trans_FCVTL_v_fallback(s, a);
+}
+
+static bool trans_FCVTL_v_fallback(DisasContext *s, arg_qrr_e *a)
 {
     /* Handle 2-reg-misc ops which are widening (so each size element
      * in the source becomes a 2*size element in the destination.
@@ -10730,6 +12435,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->nv2_mem_be = EX_TBFLAG_A64(tb_flags, NV2_MEM_BE);
     dc->fpcr_ah = EX_TBFLAG_A64(tb_flags, AH);
     dc->fpcr_nep = EX_TBFLAG_A64(tb_flags, NEP);
+    dc->fpcr_fz = EX_TBFLAG_A64(tb_flags, FZ);
+    dc->fpcr_fz16 = EX_TBFLAG_A64(tb_flags, FZ16);
+    dc->fpcr_ahp = EX_TBFLAG_A64(tb_flags, AHP);
+    dc->fpcr_fiz = EX_TBFLAG_A64(tb_flags, FIZ);
     dc->vec_len = 0;
     dc->vec_stride = 0;
     dc->cp_regs = arm_cpu->cp_regs;

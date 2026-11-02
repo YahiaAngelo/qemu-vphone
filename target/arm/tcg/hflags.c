@@ -452,6 +452,18 @@ static CPUARMTBFlags rebuild_hflags_a64(CPUARMState *env, int el, int fp_el,
     if (env->vfp.fpcr & FPCR_AH) {
         DP_TBFLAG_A64(flags, AH, 1);
     }
+    if (env->vfp.fpcr & FPCR_FZ) {
+        DP_TBFLAG_A64(flags, FZ, 1);
+    }
+    if (env->vfp.fpcr & FPCR_FZ16) {
+        DP_TBFLAG_A64(flags, FZ16, 1);
+    }
+    if (env->vfp.fpcr & FPCR_AHP) {
+        DP_TBFLAG_A64(flags, AHP, 1);
+    }
+    if (env->vfp.fpcr & FPCR_FIZ) {
+        DP_TBFLAG_A64(flags, FIZ, 1);
+    }
     if (env->vfp.fpcr & FPCR_NEP) {
         /*
          * In streaming-SVE without FA64, NEP behaves as if zero;

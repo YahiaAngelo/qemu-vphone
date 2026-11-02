@@ -166,6 +166,11 @@ typedef struct DisasContext {
     bool fpcr_ah;
     /* True if FPCR.NEP is 1 (FEAT_AFP scalar upper-element result handling) */
     bool fpcr_nep;
+    /* FPCR.{FZ,FZ16,AHP,FIZ}, which decide whether FP can run natively */
+    bool fpcr_fz;
+    bool fpcr_fz16;
+    bool fpcr_ahp;
+    bool fpcr_fiz;
     /*
      * >= 0, a copy of PSTATE.BTYPE, which will be 0 without v8.5-BTI.
      *  < 0, set by the current instruction.
