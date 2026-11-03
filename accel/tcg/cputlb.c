@@ -463,9 +463,10 @@ void tlb_flush(CPUState *cpu)
  *               entry for the moment its part waits in its queue;
  *   2           a barrier: the other parts are queued, the source flushes at once and then waits
  *               until every other part ran (running its own queued work meanwhile, so two
- *               flushing CPUs cannot wait on each other), with no global stop. The wait gives up
- *               after a millisecond, or at once where an exclusive section is pending, as one
- *               it would otherwise deadlock against.
+ *               flushing CPUs cannot wait on each other), with no global stop. Where a part has
+ *               not run after VPHONE_TLB_BARRIER_US (default 1000), or an exclusive section is
+ *               pending (which the wait would deadlock against), it falls back on mode 0's
+ *               exclusive section, so a CPU never runs guest code past the flush unflushed.
  * XNU broadcasts TLB invalidations so often that the exclusive sections of mode 0 serialize the
  * vCPUs.
  */
@@ -538,6 +539,50 @@ static void tlb_flush_queue(CPUState *dst, run_on_cpu_func fn, run_on_cpu_data d
     }
 }
 
+/*
+ * diag/tunable for mode 2: the barrier's wait limit (VPHONE_TLB_BARRIER_US, default 1000) and
+ * how its waits ended (VPHONE_TLB_BARRIER_STATS=1: every 10 s on stderr).
+ */
+static uint64_t tbw_done, tbw_timeout, tbw_excl, tbw_work;
+static int64_t tbw_last;
+
+static int64_t tlb_barrier_limit_ns(void)
+{
+    static int64_t ns = -1;
+
+    if (ns < 0) {
+        const char *e = getenv("VPHONE_TLB_BARRIER_US");
+        ns = (e && *e ? strtoll(e, NULL, 0) : 1000) * 1000;
+    }
+    return ns;
+}
+
+static void tlb_barrier_note(uint64_t *what)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("VPHONE_TLB_BARRIER_STATS");
+        on = e && *e == '1';
+    }
+    if (!on) {
+        return;
+    }
+    qatomic_inc(what);
+    int64_t now = get_clock_realtime() / 1000000000;
+    int64_t last = qatomic_read(&tbw_last);
+    if (now >= last + 10 && qatomic_cmpxchg(&tbw_last, last, now) == last) {
+        fprintf(stderr, "barrierstat done=%" PRIu64 " timeout=%" PRIu64 " exclusive=%" PRIu64
+                " exclusive_work=%" PRIu64 "\n", qatomic_read(&tbw_done),
+                qatomic_read(&tbw_timeout), qatomic_read(&tbw_excl), qatomic_read(&tbw_work));
+    }
+}
+
+/* The exclusive section a barrier falls back on: it does nothing but stop every vCPU. */
+static void tlb_barrier_fallback(CPUState *cpu, run_on_cpu_data d)
+{
+}
+
 /* Runs the source CPU's part of a synced flush, the flush's last step. */
 static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
                              run_on_cpu_data data)
@@ -555,13 +600,31 @@ static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
         if (!b) {
             return;
         }
-        deadline = get_clock() + 1000000;
+        deadline = get_clock() + tlb_barrier_limit_ns();
         while (qatomic_read(&b->pending) > 0) {
-            if (cpu_exclusive_pending() || get_clock() > deadline ||
-                !process_queued_cpu_work_nonexclusive(src_cpu)) {
+            if (cpu_exclusive_pending()) {
+                tlb_barrier_note(&tbw_excl);
+                break;
+            }
+            if (get_clock() > deadline) {
+                tlb_barrier_note(&tbw_timeout);
+                break;
+            }
+            if (!process_queued_cpu_work_nonexclusive(src_cpu)) {
+                tlb_barrier_note(&tbw_work);
                 break;
             }
             cpu_relax();
+        }
+        if (qatomic_read(&b->pending) <= 0) {
+            tlb_barrier_note(&tbw_done);
+        } else {
+            /*
+             * A part has not run yet: fall back on mode 0's synchronization, an exclusive
+             * section, which stops every vCPU; one whose part waits runs it before it runs
+             * guest code again (its queued work comes first).
+             */
+            async_safe_run_on_cpu(src_cpu, tlb_barrier_fallback, RUN_ON_CPU_NULL);
         }
         tlb_barrier_unref(b);
         return;
