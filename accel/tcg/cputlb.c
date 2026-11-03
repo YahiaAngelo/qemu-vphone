@@ -481,9 +481,17 @@ static int tlb_flush_mode(void)
     return mode;
 }
 
+/*
+ * vphone-linux: @counted[i] is set while vCPU i's part is counted in @pending. A part queued on a
+ * vCPU that is not running guest code is not waited for (tlb_flush_queue()): such a vCPU runs its
+ * queued work before it runs guest code again. Whoever clears the flag first (the source, or the
+ * part as it runs) takes the part out of @pending.
+ */
+#define TLB_BARRIER_CPUS 64
 typedef struct TLBFlushBarrier {
     int pending;
     int refs;
+    uint8_t counted[TLB_BARRIER_CPUS];
 } TLBFlushBarrier;
 
 typedef struct TLBFlushBarrierWork {
@@ -506,7 +514,10 @@ static void tlb_barrier_work(CPUState *cpu, run_on_cpu_data d)
     TLBFlushBarrierWork *w = d.host_ptr;
 
     w->fn(cpu, w->data);
-    qatomic_dec(&w->barrier->pending);
+    if (cpu->cpu_index >= TLB_BARRIER_CPUS ||
+        qatomic_xchg(&w->barrier->counted[cpu->cpu_index], 0)) {
+        qatomic_dec(&w->barrier->pending);
+    }
     tlb_barrier_unref(w->barrier);
     g_free(w);
 }
@@ -533,7 +544,22 @@ static void tlb_flush_queue(CPUState *dst, run_on_cpu_func fn, run_on_cpu_data d
         w->data = data;
         qatomic_inc(&b->pending);
         qatomic_inc(&b->refs);
+        if (dst->cpu_index < TLB_BARRIER_CPUS) {
+            qatomic_set(&b->counted[dst->cpu_index], 1);
+        }
         async_run_on_cpu(dst, tlb_barrier_work, RUN_ON_CPU_HOST_PTR(w));
+        /*
+         * vphone-linux: a vCPU not running guest code now runs its part before it does again:
+         * queuing set its exit_request, which cpu_exec() checks before its first TB, and only
+         * qemu_process_cpu_events() clears it, just before it runs the queue. This barrier pairs
+         * with cpu_exec_start()'s, so either we see it running or it sees exit_request. Waiting
+         * for such a vCPU only waited for a halted one to wake (7% of backboardd's time at rest).
+         */
+        smp_mb();
+        if (dst->cpu_index < TLB_BARRIER_CPUS && !qatomic_read(&dst->running) &&
+            qatomic_xchg(&b->counted[dst->cpu_index], 0)) {
+            qatomic_dec(&b->pending);
+        }
     } else {
         async_run_on_cpu(dst, fn, data);
     }
