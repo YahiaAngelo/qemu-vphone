@@ -231,6 +231,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
 
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
+    tb_jmp_cache_check_inval(cpu, jc);
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
@@ -247,6 +248,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
          * the TB was made from. (A TB over two pages goes the long way.)
          */
         if (tb_page_addr1(tb) == -1 &&
+            !(qatomic_read(&tb->cflags) & CF_INVALID) &&
             tb_page_addr0(tb) == get_page_addr_code(cpu_env(cpu), s.pc)) {
             tb_jmp_cache_renew(jc, hash);
             goto hit;
@@ -449,6 +451,7 @@ const void *HELPER(vphone_lookup_fast)(CPUArchState *env, uint64_t cs_base,
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     uint32_t h = tb_jmp_cache_hash_func(pc);
 
+    tb_jmp_cache_check_inval(cpu, jc);
     if (likely(qatomic_read(&jc->array[h].tb) &&
                jc->array[h].pc == pc &&
                jc->array[h].cs_base == cs_base &&

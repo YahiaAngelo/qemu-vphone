@@ -11,6 +11,7 @@
 
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
+#include "exec/tb-flush.h"
 
 #define TB_JMP_CACHE_BITS 17
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
@@ -71,6 +72,17 @@ typedef struct CPUJumpCache {
     uint32_t last_gen;
     uint32_t epoch;
     uint32_t asid;
+    /*
+     * vphone-linux: TB invalidations of position-independent TBs, counted by
+     * the invalidating CPU (atomic), and the count this CPU last acted on.
+     * Such a TB may sit in any entry, so instead of emptying every CPU's
+     * cache, an invalidation bumps 'inval' and each CPU starts a new epoch
+     * at its next lookup (tb_jmp_cache_check_inval()); an older entry is
+     * used again only after tb_lookup() has checked its TB is not
+     * CF_INVALID. Next to 'gen', on the line every lookup reads.
+     */
+    uint32_t inval;
+    uint32_t inval_seen;
     /* address space (its key + 1, 0 when empty) -> generation, this epoch */
     struct {
         uint32_t key;
@@ -109,6 +121,19 @@ static inline bool tb_jmp_cache_current(const CPUJumpCache *jc, uint32_t h)
 {
     return jc->array[h].gen == jc->gen &&
            jc->array[h].bgen == jc->bgen[h >> TB_JMP_BUCKET_SHIFT];
+}
+
+/* Act on TB invalidations by other CPUs since the last lookup (see 'inval'). */
+static inline void tb_jmp_cache_check_inval(CPUState *cpu, CPUJumpCache *jc)
+{
+    uint32_t n = qatomic_read(&jc->inval);
+
+    if (unlikely(n != jc->inval_seen)) {
+        /* pairs with the barrier in tb_jmp_cache_inval_tb() */
+        smp_rmb();
+        jc->inval_seen = n;
+        tcg_stale_jmp_cache(cpu);
+    }
 }
 
 /* Make entry @h of @jc current again, its TB checked against the mappings. */

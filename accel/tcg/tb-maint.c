@@ -800,9 +800,32 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
+        static int lazy = -1;
+
+        if (unlikely(lazy < 0)) {
+            const char *e = getenv("VPHONE_JC_LAZY_INVAL");
+            lazy = !(e && *e == '0');
+        }
         /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
+        if (lazy) {
+            /*
+             * vphone-linux: each CPU starts a new epoch at its next lookup
+             * (tb-jmp-cache.h 'inval'): emptying 2^17 entries on every CPU
+             * for each invalidation was 8% of QEMU during app switches.
+             * CF_INVALID is set before this barrier.
+             */
+            smp_wmb();
+            CPU_FOREACH(cpu) {
+                CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+                if (jc) {
+                    qatomic_inc(&jc->inval);
+                }
+            }
+        } else {
+            CPU_FOREACH(cpu) {
+                tcg_flush_jmp_cache(cpu);
+            }
         }
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
