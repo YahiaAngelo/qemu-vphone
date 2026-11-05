@@ -132,6 +132,13 @@ struct TranslationBlock {
      * translates to it (see gen_goto_tb_checked in translate-a64.c).
      */
     uintptr_t vphone_jmp_host[2];
+    /*
+     * vphone-linux return-address stack (accel/tcg/tb-jmp-cache.h): for a TB
+     * that ends in a call whose return address lies in the call's page, the
+     * TB that return last went to (NULL: none yet). Written by any CPU's
+     * helper_vphone_ras_miss; read by the call's code, which pushes it.
+     */
+    TranslationBlock *vphone_ret_tb;
 };
 
 /* The alignment given to TranslationBlock during allocation. */

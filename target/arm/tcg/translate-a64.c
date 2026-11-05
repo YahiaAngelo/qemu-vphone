@@ -587,6 +587,151 @@ static int vphone_inline_lookup(void)
     return mode;
 }
 
+/*
+ * vphone-linux: a return-address stack (accel/tcg/tb-jmp-cache.h for the
+ * design and why it is safe). VPHONE_RAS: 1 (this branch's default) calls
+ * push and returns check the stack in the generated code, 0 off (the code
+ * is exactly as without it). Needs the jump cache helper path
+ * (VPHONE_INLINE_LOOKUP >= 1) and position-independent TBs.
+ */
+static int vphone_inline_lookup(void);
+
+static bool vphone_ras(DisasContext *s)
+{
+    static int mode = -1;
+
+    if (unlikely(mode < 0)) {
+        const char *e = getenv("VPHONE_RAS");
+        mode = e && *e ? atoi(e) : 1;
+    }
+    return mode && vphone_inline_lookup() >= 1 &&
+           (tb_cflags(s->base.tb) & CF_PCREL) && !s->ss_active;
+}
+
+static bool vphone_ras_stats_on(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_RAS_STATS");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
+#define VPHONE_JC(field) (offsetof(CPUJumpCache, field))
+#define VPHONE_RAS_E(field) (offsetof(CPUJumpCache, ras[0].field))
+
+static TCGv_ptr vphone_gen_jc(void)
+{
+    TCGv_ptr jc = tcg_temp_new_ptr();
+
+    tcg_gen_ld_ptr(jc, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    return jc;
+}
+
+/* jc + (top & mask) * sizeof(entry): the entry's base, minus offsetof(ras) */
+static TCGv_ptr vphone_gen_ras_entry(TCGv_ptr jc, TCGv_i32 top)
+{
+    TCGv_i32 i = tcg_temp_new_i32();
+    TCGv_ptr e = tcg_temp_new_ptr();
+
+    QEMU_BUILD_BUG_ON(sizeof(VphoneRasEntry) != 32);
+    tcg_gen_andi_i32(i, top, VPHONE_RAS_SIZE - 1);
+    tcg_gen_shli_i32(i, i, 5);
+    tcg_gen_ext_i32_ptr(e, i);
+    tcg_gen_add_ptr(e, e, jc);
+    return e;
+}
+
+/* A call: push @lr, the call site's return TB and the stamp. */
+static void vphone_gen_ras_push(DisasContext *s, TCGv_i64 lr)
+{
+    TCGv_ptr jc, e;
+    TCGv_i32 top;
+    TCGv_i64 t;
+    TranslationBlock **slot = NULL;
+
+    if (!vphone_ras(s)) {
+        return;
+    }
+    /*
+     * The call site's return TB is known only when the return address is in
+     * the call's own page (the TB then follows from the calling TB's
+     * physical code); otherwise push the address with no TB: the return
+     * misses, but the stack stays in step.
+     */
+    if (((s->pc_curr ^ (s->pc_curr + curr_insn_len(s))) & TARGET_PAGE_MASK) == 0) {
+        slot = &s->base.tb->vphone_ret_tb;
+    }
+    jc = vphone_gen_jc();
+    top = tcg_temp_new_i32();
+    tcg_gen_ld_i32(top, jc, VPHONE_JC(ras_top));
+    tcg_gen_addi_i32(top, top, 1);
+    tcg_gen_st_i32(top, jc, VPHONE_JC(ras_top));
+    e = vphone_gen_ras_entry(jc, top);
+    tcg_gen_st_i64(lr, e, VPHONE_RAS_E(pc));
+    t = tcg_temp_new_i64();
+    if (slot) {
+        tcg_gen_ld_i64(t, tcg_constant_ptr(slot), 0);
+        tcg_gen_st_i64(t, e, VPHONE_RAS_E(tb));
+    } else {
+        tcg_gen_st_i64(tcg_constant_i64(0), e, VPHONE_RAS_E(tb));
+    }
+    tcg_gen_st_i64(tcg_constant_i64((uintptr_t)slot), e, VPHONE_RAS_E(slot));
+    tcg_gen_ld_i64(t, jc, VPHONE_JC(ras_stamp));
+    tcg_gen_st_i64(t, e, VPHONE_RAS_E(stamp));
+}
+
+/*
+ * A return: pop the top entry; when it is for this target, in this stamp,
+ * with a valid TB of this TB's flags, cs_base and cflags (a return changes
+ * none of them, as for helper_vphone_lookup_fast), go straight to that TB.
+ */
+static void vphone_gen_ras_ret(DisasContext *s)
+{
+    TranslationBlock *tb = s->base.tb;
+    uint32_t cflags = tb_cflags(tb) & ~CF_INVALID;
+    TCGLabel *miss = gen_new_label();
+    TCGv_ptr jc = vphone_gen_jc();
+    TCGv_ptr e, rtb, code;
+    TCGv_i32 top = tcg_temp_new_i32(), w = tcg_temp_new_i32();
+    TCGv_i64 t = tcg_temp_new_i64(), t2 = tcg_temp_new_i64();
+
+    tcg_gen_ld_i32(top, jc, VPHONE_JC(ras_top));
+    e = vphone_gen_ras_entry(jc, top);
+    tcg_gen_subi_i32(top, top, 1);
+    tcg_gen_st_i32(top, jc, VPHONE_JC(ras_top));
+
+    tcg_gen_ld_i64(t, e, VPHONE_RAS_E(pc));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, cpu_pc, miss);
+    tcg_gen_ld_i64(t, e, VPHONE_RAS_E(stamp));
+    tcg_gen_ld_i64(t2, jc, VPHONE_JC(ras_stamp));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, t2, miss);
+    rtb = tcg_temp_new_ptr();
+    tcg_gen_ld_ptr(rtb, e, VPHONE_RAS_E(tb));
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, rtb, 0, miss);
+    /* cflags first: CF_INVALID makes it differ */
+    tcg_gen_ld_i32(w, rtb, offsetof(TranslationBlock, cflags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, w, cflags, miss);
+    tcg_gen_ld_i32(w, rtb, offsetof(TranslationBlock, flags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, w, tb->flags, miss);
+    tcg_gen_ld_i64(t, rtb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, tb->cs_base, miss);
+    if (vphone_ras_stats_on()) {
+        tcg_gen_vphone_ras_hit();
+    }
+    tcg_gen_st8_i32(tcg_constant_i32(1), tcg_env,
+                    offsetof(CPUState, neg.can_do_io) - sizeof(CPUState));
+    code = tcg_temp_new_ptr();
+    tcg_gen_ld_ptr(code, rtb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(code);
+
+    gen_set_label(miss);
+    tcg_gen_vphone_ras_miss(tb->cs_base, tb->flags, cflags);
+}
+
 static void vphone_gen_lookup_and_goto(DisasContext *s)
 {
     TranslationBlock *tb = s->base.tb;
@@ -604,6 +749,10 @@ static void vphone_gen_lookup_and_goto(DisasContext *s)
      * vphone-linux: the jump cache's bucket generations (tb-jmp-cache.h) are
      * checked in the helper only: the inline check (1) takes the helper too.
      */
+    if (s->vphone_ras_ret && vphone_ras(s)) {
+        vphone_gen_ras_ret(s);
+        return;
+    }
     if (vphone_inline_lookup() >= 1) {
         tcg_gen_vphone_lookup_fast(tb->cs_base, tb->flags,
                                    tb_cflags(tb) & ~CF_INVALID);
@@ -1849,6 +1998,7 @@ static bool trans_BL(DisasContext *s, arg_i *a)
 {
     gen_pc_plus_diff(s, cpu_reg(s, 30), curr_insn_len(s));
     vphone_gen_prefetch_ret(s, cpu_reg(s, 30));
+    vphone_gen_ras_push(s, cpu_reg(s, 30));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
     return true;
@@ -1956,6 +2106,7 @@ static bool trans_BLR(DisasContext *s, arg_r *a)
     }
     gen_pc_plus_diff(s, lr, curr_insn_len(s));
     vphone_gen_prefetch_ret(s, lr);
+    vphone_gen_ras_push(s, lr);
     set_btype_for_blr(s);
     gen_a64_set_pc(s, dst);
     s->base.is_jmp = DISAS_JUMP;
@@ -1965,6 +2116,7 @@ static bool trans_BLR(DisasContext *s, arg_r *a)
 static bool trans_RET(DisasContext *s, arg_r *a)
 {
     s->vphone_lookup_reason = 3;
+    s->vphone_ras_ret = true;
     gen_a64_set_pc(s, cpu_reg(s, a->rn));
     s->base.is_jmp = DISAS_JUMP;
     return true;
@@ -2026,6 +2178,7 @@ static bool trans_BLRAZ(DisasContext *s, arg_braz *a)
     }
     gen_pc_plus_diff(s, lr, curr_insn_len(s));
     vphone_gen_prefetch_ret(s, lr);
+    vphone_gen_ras_push(s, lr);
     set_btype_for_blr(s);
     gen_a64_set_pc(s, dst);
     s->base.is_jmp = DISAS_JUMP;
@@ -2035,6 +2188,7 @@ static bool trans_BLRAZ(DisasContext *s, arg_braz *a)
 static bool trans_RETA(DisasContext *s, arg_reta *a)
 {
     s->vphone_lookup_reason = 6;
+    s->vphone_ras_ret = true;
     TCGv_i64 dst;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
@@ -2079,6 +2233,7 @@ static bool trans_BLRA(DisasContext *s, arg_bra *a)
     }
     gen_pc_plus_diff(s, lr, curr_insn_len(s));
     vphone_gen_prefetch_ret(s, lr);
+    vphone_gen_ras_push(s, lr);
     set_btype_for_blr(s);
     gen_a64_set_pc(s, dst);
     s->base.is_jmp = DISAS_JUMP;
@@ -9763,6 +9918,7 @@ TRANS_FEAT(AUTIBSPPC_IMM, aa64_pauth, trans_cssc_nop)
 static bool trans_RETSPPC_IMM(DisasContext *s, arg_RETSPPC_IMM *a)
 {
     s->vphone_lookup_reason = 6;
+    s->vphone_ras_ret = true;
 
     if (!dc_isar_feature(aa64_pauth, s)) {
         return false;

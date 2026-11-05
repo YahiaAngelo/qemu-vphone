@@ -65,6 +65,33 @@
 #define TB_JMP_BUCKET_SHIFT 8
 #define TB_JMP_BUCKETS (TB_JMP_CACHE_SIZE >> TB_JMP_BUCKET_SHIFT)
 
+/*
+ * vphone-linux: a return-address stack (VPHONE_RAS, translate-a64.c). A call
+ * (BL, BLR, BLRAA, ...) pushes its return address, the TB its call site last
+ * returned to (tb->vphone_ret_tb: the return address is the call's next
+ * instruction, in the same page, so that TB is fixed by the calling TB's
+ * physical code) and 'ras_stamp'. A return (RET, RETAA, RETAB) pops the top
+ * entry and jumps straight to its TB when the target is the pushed address,
+ * the stamp is unchanged and the TB is valid (not CF_INVALID) with the
+ * returning TB's flags, cs_base and cflags; anything else takes
+ * helper_vphone_ras_miss, which also fills the call site's TB. 'ras_stamp'
+ * changes at every event that changes or might change a mapping of this CPU
+ * (whatever starts a jump cache generation or clears a page, an address
+ * space switch, an emptied cache), so an unchanged stamp means the return
+ * address still maps to the page the call ran from. A stale or mismatched
+ * entry (longjmp, a context switch, an exception) only misses: the stack is
+ * a prediction, checked before use.
+ */
+#define VPHONE_RAS_BITS 5
+#define VPHONE_RAS_SIZE (1 << VPHONE_RAS_BITS)
+
+typedef struct VphoneRasEntry {
+    vaddr pc;
+    TranslationBlock *tb;
+    TranslationBlock **slot;
+    uint64_t stamp;
+} VphoneRasEntry;
+
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
     uint32_t gen;
@@ -83,6 +110,10 @@ typedef struct CPUJumpCache {
      */
     uint32_t inval;
     uint32_t inval_seen;
+    /* vphone-linux: the return-address stack (above); top = last pushed */
+    uint32_t ras_top;
+    uint64_t ras_stamp;
+    VphoneRasEntry ras[VPHONE_RAS_SIZE];
     /* address space (its key + 1, 0 when empty) -> generation, this epoch */
     struct {
         uint32_t key;
@@ -101,6 +132,12 @@ typedef struct CPUJumpCache {
         uint32_t bgen;
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
+
+/* A mapping of @jc's CPU may have changed: no return-stack entry is good. */
+static inline void tb_jmp_cache_ras_stale(CPUJumpCache *jc)
+{
+    qatomic_set(&jc->ras_stamp, jc->ras_stamp + 1);
+}
 
 /* Fill entry @h of @jc with @tb for @pc, in generation @gen. */
 static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,

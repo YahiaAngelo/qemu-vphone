@@ -159,6 +159,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
      * guest flushes single pages often enough that 5-11% of its lookups
      * found their slot emptied. Called on @cpu itself, like the generation.
      */
+    tb_jmp_cache_ras_stale(jc);
     i0 = tb_jmp_cache_hash_page(page_addr);
     /* a new generation of the page's bucket (tb-jmp-cache.h) */
     if (unlikely(++jc->bgen[i0 >> TB_JMP_BUCKET_SHIFT] == 0)) {

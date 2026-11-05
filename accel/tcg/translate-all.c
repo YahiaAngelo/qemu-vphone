@@ -476,6 +476,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->jmp_dest[0] = (uintptr_t)NULL;
     tb->vphone_jmp_host[0] = 0;
     tb->vphone_jmp_host[1] = 0;
+    tb->vphone_ret_tb = NULL;
     tb->jmp_dest[1] = (uintptr_t)NULL;
 
     /* init original jump addresses which have been set during tcg_gen_code() */
@@ -618,6 +619,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         return;
     }
 
+    tb_jmp_cache_ras_stale(jc);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }
@@ -658,6 +660,7 @@ void tcg_stale_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
+    tb_jmp_cache_ras_stale(jc);
     jc->epoch++;
     jc->gen = tcg_new_jmp_gen(cpu, jc);
     tcg_note_jmp_gen(jc);
@@ -676,6 +679,7 @@ void tcg_switch_jmp_cache(CPUState *cpu, uint32_t asid)
     if (unlikely(jc == NULL)) {
         return;
     }
+    tb_jmp_cache_ras_stale(jc);
     jc->asid = asid;
     if (jc->asid_gen[i].key == asid + 1 && jc->asid_gen[i].epoch == jc->epoch) {
         jc->gen = jc->asid_gen[i].gen;

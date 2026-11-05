@@ -110,6 +110,8 @@ typedef struct DisasContext {
     bool ss_active;
     /* vphone diagnostic (VPHONE_LOOKUP_STATS): why the TB ends in a lookup. */
     int vphone_lookup_reason;
+    /* vphone-linux: the TB ends in a return (RET, RETAA, RETAB): VPHONE_RAS. */
+    bool vphone_ras_ret;
     bool pstate_ss;
     /* True if the insn just emitted was a load-exclusive instruction
      * (necessary for syndrome information for single step exceptions),

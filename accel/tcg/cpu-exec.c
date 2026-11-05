@@ -464,6 +464,108 @@ const void *HELPER(vphone_lookup_fast)(CPUArchState *env, uint64_t cs_base,
     return HELPER(lookup_tb_ptr)(env);
 }
 
+/*
+ * vphone-linux diagnostic (VPHONE_RAS_STATS=1): per vCPU thread, how returns
+ * fared on the return-address stack (tb-jmp-cache.h), logged (LOG_GUEST_ERROR)
+ * every 2^24 returns of a thread. hit: straight to the TB; the misses: target
+ * not the pushed address, stamp changed (a mapping may have changed), no TB
+ * known for the call site (first return, or a call at a page's end), TB keys
+ * differ or TB invalidated. fill: a call site's TB recorded.
+ */
+enum { RAS_HIT, RAS_PC, RAS_STAMP, RAS_EMPTY, RAS_NOSLOT, RAS_KEYS, RAS_FILL, RAS_N };
+static const char *const vphone_ras_names[RAS_N] = {
+    "hit", "pc", "stamp", "empty", "noslot", "keys", "fill",
+};
+static __thread uint64_t vphone_ras_counts[RAS_N];
+static __thread uint64_t vphone_ras_rets;
+
+/* VPHONE_RAS_STATS: 1 logs every 2^24 returns, a value from 10 to 40 every 2^value */
+static int vphone_ras_stats_shift = -1;
+
+static bool vphone_ras_stats(void)
+{
+    if (unlikely(vphone_ras_stats_shift < 0)) {
+        const char *e = getenv("VPHONE_RAS_STATS");
+        int v = e && *e ? atoi(e) : 0;
+
+        vphone_ras_stats_shift = v <= 0 ? 0 : v >= 10 && v <= 40 ? v : 24;
+    }
+    return vphone_ras_stats_shift;
+}
+
+static void vphone_ras_count(int what)
+{
+    vphone_ras_counts[what]++;
+    if (what == RAS_FILL) {
+        return;
+    }
+    if (!(++vphone_ras_rets & ((1ull << vphone_ras_stats_shift) - 1))) {
+        g_autoptr(GString) line = g_string_new("rasstat");
+        g_string_append_printf(line, " cpu=%d",
+                               current_cpu ? current_cpu->cpu_index : -1);
+        for (int i = 0; i < RAS_N; i++) {
+            g_string_append_printf(line, " %s=%" PRIu64, vphone_ras_names[i],
+                                   vphone_ras_counts[i]);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR, "%s\n", line->str);
+    }
+}
+
+void HELPER(vphone_ras_hit)(void)
+{
+    vphone_ras_count(RAS_HIT);
+}
+
+/*
+ * vphone-linux: a return whose return-stack entry did not pass the inline
+ * check (translate-a64.c vphone_gen_ras_ret; the entry is popped already):
+ * the ordinary lookup (helper_vphone_lookup_fast), then, when the entry was
+ * pushed for this very return address and no mapping can have changed since
+ * the push, the TB found is recorded as its call site's return TB, which the
+ * call pushes from then on. That TB lies in the call's page at the next
+ * instruction, so it is the right TB for that call site wherever the calling
+ * TB runs, as long as it is valid and its keys match (both checked at each
+ * use).
+ */
+const void *HELPER(vphone_ras_miss)(CPUArchState *env, uint64_t cs_base,
+                                    uint32_t flags, uint32_t cflags)
+{
+    CPUState *cpu = env_cpu(env);
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    VphoneRasEntry *e = &jc->ras[(jc->ras_top + 1) & (VPHONE_RAS_SIZE - 1)];
+    vaddr pc = cpu->cc->get_pc(cpu);
+    bool same = e->pc == pc && e->stamp == jc->ras_stamp;
+    const void *tc_ptr;
+
+    if (vphone_ras_stats()) {
+        TranslationBlock *t = e->tb;
+        int why = e->pc != pc ? RAS_PC :
+                  e->stamp != jc->ras_stamp ? RAS_STAMP :
+                  !e->slot ? RAS_NOSLOT : !t ? RAS_EMPTY : RAS_KEYS;
+
+        vphone_ras_count(why);
+    }
+
+    tc_ptr = HELPER(vphone_lookup_fast)(env, cs_base, flags, cflags);
+
+    /* the lookup may itself start a new generation (and so a new stamp) */
+    if (same && e->slot && tc_ptr != tcg_code_gen_epilogue &&
+        e->stamp == jc->ras_stamp) {
+        uint32_t h = tb_jmp_cache_hash_func(pc);
+        TranslationBlock *t = qatomic_read(&jc->array[h].tb);
+
+        if (t && jc->array[h].pc == pc && t->tc.ptr == tc_ptr &&
+            t->cs_base == cs_base && t->flags == flags &&
+            t->cflags == cflags) {
+            qatomic_set(e->slot, t);
+            if (vphone_ras_stats()) {
+                vphone_ras_count(RAS_FILL);
+            }
+        }
+    }
+    return tc_ptr;
+}
+
 /* Return the current PC from CPU, which may be cached in TB. */
 static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
 {
