@@ -2455,6 +2455,76 @@ static bool trans_NOP(DisasContext *s, arg_NOP *a)
 }
 
 /*
+ * vphone-linux: acquire/release barriers on a TSO host (VPHONE_FENCE).
+ *
+ * QEMU's mapping puts a full barrier before every release store (STLR,
+ * STLUR, STLXR) and after every acquire load (LDAR, LDAPR, LDAXR). On an
+ * x86 host only store->load ordering needs a fence (TCG_TARGET_DEFAULT_MO),
+ * so each of those emits a locked instruction, and yet a release store
+ * followed by an RCsc acquire load (STLR; LDAR), which Arm orders, gets no
+ * fence between the two: the load can pass the store in the host's store
+ * buffer (tests/tcg/vphone-fence sees both loads of a store-buffering pair
+ * read 0). Under TSO, acquire and release are free; the one ordering left
+ * is release store -> later RCsc acquire load. Modes:
+ *   0  QEMU's mapping;
+ *   1  (default on x86 hosts) a fence after each release store (STLR,
+ *      STLUR, STLLR); none for acquire loads, nor for STLXR/STLXP, whose
+ *      store is a locked cmpxchg (a full barrier on x86);
+ *   2  a fence before each RCsc acquire load (LDAR, LDLAR, LDAXR, LDAXP);
+ *      none for release stores nor LDAPR.
+ * Other hosts always use mode 0.
+ */
+static int vphone_fence_mode(void)
+{
+    static int mode = -1;
+
+    if (unlikely(mode < 0)) {
+#if defined(__x86_64__) || defined(__i386__)
+        const char *e = getenv("VPHONE_FENCE");
+        mode = e && *e ? atoi(e) : 1;
+        if (mode < 0 || mode > 2) {
+            mode = 0;
+        }
+#else
+        mode = 0;
+#endif
+    }
+    return mode;
+}
+
+/* before a release store */
+static void vphone_rel_before(DisasContext *s)
+{
+    if (vphone_fence_mode() == 0) {
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+    }
+}
+
+/* after a release store that is a plain host store (not STLXR/STLXP) */
+static void vphone_rel_after(DisasContext *s)
+{
+    if (vphone_fence_mode() == 1) {
+        tcg_gen_mb(TCG_MO_ST_LD | TCG_BAR_SC);
+    }
+}
+
+/* before an acquire load; @rcsc: LDAR/LDAXR (not LDAPR) */
+static void vphone_acq_before(DisasContext *s, bool rcsc)
+{
+    if (vphone_fence_mode() == 2 && rcsc) {
+        tcg_gen_mb(TCG_MO_ST_LD | TCG_BAR_SC);
+    }
+}
+
+/* after an acquire load */
+static void vphone_acq_after(DisasContext *s)
+{
+    if (vphone_fence_mode() == 0) {
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    }
+}
+
+/*
  * vphone diagnostic (VPHONE_INSN_STATS=1): generated code counts executed
  * instructions of a few classes in env->vphone_icount[], summed over the vCPUs
  * at each VPHONE_MARK begin/end (helper.c).
@@ -3713,7 +3783,7 @@ static bool trans_STXR(DisasContext *s, arg_stxr *a)
         gen_check_sp_alignment(s);
     }
     if (a->lasr) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+        vphone_rel_before(s);
     }
     gen_store_exclusive(s, a->rs, a->rt, a->rt2, a->rn, a->sz, false);
     return true;
@@ -3725,9 +3795,12 @@ static bool trans_LDXR(DisasContext *s, arg_stxr *a)
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
+    if (a->lasr) {
+        vphone_acq_before(s, true);
+    }
     gen_load_exclusive(s, a->rt, a->rt2, a->rn, a->sz, false);
     if (a->lasr) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+        vphone_acq_after(s);
     }
     return true;
 }
@@ -3749,13 +3822,14 @@ static bool trans_STLR(DisasContext *s, arg_stlr *a)
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
-    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+    vphone_rel_before(s);
     vphone_icount(s, VPI_STLR);
     memop = check_ordered_align(s, a->rn, 0, true, a->sz);
     clean_addr = gen_mte_check1(s, cpu_reg_sp(s, a->rn),
                                 true, a->rn != 31, memop);
     do_gpr_st(s, cpu_reg(s, a->rt), clean_addr, memop, true, a->rt,
               iss_sf, a->lasr);
+    vphone_rel_after(s);
     return true;
 }
 
@@ -3773,12 +3847,13 @@ static bool trans_LDAR(DisasContext *s, arg_stlr *a)
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
+    vphone_acq_before(s, true);
     memop = check_ordered_align(s, a->rn, 0, false, a->sz);
     clean_addr = gen_mte_check1(s, cpu_reg_sp(s, a->rn),
                                 false, a->rn != 31, memop);
     do_gpr_ld(s, cpu_reg(s, a->rt), clean_addr, memop, false, true,
               a->rt, iss_sf, a->lasr);
-    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    vphone_acq_after(s);
     vphone_icount(s, VPI_LDAR);
     return true;
 }
@@ -3789,7 +3864,7 @@ static bool trans_STXP(DisasContext *s, arg_stxr *a)
         gen_check_sp_alignment(s);
     }
     if (a->lasr) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+        vphone_rel_before(s);
     }
     gen_store_exclusive(s, a->rs, a->rt, a->rt2, a->rn, a->sz, true);
     return true;
@@ -3800,9 +3875,12 @@ static bool trans_LDXP(DisasContext *s, arg_stxr *a)
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
+    if (a->lasr) {
+        vphone_acq_before(s, true);
+    }
     gen_load_exclusive(s, a->rt, a->rt2, a->rn, a->sz, true);
     if (a->lasr) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+        vphone_acq_after(s);
     }
     return true;
 }
@@ -4401,7 +4479,7 @@ static bool trans_LDAPR(DisasContext *s, arg_LDAPR *a)
      */
     do_gpr_ld(s, cpu_reg(s, a->rt), clean_addr, mop, false,
               true, a->rt, iss_sf, true);
-    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    vphone_acq_after(s);
     vphone_icount(s, VPI_LDAPR);
     return true;
 }
@@ -4474,7 +4552,7 @@ static bool trans_LDAPR_i(DisasContext *s, arg_ldapr_stlr_i *a)
      */
     do_gpr_ld(s, cpu_reg(s, a->rt), dirty_addr, mop, a->ext, true,
               a->rt, iss_sf, true);
-    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    vphone_acq_after(s);
     vphone_icount(s, VPI_LDAPR);
     return true;
 }
@@ -4500,9 +4578,10 @@ static bool trans_STLR_i(DisasContext *s, arg_ldapr_stlr_i *a)
     tcg_gen_addi_i64(dirty_addr, dirty_addr, a->imm);
 
     /* Store-Release semantics */
-    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+    vphone_rel_before(s);
     vphone_icount(s, VPI_STLR);
     do_gpr_st(s, cpu_reg(s, a->rt), dirty_addr, mop, true, a->rt, iss_sf, true);
+    vphone_rel_after(s);
     return true;
 }
 
