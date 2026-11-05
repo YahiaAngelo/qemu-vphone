@@ -534,6 +534,22 @@ static void vphone_ibc_count(int what)
     qemu_log_mask(LOG_GUEST_ERROR, "%s\n", line->str);
 }
 
+static __thread uint32_t vphone_ibc_other;
+static uint32_t vphone_ibc_replace_n;
+
+/* VPHONE_IBC_REPLACE: a power of two, 1..1024 (default 8) */
+static uint32_t vphone_ibc_replace(void)
+{
+    if (unlikely(!vphone_ibc_replace_n)) {
+        const char *e = getenv("VPHONE_IBC_REPLACE");
+        int v = e && *e ? atoi(e) : 8;
+
+        v = v < 1 ? 1 : v > 1024 ? 1024 : v;
+        vphone_ibc_replace_n = 1u << (31 - __builtin_clz(v));
+    }
+    return vphone_ibc_replace_n;
+}
+
 void HELPER(vphone_ibc_hit)(void)
 {
     vphone_ibc_count(IBC_HIT);
@@ -571,6 +587,20 @@ const void *HELPER(vphone_ibc_miss)(CPUArchState *env, void *slotp,
     if (!t || jc->array[h].pc != pc || t->tc.ptr != tc_ptr ||
         t->cs_base != cs_base || t->flags != flags || t->cflags != cflags ||
         !t->vphone_host) {
+        return tc_ptr;
+    }
+    /*
+     * Another valid target than the cached one: a polymorphic site (such as
+     * objc_msgSend's final BRAA) would rewrite its slot, a line every vCPU
+     * running that code reads, at nearly every execution. Replace it only on
+     * every VPHONE_IBC_REPLACE-th such miss of this vCPU (default 8; 1 =
+     * always), which still lets a dominant target take the slot.
+     */
+    if (cur && cur != t && !(qatomic_read(&cur->cflags) & CF_INVALID) &&
+        (++vphone_ibc_other & (vphone_ibc_replace() - 1))) {
+        if (vphone_ibc_stats()) {
+            vphone_ibc_count(IBC_HOST);
+        }
         return tc_ptr;
     }
     vphone_tlb_fill_code(cpu, pc);
