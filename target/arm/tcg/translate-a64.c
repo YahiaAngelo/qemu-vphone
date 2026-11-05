@@ -3133,6 +3133,48 @@ static bool vphone_fast_cnt(DisasContext *s, const ARMCPRegInfo *ri, bool isread
            !(tb_cflags(s->base.tb) & CF_USE_ICOUNT) && vphone_is_counter_read(ri);
 }
 
+/*
+ * vphone-linux: DC ZVA inline (VPHONE_INLINE_ZVA). XNU zero-fills every new
+ * page with DC ZVA, 64 bytes at a time (256 per 16 KiB page, millions a
+ * second when a process touches fresh memory), and each one called the
+ * access-check helper and helper_dc_zva (a TLB lookup in C and a memset).
+ * 1 (the default): the block is zeroed by stores in the generated code
+ * through the softmmu fast path: first one byte at the operand's own
+ * address, so that a fault reports that address as the helper's probe did,
+ * then the aligned block in 16-byte stores; the slow path handles faults,
+ * watchpoints, code pages and I/O. At EL1 on a core without EL2 the access
+ * check (aa64_zva_access) cannot trap and is left out. Not with MTE.
+ * 0: QEMU's helpers.
+ */
+static bool vphone_inline_zva(DisasContext *s)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_INLINE_ZVA");
+        on = e && *e ? atoi(e) != 0 : 1;
+    }
+    return on && !s->mte_active[0] && (4 << s->dcz_blocksize) % 16 == 0;
+}
+
+static void vphone_gen_zva(DisasContext *s, TCGv_i64 va)
+{
+    int len = 4 << s->dcz_blocksize;
+    int midx = get_mem_index(s);
+    TCGv_i64 zero = tcg_constant_i64(0);
+    TCGv_i64 base = tcg_temp_new_i64();
+    TCGv_i64 addr = tcg_temp_new_i64();
+    TCGv_i128 z = tcg_temp_new_i128();
+
+    tcg_gen_qemu_st_i64(zero, va, midx, MO_UB);
+    tcg_gen_andi_i64(base, va, -(int64_t)len);
+    tcg_gen_concat_i64_i128(z, zero, zero);
+    for (int i = 0; i < len; i += 16) {
+        tcg_gen_addi_i64(addr, base, i);
+        tcg_gen_qemu_st_i128(z, addr, midx, MO_128 | MO_ATOM_NONE);
+    }
+}
+
 static void handle_sys(DisasContext *s, bool isread,
                        unsigned int op0, unsigned int op1, unsigned int op2,
                        unsigned int crn, unsigned int crm, unsigned int rt)
@@ -3244,7 +3286,10 @@ static void handle_sys(DisasContext *s, bool isread,
         }
     }
 
-    if (ri->accessfn || (ri->fgt && s->fgt_active)) {
+    if ((ri->accessfn || (ri->fgt && s->fgt_active)) &&
+        !((ri->type & ARM_CP_SPECIAL_MASK) == ARM_CP_DC_ZVA && !isread &&
+          s->current_el == 1 && !arm_dc_feature(s, ARM_FEATURE_EL2) &&
+          !(ri->fgt && s->fgt_active) && vphone_inline_zva(s))) {
         /* Emit code to perform further access permissions checks at
          * runtime; this may result in an exception.
          */
@@ -3376,6 +3421,10 @@ static void handle_sys(DisasContext *s, bool isread,
                                      tcg_constant_i32(desc), cpu_reg(s, rt));
         } else {
             tcg_rt = cpu_reg(s, rt);
+        }
+        if (vphone_inline_zva(s)) {
+            vphone_gen_zva(s, tcg_rt);
+            return;
         }
         gen_helper_dc_zva(tcg_env, tcg_rt);
         return;
