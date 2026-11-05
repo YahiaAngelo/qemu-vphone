@@ -3261,6 +3261,18 @@ void tcg_gen_vphone_xpage_slow(uint64_t cs_base, uint32_t flags, uint32_t cflags
     tcg_temp_free_ptr(ptr);
 }
 
+/* vphone-linux: an indirect branch's missed site cache check (VPHONE_IBC), then goto_ptr. */
+void tcg_gen_vphone_ibc_miss(void *slot, uint64_t cs_base, uint32_t flags, uint32_t cflags)
+{
+    TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
+
+    gen_helper_vphone_ibc_miss(ptr, tcg_env, tcg_constant_ptr(slot),
+                               tcg_constant_i64(cs_base), tcg_constant_i32(flags),
+                               tcg_constant_i32(cflags));
+    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
+    tcg_temp_free_ptr(ptr);
+}
+
 /* vphone-linux: a return's missed return-stack check (VPHONE_RAS), then goto_ptr. */
 void tcg_gen_vphone_ras_miss(uint64_t cs_base, uint32_t flags, uint32_t cflags)
 {
@@ -3276,6 +3288,12 @@ void tcg_gen_vphone_ras_miss(uint64_t cs_base, uint32_t flags, uint32_t cflags)
 void tcg_gen_vphone_ras_hit(void)
 {
     gen_helper_vphone_ras_hit();
+}
+
+/* vphone-linux diagnostic (VPHONE_IBC_STATS): count an indirect-branch cache hit. */
+void tcg_gen_vphone_ibc_hit(void)
+{
+    gen_helper_vphone_ibc_hit();
 }
 
 void tcg_gen_lookup_and_goto_ptr(void)

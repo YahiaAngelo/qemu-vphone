@@ -81,6 +81,15 @@ struct TranslationBlock {
     struct tb_tc tc;
 
     /*
+     * vphone-linux indirect-branch cache (VPHONE_IBC, translate-a64.c): the
+     * host address of the guest code at the TB's first instruction, set when
+     * the TB is made (0: none, or the TB spans two pages). A branch whose
+     * target's code TLB entry translates to this address may enter the TB
+     * (its keys aside). Kept on the line of the keys and tc.ptr.
+     */
+    uintptr_t vphone_host;
+
+    /*
      * Track tb_page_addr_t intervals that intersect this TB.
      * We use a linked list headed in each PageDesc. Within the list, the lsb
      * of the previous pointer tells the index of page_next[], and the
@@ -139,6 +148,12 @@ struct TranslationBlock {
      * helper_vphone_ras_miss; read by the call's code, which pushes it.
      */
     TranslationBlock *vphone_ret_tb;
+    /*
+     * vphone-linux indirect-branch cache (VPHONE_IBC): for a TB that ends in
+     * BR/BLR/BRAA/BLRAA/..., the TB that branch last went to (NULL: none).
+     * Written by any CPU's helper_vphone_ibc_miss; checked at each use.
+     */
+    TranslationBlock *vphone_ibr_tb;
 };
 
 /* The alignment given to TranslationBlock during allocation. */

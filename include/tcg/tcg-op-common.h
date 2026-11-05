@@ -78,7 +78,9 @@ void tcg_gen_goto_ptr(TCGv_ptr ptr);
 void tcg_gen_vphone_lookup_fast(uint64_t cs_base, uint32_t flags, uint32_t cflags);
 void tcg_gen_vphone_ras_miss(uint64_t cs_base, uint32_t flags, uint32_t cflags);
 void tcg_gen_vphone_xpage_slow(uint64_t cs_base, uint32_t flags, uint32_t cflags);
+void tcg_gen_vphone_ibc_miss(void *slot, uint64_t cs_base, uint32_t flags, uint32_t cflags);
 void tcg_gen_vphone_ras_hit(void);
+void tcg_gen_vphone_ibc_hit(void);
 
 /* 32 bit ops */
 

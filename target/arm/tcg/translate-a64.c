@@ -769,6 +769,112 @@ static void vphone_gen_ras_ret(DisasContext *s)
     tcg_gen_vphone_ras_miss(tb->cs_base, tb->flags, cflags);
 }
 
+/*
+ * vphone-linux: an indirect-branch cache per branch site. A TB that ends in
+ * BR, BLR, BRAA, BLRAA, BRAAZ, BLRAAZ (and the B-key forms) keeps the TB its
+ * branch last went to (tb->vphone_ibr_tb). The branch enters that TB
+ * directly when it is still right for the target, checked here in the
+ * generated code without the jump cache, whose entry for the target is
+ * usually a cache miss (40% of helper_vphone_lookup_fast's time):
+ *  - the target's code entry in this CPU's softmmu TLB is the bare page
+ *    (mapped, executable, no flags) and translates the target to the host
+ *    address of the cached TB's first instruction (tb->vphone_host): the
+ *    target is the very code the TB was made from (A64 TBs are
+ *    position-independent, so this holds at any virtual address and in any
+ *    address space);
+ *  - the TB is not invalid and has this TB's flags, cs_base and cflags
+ *    (such a branch changes none of them on a core without BTI).
+ * Anything else takes helper_vphone_ibc_miss: the jump cache lookup, which
+ * then records the TB found and fills the target's code TLB entry.
+ * Unlike the return-address stack, nothing here depends on which CPU wrote
+ * the cache, so CPUs running the same code share it. VPHONE_IBC: 1 (the
+ * default) on, 0 off (the code is as before). VPHONE_IBC_STATS=1 counts hits
+ * and misses (ibcstat lines with -d guest_errors).
+ */
+static bool vphone_ibc(DisasContext *s)
+{
+    static int mode = -1;
+
+    if (unlikely(mode < 0)) {
+        const char *e = getenv("VPHONE_IBC");
+        mode = e && *e ? atoi(e) : 1;
+    }
+    switch (s->vphone_lookup_reason) {
+    case 1: case 2: case 4: case 5: case 7: case 8:
+        break;
+    default:
+        return false;
+    }
+    return mode && vphone_inline_lookup() >= 1 &&
+           (tb_cflags(s->base.tb) & CF_PCREL) && !s->ss_active &&
+           !dc_isar_feature(aa64_bti, s);
+}
+
+static bool vphone_ibc_stats_on(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_IBC_STATS");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
+static void vphone_gen_ibc(DisasContext *s)
+{
+    TranslationBlock *tb = s->base.tb;
+    uint32_t cflags = tb_cflags(tb) & ~CF_INVALID;
+    int fi = mmuidx_to_fast_index(arm_to_core_mmu_idx(s->mmu_idx));
+    intptr_t f = offsetof(CPUNegativeOffsetState, tlb.f[fi]) -
+                 sizeof(CPUNegativeOffsetState);
+    TCGLabel *miss = gen_new_label();
+    TCGv_ptr rtb = tcg_temp_new_ptr();
+    TCGv_ptr table = tcg_temp_new_ptr();
+    TCGv_ptr entry = tcg_temp_new_ptr();
+    TCGv_ptr code = tcg_temp_new_ptr();
+    TCGv_i64 t = tcg_temp_new_i64();
+    TCGv_i64 t2 = tcg_temp_new_i64();
+    TCGv_i32 w = tcg_temp_new_i32();
+
+    tcg_gen_ld_ptr(rtb, tcg_constant_ptr(&tb->vphone_ibr_tb), 0);
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, rtb, 0, miss);
+
+    /* entry = table + ((pc >> (page_bits - entry_bits)) & mask) */
+    tcg_gen_shri_i64(t, cpu_pc, TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+    tcg_gen_ld_i64(t2, tcg_env, f + offsetof(CPUTLBDescFast, mask));
+    tcg_gen_and_i64(t, t, t2);
+    tcg_gen_ld_ptr(table, tcg_env, f + offsetof(CPUTLBDescFast, table));
+    tcg_gen_trunc_i64_ptr(entry, t);
+    tcg_gen_add_ptr(entry, entry, table);
+    /* the code comparator must be the bare page */
+    tcg_gen_ld_i64(t2, entry, offsetof(CPUTLBEntry, addr_code));
+    tcg_gen_andi_i64(t, cpu_pc, TARGET_PAGE_MASK);
+    tcg_gen_brcond_i64(TCG_COND_NE, t2, t, miss);
+    /* host = addend + pc: the cached TB's code */
+    tcg_gen_ld_i64(t, entry, offsetof(CPUTLBEntry, addend));
+    tcg_gen_add_i64(t, t, cpu_pc);
+    tcg_gen_ld_i64(t2, rtb, offsetof(TranslationBlock, vphone_host));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, t2, miss);
+    /* cflags first: CF_INVALID makes it differ */
+    tcg_gen_ld_i32(w, rtb, offsetof(TranslationBlock, cflags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, w, cflags, miss);
+    tcg_gen_ld_i32(w, rtb, offsetof(TranslationBlock, flags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, w, tb->flags, miss);
+    tcg_gen_ld_i64(t, rtb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, tb->cs_base, miss);
+    if (vphone_ibc_stats_on()) {
+        tcg_gen_vphone_ibc_hit();
+    }
+    tcg_gen_st8_i32(tcg_constant_i32(1), tcg_env,
+                    offsetof(CPUState, neg.can_do_io) - sizeof(CPUState));
+    tcg_gen_ld_ptr(code, rtb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(code);
+
+    gen_set_label(miss);
+    tcg_gen_vphone_ibc_miss(&tb->vphone_ibr_tb, tb->cs_base, tb->flags, cflags);
+}
+
 static void vphone_gen_lookup_and_goto(DisasContext *s)
 {
     TranslationBlock *tb = s->base.tb;
@@ -788,6 +894,10 @@ static void vphone_gen_lookup_and_goto(DisasContext *s)
      */
     if (s->vphone_ras_ret && vphone_ras(s)) {
         vphone_gen_ras_ret(s);
+        return;
+    }
+    if (vphone_ibc(s)) {
+        vphone_gen_ibc(s);
         return;
     }
     if (vphone_inline_lookup() >= 1) {

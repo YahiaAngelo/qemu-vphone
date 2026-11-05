@@ -489,6 +489,106 @@ const void *HELPER(vphone_xpage_slow)(CPUArchState *env, uint64_t cs_base,
 }
 
 /*
+ * vphone-linux diagnostic (VPHONE_IBC_STATS=1): per vCPU thread, how indirect
+ * branches fared on their site cache, logged (LOG_GUEST_ERROR) every 2^24
+ * counts of a thread (VPHONE_IBC_STATS=10..40: every 2^value). Hits are counted in the generated code only with the
+ * statistics on (helper_vphone_ibc_hit). Misses: no TB cached yet; the
+ * target's code TLB entry absent or of another page ('tlb'); its host address
+ * not the cached TB's (another target: 'host'); the keys differ or the TB is
+ * invalid ('keys'). fill: the site's TB replaced.
+ */
+enum { IBC_HIT, IBC_EMPTY, IBC_TLB, IBC_HOST, IBC_KEYS, IBC_FILL, IBC_N };
+static const char *const vphone_ibc_names[IBC_N] = {
+    "hit", "empty", "tlb", "host", "keys", "fill",
+};
+static __thread uint64_t vphone_ibc_counts[IBC_N];
+static __thread uint64_t vphone_ibc_events;
+static int vphone_ibc_stats_shift = -1;
+
+static int vphone_ibc_stats(void)
+{
+    if (unlikely(vphone_ibc_stats_shift < 0)) {
+        const char *e = getenv("VPHONE_IBC_STATS");
+        int v = e && *e ? atoi(e) : 0;
+
+        vphone_ibc_stats_shift = v <= 0 ? 0 : v >= 10 && v <= 40 ? v : 24;
+    }
+    return vphone_ibc_stats_shift;
+}
+
+static void vphone_ibc_count(int what)
+{
+    vphone_ibc_counts[what]++;
+    if (what == IBC_FILL ||
+        (++vphone_ibc_events & ((1ull << vphone_ibc_stats()) - 1))) {
+        return;
+    }
+    g_autoptr(GString) line = g_string_new("ibcstat");
+
+    g_string_append_printf(line, " cpu=%d",
+                           current_cpu ? current_cpu->cpu_index : -1);
+    for (int i = 0; i < IBC_N; i++) {
+        g_string_append_printf(line, " %s=%" PRIu64, vphone_ibc_names[i],
+                               vphone_ibc_counts[i]);
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "%s\n", line->str);
+}
+
+void HELPER(vphone_ibc_hit)(void)
+{
+    vphone_ibc_count(IBC_HIT);
+}
+
+/*
+ * vphone-linux: an indirect branch (BR, BLR, BRAA, BLRAA, ...) whose site
+ * cache did not pass the inline check (translate-a64.c vphone_gen_ibc): the
+ * ordinary lookup (helper_vphone_lookup_fast, with the branching TB's keys),
+ * then, when it found a TB of those keys made from one page, the TB becomes
+ * the site's (*@slot), and the target's code TLB entry, which the inline
+ * check reads, is filled if it is missing. The inline check validates the TB
+ * by itself at every use (the target's code translates to the TB's own host
+ * address, keys equal, not invalid), so a stale or racing slot only misses.
+ */
+const void *HELPER(vphone_ibc_miss)(CPUArchState *env, void *slotp,
+                                    uint64_t cs_base, uint32_t flags,
+                                    uint32_t cflags)
+{
+    CPUState *cpu = env_cpu(env);
+    TranslationBlock **slot = slotp;
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    TranslationBlock *cur = qatomic_read(slot);
+    vaddr pc = cpu->cc->get_pc(cpu);
+    const void *tc_ptr;
+    uint32_t h;
+    TranslationBlock *t;
+
+    tc_ptr = HELPER(vphone_lookup_fast)(env, cs_base, flags, cflags);
+    if (unlikely(tc_ptr == tcg_code_gen_epilogue)) {
+        return tc_ptr;
+    }
+    h = tb_jmp_cache_hash_func(pc);
+    t = qatomic_read(&jc->array[h].tb);
+    if (!t || jc->array[h].pc != pc || t->tc.ptr != tc_ptr ||
+        t->cs_base != cs_base || t->flags != flags || t->cflags != cflags ||
+        !t->vphone_host) {
+        return tc_ptr;
+    }
+    vphone_tlb_fill_code(cpu, pc);
+    if (vphone_ibc_stats()) {
+        vphone_ibc_count(!cur ? IBC_EMPTY : cur == t ? IBC_TLB :
+                         (cur->cflags != cflags || cur->flags != flags ||
+                          cur->cs_base != cs_base) ? IBC_KEYS : IBC_HOST);
+        if (cur != t) {
+            vphone_ibc_count(IBC_FILL);
+        }
+    }
+    if (cur != t) {
+        qatomic_set(slot, t);
+    }
+    return tc_ptr;
+}
+
+/*
  * vphone-linux diagnostic (VPHONE_RAS_STATS=1): per vCPU thread, how returns
  * fared on the return-address stack (tb-jmp-cache.h), logged (LOG_GUEST_ERROR)
  * every 2^24 returns of a thread. hit: straight to the TB; the misses: target

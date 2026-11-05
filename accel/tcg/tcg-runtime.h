@@ -28,7 +28,9 @@ DEF_HELPER_FLAGS_1(lookup_tb_ptr, TCG_CALL_NO_WG_SE, cptr, env)
 DEF_HELPER_FLAGS_4(vphone_lookup_fast, TCG_CALL_NO_WG_SE, cptr, env, i64, i32, i32)
 DEF_HELPER_FLAGS_4(vphone_ras_miss, TCG_CALL_NO_WG, cptr, env, i64, i32, i32)
 DEF_HELPER_FLAGS_4(vphone_xpage_slow, TCG_CALL_NO_WG, cptr, env, i64, i32, i32)
+DEF_HELPER_FLAGS_5(vphone_ibc_miss, TCG_CALL_NO_WG, cptr, env, ptr, i64, i32, i32)
 DEF_HELPER_FLAGS_0(vphone_ras_hit, TCG_CALL_NO_RWG, void)
+DEF_HELPER_FLAGS_0(vphone_ibc_hit, TCG_CALL_NO_RWG, void)
 
 DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
 

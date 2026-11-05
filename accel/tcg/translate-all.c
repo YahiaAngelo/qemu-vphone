@@ -477,6 +477,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->vphone_jmp_host[0] = 0;
     tb->vphone_jmp_host[1] = 0;
     tb->vphone_ret_tb = NULL;
+    tb->vphone_ibr_tb = NULL;
+    tb->vphone_host = (phys_pc != -1 && tb_page_addr1(tb) == -1) ?
+                      (uintptr_t)host_pc : 0;
     tb->jmp_dest[1] = (uintptr_t)NULL;
 
     /* init original jump addresses which have been set during tcg_gen_code() */
