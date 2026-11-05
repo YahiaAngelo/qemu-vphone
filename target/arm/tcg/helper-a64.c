@@ -1971,6 +1971,14 @@ static const char *const vphone_lookup_names[] = {
 static __thread uint64_t vphone_lookup_counts[12];
 static __thread uint64_t vphone_lookup_total;
 
+/* a counter register read without the BQL (VPHONE_FAST_CNT, translate-a64.c) */
+uint64_t HELPER(vphone_cnt_read)(CPUARMState *env, const void *rip)
+{
+    const ARMCPRegInfo *ri = rip;
+
+    return ri->readfn(env, ri);
+}
+
 void HELPER(vphone_mark)(CPUARMState *env)
 {
     vphone_mark_op(env, env->xregs[0], env->xregs[1]);

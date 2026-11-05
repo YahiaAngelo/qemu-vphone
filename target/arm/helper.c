@@ -1487,6 +1487,17 @@ static uint64_t gt_virt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
     return gt_get_countervalue(env) - offset;
 }
 
+/*
+ * vphone-linux (VPHONE_FAST_CNT, translate-a64.c): the counter reads
+ * (CNTPCT/CNTVCT and their self-synchronised forms) only read env and the
+ * virtual clock, whose reader is lock-free, so outside icount they need
+ * neither the BQL nor the end of the TB that ARM_CP_IO imposes.
+ */
+bool vphone_is_counter_read(const ARMCPRegInfo *ri)
+{
+    return ri->readfn == gt_cnt_read || ri->readfn == gt_virt_cnt_read;
+}
+
 static void gt_cval_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           int timeridx,
                           uint64_t value)

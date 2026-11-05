@@ -3110,6 +3110,29 @@ static void gen_sysreg_undef(DisasContext *s, bool isread,
  * These are all essentially the same insn in 'read' and 'write'
  * versions, with varying op0 fields.
  */
+/*
+ * vphone-linux: counter reads (CNTVCT_EL0, CNTPCT_EL0, CNTVCTSS_EL0,
+ * CNTPCTSS_EL0) are ARM_CP_IO, so each one took the BQL around its readfn and
+ * ended the TB with an exit to the main loop. Outside icount neither is needed: the readfn reads
+ * env and the virtual clock (a seqlock reader). VPHONE_FAST_CNT=1 reads them
+ * through helper_vphone_cnt_read without the BQL and keeps the TB going;
+ * 0 (the default) = QEMU's way. The access check is unchanged. Off by
+ * default: VPHONE_SYSREG_STATS showed iOS 27 reads CNTVCT_EL0 only ~14
+ * thousand times a second (EL1; user code does not use MRS for its clock),
+ * too few to matter.
+ */
+static bool vphone_fast_cnt(DisasContext *s, const ARMCPRegInfo *ri, bool isread)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_FAST_CNT");
+        on = e && *e ? atoi(e) != 0 : 0;
+    }
+    return on && isread && ri->readfn && !(ri->type & ARM_CP_CONST) &&
+           !(tb_cflags(s->base.tb) & CF_USE_ICOUNT) && vphone_is_counter_read(ri);
+}
+
 static void handle_sys(DisasContext *s, bool isread,
                        unsigned int op0, unsigned int op1, unsigned int op2,
                        unsigned int crn, unsigned int crm, unsigned int rt)
@@ -3393,6 +3416,14 @@ static void handle_sys(DisasContext *s, bool isread,
         return;
     default:
         tcg_debug_assert_not_reached();
+    }
+
+    if (vphone_fast_cnt(s, ri, isread)) {
+        if (!tcg_ri) {
+            tcg_ri = gen_lookup_cp_reg(key);
+        }
+        gen_helper_vphone_cnt_read(cpu_reg(s, rt), tcg_env, tcg_ri);
+        return;
     }
 
     if (ri->type & ARM_CP_IO) {

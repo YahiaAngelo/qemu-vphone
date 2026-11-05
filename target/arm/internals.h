@@ -2026,6 +2026,8 @@ enum {
 };
 void vphone_sysreg_dump(const char *what);
 bool vphone_sysreg_stats_enable(void);
+/* counter register reads that need no BQL (helper.c, VPHONE_FAST_CNT) */
+bool vphone_is_counter_read(const ARMCPRegInfo *ri);
 bool vphone_mark_on(void);
 void vphone_mark_op(CPUARMState *env, uint64_t op, uint64_t arg);
 
