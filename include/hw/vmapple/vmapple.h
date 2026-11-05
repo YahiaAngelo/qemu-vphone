@@ -24,6 +24,8 @@
 
 #define TYPE_VMAPPLE_SEP_STORAGE "vresearch-sep-storage"
 
+#define TYPE_VMAPPLE_AVP_RTC "vresearch-avp-rtc"
+
 #define TYPE_VMAPPLE_VUSB "vresearch-vusb"
 #define TYPE_VMAPPLE_VUSB_PCI "vresearch-vusb-pci"
 

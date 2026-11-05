@@ -335,57 +335,20 @@ static void create_aes(VResearchMachineState *vms)
 
 
 
-/*
- * avp-rtc ("avp,rtc"): register layout not known yet. Storage that logs each
- * access with the CPU and PC, to learn who uses it and how.
- */
-#define AVP_RTC_SIZE 0x1000
-
-static uint8_t avp_rtc_regs[AVP_RTC_SIZE];
-
-static uint64_t avp_rtc_read(void *opaque, hwaddr addr, unsigned size)
+/* avp-rtc ("avp,rtc"): the clock XNU's AppleVirtualPlatformRTC reads */
+static void create_avp_rtc(VResearchMachineState *vms)
 {
-    uint64_t val = ldn_le_p(&avp_rtc_regs[addr], size);
-    CPUState *cs = current_cpu;
-
-    qemu_log_mask(LOG_UNIMP, "avp-rtc: read%u 0x%03" HWADDR_PRIx " -> 0x%"
-                  PRIx64 " cpu%d pc 0x%" PRIx64 "\n", size, addr, val,
-                  cs ? cs->cpu_index : -1, cs ? cpu_env(cs)->pc : 0);
-    return val;
+    sysbus_create_simple(TYPE_VMAPPLE_AVP_RTC, vms->memmap[VR_AVP_RTC].base,
+                         qdev_get_gpio_in(vms->gic, vms->irqmap[VR_AVP_RTC]));
 }
 
-static void avp_rtc_write(void *opaque, hwaddr addr, uint64_t val,
-                          unsigned size)
-{
-    CPUState *cs = current_cpu;
-
-    qemu_log_mask(LOG_UNIMP, "avp-rtc: write%u 0x%03" HWADDR_PRIx " <- 0x%"
-                  PRIx64 " cpu%d pc 0x%" PRIx64 "\n", size, addr, val,
-                  cs ? cs->cpu_index : -1, cs ? cpu_env(cs)->pc : 0);
-    stn_le_p(&avp_rtc_regs[addr], size, val);
-}
-
-static const MemoryRegionOps avp_rtc_ops = {
-    .read = avp_rtc_read,
-    .write = avp_rtc_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 4,
-    .valid.max_access_size = 8,
-};
-
 /*
- * Devices vresearch101 has and vmapple does not. Their register interfaces
- * are not known yet; map them as logged holes (-d unimp) so the guest's
- * accesses show what they need.
+ * Devices vresearch101 has and vmapple does not, whose register interfaces
+ * are not known yet: logged holes (-d unimp) so the guest's accesses show
+ * what they need.
  */
 static void create_avp_stubs(VResearchMachineState *vms)
 {
-    MemoryRegion *rtc = g_new0(MemoryRegion, 1);
-
-    memory_region_init_io(rtc, NULL, &avp_rtc_ops, NULL, "avp-rtc",
-                          vms->memmap[VR_AVP_RTC].size);
-    memory_region_add_subregion(get_system_memory(), vms->memmap[VR_AVP_RTC].base,
-                                rtc);
     create_unimplemented_device("avp-ctrr", vms->memmap[VR_AVP_CTRR].base,
                                 vms->memmap[VR_AVP_CTRR].size);
 }
@@ -1044,6 +1007,7 @@ static void mach_vresearch_init(MachineState *machine)
      * share=on), and those small anonymous regions are not.
      */
     create_gfx(vms);
+    create_avp_rtc(vms);
     create_avp_stubs(vms);
     create_vpiop(vms);
     create_uart(vms, sysmem, serial_hd(0));

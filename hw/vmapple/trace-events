@@ -41,3 +41,7 @@ vusb_pci_rx(uint32_t len, uint8_t ep, uint8_t type, uint32_t a, uint32_t b) "fro
 
 # sep-storage.c
 sep_storage_request(uint32_t type, uint64_t sector, int ndesc, uint8_t status) "type %u sector %" PRIu64 " descs %d status %u"
+
+# avp-rtc.c
+avp_rtc_read(uint64_t addr, unsigned size, uint64_t val) "0x%03" PRIx64 " size %u -> 0x%" PRIx64
+avp_rtc_write(uint64_t addr, unsigned size, uint64_t val) "0x%03" PRIx64 " size %u <- 0x%" PRIx64
