@@ -464,6 +464,30 @@ const void *HELPER(vphone_lookup_fast)(CPUArchState *env, uint64_t cs_base,
     return HELPER(lookup_tb_ptr)(env);
 }
 
+void vphone_tlb_fill_code(CPUState *cpu, vaddr addr);
+
+/*
+ * vphone-linux: the slow way of a checked cross-page link (VPHONE_XPAGE_LINKS,
+ * translate-a64.c gen_goto_tb_checked) with VPHONE_XPAGE_REFILL: the jump
+ * cache lookup with the branching TB's own keys (a direct branch changes
+ * none of them), then, when it found a TB, the destination page's code entry
+ * in the softmmu TLB, which the link checks, is filled if it is not there:
+ * a jump cache hit never fills it, so after a TLB flush the link would
+ * otherwise miss at every execution.
+ */
+const void *HELPER(vphone_xpage_slow)(CPUArchState *env, uint64_t cs_base,
+                                      uint32_t flags, uint32_t cflags)
+{
+    const void *tc_ptr = HELPER(vphone_lookup_fast)(env, cs_base, flags, cflags);
+
+    if (likely(tc_ptr != tcg_code_gen_epilogue)) {
+        CPUState *cpu = env_cpu(env);
+
+        vphone_tlb_fill_code(cpu, cpu->cc->get_pc(cpu));
+    }
+    return tc_ptr;
+}
+
 /*
  * vphone-linux diagnostic (VPHONE_RAS_STATS=1): per vCPU thread, how returns
  * fared on the return-address stack (tb-jmp-cache.h), logged (LOG_GUEST_ERROR)

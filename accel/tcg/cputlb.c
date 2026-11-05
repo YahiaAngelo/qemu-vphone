@@ -1825,6 +1825,28 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
     return qemu_ram_addr_from_host_nofail(p);
 }
 
+/*
+ * vphone-linux: make sure @cpu's softmmu TLB, in its current code MMU index,
+ * holds a plain code entry for @addr's page (no fault is raised: a page that
+ * cannot be executed is left alone). A checked cross-page link (translate-a64.c) tests this entry;
+ * TB lookups that hit the jump cache never fill it, so after a TLB flush
+ * (every address space switch) such a link would otherwise keep taking the
+ * slow way until something else filled the entry.
+ */
+void vphone_tlb_fill_code(CPUState *cpu, vaddr addr)
+{
+    int mmu_idx = cpu_mmu_index(cpu, true);
+    CPUTLBEntry *entry = tlb_entry(cpu, mmu_idx, addr);
+    CPUTLBEntryFull *full;
+    void *host;
+
+    if (likely(tlb_read_idx(entry, MMU_INST_FETCH) == (addr & TARGET_PAGE_MASK))) {
+        return;
+    }
+    (void)probe_access_internal(cpu, addr, 0, MMU_INST_FETCH, mmu_idx, true,
+                                &host, &full, 0);
+}
+
 /* Load/store with atomicity primitives. */
 #include "ldst_atomicity.c.inc"
 

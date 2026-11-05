@@ -1988,6 +1988,52 @@ void HELPER(vphone_lookup_stat)(uint32_t reason)
     }
 }
 
+/*
+ * vphone diagnostic (VPHONE_LOOKUP_STATS=1): why a checked cross-page link
+ * (translate-a64.c gen_goto_tb_checked) took the slow way, read from the
+ * same softmmu TLB entry its code checked: the code comparator invalid (-1,
+ * flushed), the page right but flag bits set, another page in the entry,
+ * or the page right but another host address than the link's.
+ */
+static const char *const vphone_xpage_names[] = {
+    "xp-empty", "xp-flags", "xp-other", "xp-host",
+};
+static __thread uint64_t vphone_xpage_counts[4];
+static __thread uint64_t vphone_xpage_total;
+
+void HELPER(vphone_xpage_why)(CPUARMState *env, void *wantp, uint32_t fi)
+{
+    CPUState *cs = env_cpu(env);
+    CPUTLBDescFast *f = &cs->neg.tlb.f[fi];
+    uint64_t pc = env->pc;
+    uintptr_t off = (pc >> (TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS)) & f->mask;
+    CPUTLBEntry *e = (CPUTLBEntry *)((char *)f->table + off);
+    uint64_t tag = e->addr_code, page = pc & TARGET_PAGE_MASK;
+    uintptr_t want = qatomic_read((uintptr_t *)wantp);
+    int why;
+
+    if (tag == -1) {
+        why = 0;
+    } else if ((tag & TARGET_PAGE_MASK) == page && tag != page) {
+        why = 1;
+    } else if ((tag & TARGET_PAGE_MASK) != page) {
+        why = 2;
+    } else {
+        why = 3;
+        (void)want;
+    }
+    vphone_xpage_counts[why]++;
+    if (!(++vphone_xpage_total & ((1u << 22) - 1))) {
+        g_autoptr(GString) line = g_string_new("xpagestat");
+        g_string_append_printf(line, " cpu=%d", cs->cpu_index);
+        for (int i = 0; i < ARRAY_SIZE(vphone_xpage_counts); i++) {
+            g_string_append_printf(line, " %s=%" PRIu64, vphone_xpage_names[i],
+                                   vphone_xpage_counts[i]);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR, "%s\n", line->str);
+    }
+}
+
 void vphone_tb_jmp_cache_prefetch(CPUState *cpu, vaddr pc);
 
 /* A call's return address: its TB lookup's entry, prefetched (cpu-exec.c). */

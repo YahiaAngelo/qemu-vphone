@@ -3250,6 +3250,17 @@ void tcg_gen_vphone_lookup_fast(uint64_t cs_base, uint32_t flags, uint32_t cflag
     tcg_temp_free_ptr(ptr);
 }
 
+/* vphone-linux: a checked cross-page link's slow way (VPHONE_XPAGE_REFILL), then goto_ptr. */
+void tcg_gen_vphone_xpage_slow(uint64_t cs_base, uint32_t flags, uint32_t cflags)
+{
+    TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
+
+    gen_helper_vphone_xpage_slow(ptr, tcg_env, tcg_constant_i64(cs_base),
+                                 tcg_constant_i32(flags), tcg_constant_i32(cflags));
+    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
+    tcg_temp_free_ptr(ptr);
+}
+
 /* vphone-linux: a return's missed return-stack check (VPHONE_RAS), then goto_ptr. */
 void tcg_gen_vphone_ras_miss(uint64_t cs_base, uint32_t flags, uint32_t cflags)
 {

@@ -19,6 +19,7 @@
 DEF_HELPER_FLAGS_2(udiv64, TCG_CALL_NO_RWG_SE, i64, i64, i64)
 DEF_HELPER_FLAGS_1(vphone_lookup_stat, TCG_CALL_NO_RWG, void, i32)
 DEF_HELPER_FLAGS_2(vphone_prefetch_ret, TCG_CALL_NO_RWG, void, env, i64)
+DEF_HELPER_FLAGS_3(vphone_xpage_why, TCG_CALL_NO_RWG, void, env, ptr, i32)
 DEF_HELPER_FLAGS_2(sdiv64, TCG_CALL_NO_RWG_SE, s64, s64, s64)
 DEF_HELPER_FLAGS_1(rbit64, TCG_CALL_NO_RWG_SE, i64, i64)
 DEF_HELPER_2(msr_i_spsel, void, env, i32)

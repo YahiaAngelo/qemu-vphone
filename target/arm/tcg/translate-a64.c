@@ -445,7 +445,7 @@ static void gen_step_complete_exception(DisasContext *s)
     s->base.is_jmp = DISAS_NORETURN;
 }
 
-static void vphone_gen_lookup_stat(DisasContext *s, int reason)
+static bool vphone_lookup_stats_on(void)
 {
     static int on = -1;
 
@@ -453,7 +453,12 @@ static void vphone_gen_lookup_stat(DisasContext *s, int reason)
         const char *e = getenv("VPHONE_LOOKUP_STATS");
         on = e && *e && *e != '0';
     }
-    if (on) {
+    return on;
+}
+
+static void vphone_gen_lookup_stat(DisasContext *s, int reason)
+{
+    if (vphone_lookup_stats_on()) {
         gen_helper_vphone_lookup_stat(tcg_constant_i32(reason));
     }
 }
@@ -522,6 +527,23 @@ static bool vphone_xpage_links(void)
     return on;
 }
 
+/*
+ * VPHONE_XPAGE_REFILL: 1 (default) the slow way of a checked link is the
+ * jump cache lookup with this TB's keys, which also fills the destination's
+ * code TLB entry the link checks (cpu-exec.c helper_vphone_xpage_slow);
+ * 0 the generic lookup, as before.
+ */
+static bool vphone_xpage_refill(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_XPAGE_REFILL");
+        on = e && *e ? atoi(e) != 0 : 1;
+    }
+    return on;
+}
+
 static void gen_goto_tb_checked(DisasContext *s, int n)
 {
     TCGLabel *link = gen_new_label();
@@ -562,7 +584,22 @@ static void gen_goto_tb_checked(DisasContext *s, int n)
 
     gen_set_label(slow);
     vphone_gen_lookup_stat(s, 11);
-    tcg_gen_lookup_and_goto_ptr();
+    if (vphone_lookup_stats_on()) {
+        gen_helper_vphone_xpage_why(tcg_env,
+                                    tcg_constant_ptr(&s->base.tb->vphone_jmp_host[n]),
+                                    tcg_constant_i32(fi));
+    }
+    /*
+     * A direct branch keeps this TB's keys, BTYPE aside: entered with a
+     * BTYPE (a guarded guest), the destination's differs, so the generic way.
+     */
+    if (vphone_xpage_refill() && !(tb_cflags(s->base.tb) & CF_NO_GOTO_PTR) &&
+        !(s->base.tb->cs_base & R_TBFLAG_A64_BTYPE_MASK)) {
+        tcg_gen_vphone_xpage_slow(s->base.tb->cs_base, s->base.tb->flags,
+                                  tb_cflags(s->base.tb) & ~CF_INVALID);
+    } else {
+        tcg_gen_lookup_and_goto_ptr();
+    }
     s->base.is_jmp = DISAS_NORETURN;
 }
 
