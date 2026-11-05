@@ -1121,6 +1121,35 @@ unsigned int gt_cntfrq_period_ns(ARMCPU *cpu)
       NANOSECONDS_PER_SECOND / cpu->gt_cntfrq_hz : 1;
 }
 
+/*
+ * vphone: the count and the timers' deadlines use CNTFRQ exactly. The integer
+ * period above truncates 1e9 / CNTFRQ: at vresearch101's 24 MHz it is 41 ns
+ * instead of 41.67, so the guest's clock gained 1.63% (a second a minute). The
+ * deadlines are the count's exact inverse (rounded up), which keeps the
+ * property the period was chosen for: a timer never fires before the count
+ * reaches its compare value. Where 1e9 is a multiple of CNTFRQ, both are what
+ * the period gave. As there, CNTFRQ is capped at 1 GHz.
+ */
+static uint32_t gt_cntfrq_capped(ARMCPU *cpu)
+{
+    return MIN(cpu->gt_cntfrq_hz, NANOSECONDS_PER_SECOND);
+}
+
+uint64_t gt_ns_to_ticks(ARMCPU *cpu, uint64_t ns)
+{
+    return muldiv64(ns, gt_cntfrq_capped(cpu), NANOSECONDS_PER_SECOND);
+}
+
+int64_t gt_ticks_to_ns(ARMCPU *cpu, uint64_t ticks)
+{
+    uint32_t hz = gt_cntfrq_capped(cpu);
+
+    if (ticks > muldiv64(INT64_MAX, hz, NANOSECONDS_PER_SECOND)) {
+        return INT64_MAX;
+    }
+    return muldiv64_round_up(ticks, NANOSECONDS_PER_SECOND, hz);
+}
+
 static void arm_cpu_propagate_feature_implications(ARMCPU *cpu)
 {
     CPUARMState *env = &cpu->env;
@@ -1558,7 +1587,8 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 
     {
-        uint64_t scale = gt_cntfrq_period_ns(cpu);
+        /* Deadlines are set in nanoseconds: gt_ticks_to_ns(). */
+        uint64_t scale = SCALE_NS;
 
         cpu->gt_timer[GTIMER_PHYS] = timer_new(QEMU_CLOCK_VIRTUAL, scale,
                                                arm_gt_ptimer_cb, cpu);

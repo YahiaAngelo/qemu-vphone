@@ -1259,6 +1259,14 @@ void arm_gt_sel2timer_cb(void *opaque);
 void arm_gt_sel2vtimer_cb(void *opaque);
 
 unsigned int gt_cntfrq_period_ns(ARMCPU *cpu);
+/* The generic timer's count at QEMU_CLOCK_VIRTUAL time @ns, exactly. */
+uint64_t gt_ns_to_ticks(ARMCPU *cpu, uint64_t ns);
+/*
+ * The earliest QEMU_CLOCK_VIRTUAL time at which the count reaches @ticks
+ * (the exact inverse of gt_ns_to_ticks); INT64_MAX when that is beyond the
+ * range of a QEMUTimer.
+ */
+int64_t gt_ticks_to_ns(ARMCPU *cpu, uint64_t ticks);
 void gt_rme_post_el_change(ARMCPU *cpu, void *opaque);
 
 #define ARM_AFF0_SHIFT 0

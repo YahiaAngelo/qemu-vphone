@@ -1286,7 +1286,7 @@ uint64_t gt_get_countervalue(CPUARMState *env)
 {
     ARMCPU *cpu = env_archcpu(env);
 
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
+    return gt_ns_to_ticks(cpu, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 static void gt_update_irq(ARMCPU *cpu, int timeridx)
@@ -1456,11 +1456,7 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
          * set the timer for as far in the future as possible. When the
          * timer expires we will reset the timer for any remaining period.
          */
-        if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
-            timer_mod_ns(cpu->gt_timer[timeridx], INT64_MAX);
-        } else {
-            timer_mod(cpu->gt_timer[timeridx], nexttick);
-        }
+        timer_mod_ns(cpu->gt_timer[timeridx], gt_ticks_to_ns(cpu, nexttick));
         trace_arm_gt_recalc(timeridx, nexttick);
     } else {
         /* Timer disabled: ISTATUS and timer output always clear */

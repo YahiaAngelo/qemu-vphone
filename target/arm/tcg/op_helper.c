@@ -431,15 +431,11 @@ void HELPER(wfit)(CPUARMState *env, uint64_t timeout)
     if (uadd64_overflow(timeout, offset, &nexttick)) {
         nexttick = UINT64_MAX;
     }
-    if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
-        /*
-         * If the timeout is too long for the signed 64-bit range
-         * of a QEMUTimer, let it expire early.
-         */
-        timer_mod_ns(cpu->wfxt_timer, INT64_MAX);
-    } else {
-        timer_mod(cpu->wfxt_timer, nexttick);
-    }
+    /*
+     * The timer counts nanoseconds (a deadline in ticks fired it ~41x early
+     * at 24 MHz); one too long for a QEMUTimer expires early.
+     */
+    timer_mod_ns(cpu->wfxt_timer, gt_ticks_to_ns(cpu, nexttick));
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);
