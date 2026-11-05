@@ -821,7 +821,7 @@ typedef struct CPUArchState {
     struct {} end_reset_fields;
 
     /* vphone diagnostic: executed instructions per class (VPHONE_INSN_STATS) */
-    uint64_t vphone_icount[16];
+    uint64_t vphone_icount[24];
 
     /*
      * Newer SPRR layout (M1/A14 and later, the vresearch101 CPU): one

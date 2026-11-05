@@ -1976,6 +1976,100 @@ void HELPER(vphone_mark)(CPUARMState *env)
     vphone_mark_op(env, env->xregs[0], env->xregs[1]);
 }
 
+/*
+ * vphone diagnostic (VPHONE_SYSREG_STATS=1): executed system register
+ * accesses per (register, flags), in one global table, dumped (top 40) at
+ * each VPHONE_MARK begin/end. Flags: VPHONE_SR_*, current EL << 8.
+ */
+#define VPHONE_SR_SLOTS 4096
+static struct {
+    const ARMCPRegInfo *ri;
+    uint32_t fl;
+    uint64_t n;
+} vphone_sr[VPHONE_SR_SLOTS];
+static QemuMutex vphone_sr_lock;
+static bool vphone_sr_init;
+
+void HELPER(vphone_sysreg_stat)(const void *p, uint32_t fl)
+{
+    const ARMCPRegInfo *ri = p;
+    uint32_t h = (((uintptr_t)ri >> 4) * 0x9e3779b1u ^ fl * 0x85ebca6bu) % VPHONE_SR_SLOTS;
+
+    for (int i = 0; i < VPHONE_SR_SLOTS; i++, h = (h + 1) % VPHONE_SR_SLOTS) {
+        if (qatomic_read(&vphone_sr[h].ri) == ri && vphone_sr[h].fl == fl) {
+            qatomic_inc(&vphone_sr[h].n);
+            return;
+        }
+        if (qatomic_read(&vphone_sr[h].ri) == NULL) {
+            if (!qatomic_read(&vphone_sr_init)) {
+                return;
+            }
+            qemu_mutex_lock(&vphone_sr_lock);
+            if (vphone_sr[h].ri == NULL) {
+                vphone_sr[h].fl = fl;
+                qatomic_set(&vphone_sr[h].ri, ri);
+            }
+            qemu_mutex_unlock(&vphone_sr_lock);
+            if (vphone_sr[h].ri == ri && vphone_sr[h].fl == fl) {
+                qatomic_inc(&vphone_sr[h].n);
+                return;
+            }
+        }
+    }
+}
+
+static int vphone_sr_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+void vphone_sysreg_dump(const char *what)
+{
+    uint64_t (*order)[2];
+    int n = 0;
+
+    if (!qatomic_read(&vphone_sr_init)) {
+        return;
+    }
+    order = g_malloc(sizeof(*order) * VPHONE_SR_SLOTS);
+    for (int i = 0; i < VPHONE_SR_SLOTS; i++) {
+        if (vphone_sr[i].ri) {
+            order[n][0] = qatomic_read(&vphone_sr[i].n);
+            order[n][1] = i;
+            n++;
+        }
+    }
+    qsort(order, n, sizeof(order[0]), vphone_sr_cmp);
+    for (int k = 0; k < n && k < 40; k++) {
+        int i = order[k][1];
+        uint32_t fl = vphone_sr[i].fl;
+        fprintf(stderr, "vphone-sysreg %s %s n=%" PRIu64 " el=%u %s%s%s%s%s\n", what,
+                vphone_sr[i].ri->name, order[k][0], fl >> 8,
+                fl & VPHONE_SR_READ ? "read" : "write",
+                fl & VPHONE_SR_TBEND ? " tbend" : "",
+                fl & VPHONE_SR_IO ? " io" : "",
+                fl & VPHONE_SR_FN ? " fn" : "",
+                fl & VPHONE_SR_ACCESSFN ? " accessfn" : "");
+    }
+    g_free(order);
+}
+
+bool vphone_sysreg_stats_enable(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_SYSREG_STATS");
+        on = e && *e && atoi(e) != 0;
+        if (on) {
+            qemu_mutex_init(&vphone_sr_lock);
+            qatomic_set(&vphone_sr_init, true);
+        }
+    }
+    return on;
+}
+
 void HELPER(vphone_lookup_stat)(uint32_t reason)
 {
     if (reason >= ARRAY_SIZE(vphone_lookup_counts)) {

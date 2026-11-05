@@ -2532,7 +2532,13 @@ static void vphone_acq_after(DisasContext *s)
 enum {
     VPI_LDAR, VPI_LDAPR, VPI_STLR, VPI_LDAXR, VPI_STLXR, VPI_LDXR, VPI_STXR,
     VPI_CAS, VPI_ATOMIC, VPI_DMB_FULL, VPI_DMB_LDST, VPI_ISB, VPI_MRS, VPI_MSR,
+    VPI_DAIFSET, VPI_DAIFCLR, VPI_WFE, VPI_CLREX,
 };
+
+static bool vphone_sysreg_stats_on(void)
+{
+    return vphone_sysreg_stats_enable();
+}
 
 static void vphone_icount(DisasContext *s, int cls)
 {
@@ -2583,6 +2589,7 @@ static bool trans_WFI(DisasContext *s, arg_WFI *a)
 
 static bool trans_WFE(DisasContext *s, arg_WFI *a)
 {
+    vphone_icount(s, VPI_WFE);
     /*
      * When running in MTTCG we don't generate jumps to the yield and
      * WFE helpers as it won't affect the scheduling of other vCPUs.
@@ -2762,6 +2769,7 @@ static bool trans_AUTIBSP(DisasContext *s, arg_AUTIBSP *a)
 
 static bool trans_CLREX(DisasContext *s, arg_CLREX *a)
 {
+    vphone_icount(s, VPI_CLREX);
     tcg_gen_movi_i64(cpu_exclusive_addr, -1);
     return true;
 }
@@ -2980,6 +2988,7 @@ static bool trans_MSR_i_TCO(DisasContext *s, arg_i *a)
 
 static bool trans_MSR_i_DAIFSET(DisasContext *s, arg_i *a)
 {
+    vphone_icount(s, VPI_DAIFSET);
     gen_helper_msr_i_daifset(tcg_env, tcg_constant_i32(a->imm));
     s->base.is_jmp = DISAS_TOO_MANY;
     return true;
@@ -2987,6 +2996,7 @@ static bool trans_MSR_i_DAIFSET(DisasContext *s, arg_i *a)
 
 static bool trans_MSR_i_DAIFCLEAR(DisasContext *s, arg_i *a)
 {
+    vphone_icount(s, VPI_DAIFCLR);
     gen_helper_msr_i_daifclear(tcg_env, tcg_constant_i32(a->imm));
     /* Exit the cpu loop to re-evaluate pending IRQs. */
     s->base.is_jmp = DISAS_UPDATE_EXIT;
@@ -3142,6 +3152,18 @@ static void handle_sys(DisasContext *s, bool isread,
                       isread ? "read" : "write", op0, op1, crn, crm, op2);
         gen_sysreg_undef(s, isread, op0, op1, op2, crn, crm, rt);
         return;
+    }
+
+    if (vphone_sysreg_stats_on()) {
+        bool fn = !(ri->type & ARM_CP_CONST) &&
+                  (isread ? ri->readfn != NULL : ri->writefn != NULL);
+        uint32_t fl = (isread ? VPHONE_SR_READ : 0) |
+                      (!isread && !(ri->type & ARM_CP_SUPPRESS_TB_END) ? VPHONE_SR_TBEND : 0) |
+                      (ri->type & ARM_CP_IO ? VPHONE_SR_IO : 0) |
+                      (fn ? VPHONE_SR_FN : 0) |
+                      (ri->accessfn ? VPHONE_SR_ACCESSFN : 0) |
+                      (s->current_el << 8);
+        gen_helper_vphone_sysreg_stat(tcg_constant_ptr(ri), tcg_constant_i32(fl));
     }
 
     if (s->nv2 && ri->nv2_redirect_offset) {

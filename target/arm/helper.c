@@ -2832,7 +2832,7 @@ static void vphone_mark_icount(const char *what)
 {
     static const char *const names[] = {
         "ldar", "ldapr", "stlr", "ldaxr", "stlxr", "ldxr", "stxr", "cas",
-        "atomic", "dmb", "dmbldst", "isb", "mrs", "msr",
+        "atomic", "dmb", "dmbldst", "isb", "mrs", "msr", "daifset", "daifclr", "wfe", "clrex",
     };
     g_autoptr(GString) line = g_string_new("vphone-icount ");
     struct timespec ts;
@@ -2849,6 +2849,7 @@ static void vphone_mark_icount(const char *what)
         g_string_append_printf(line, " %s=%" PRIu64, names[i], n);
     }
     fprintf(stderr, "%s\n", line->str);
+    vphone_sysreg_dump(what);
 }
 
 void vphone_mark_op(CPUARMState *env, uint64_t op, uint64_t arg)

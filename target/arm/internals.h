@@ -2019,6 +2019,13 @@ bool arm_pan_enabled(CPUARMState *env);
 int compare_u64(const void *a, const void *b);
 
 /* vphone-linux measurement markers (VPHONE_MARK, helper.c) */
+/* vphone diagnostic: system register accesses (VPHONE_SYSREG_STATS, helper-a64.c) */
+enum {
+    VPHONE_SR_READ = 1, VPHONE_SR_TBEND = 2, VPHONE_SR_IO = 4, VPHONE_SR_FN = 8,
+    VPHONE_SR_ACCESSFN = 16,
+};
+void vphone_sysreg_dump(const char *what);
+bool vphone_sysreg_stats_enable(void);
 bool vphone_mark_on(void);
 void vphone_mark_op(CPUARMState *env, uint64_t op, uint64_t arg);
 
