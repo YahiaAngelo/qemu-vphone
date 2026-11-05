@@ -820,6 +820,9 @@ typedef struct CPUArchState {
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
+    /* vphone diagnostic: executed instructions per class (VPHONE_INSN_STATS) */
+    uint64_t vphone_icount[16];
+
     /*
      * Newer SPRR layout (M1/A14 and later, the vresearch101 CPU): one
      * permission table per EL, S3_6_C15_C1_5 for EL0 and S3_6_C15_C1_6 for

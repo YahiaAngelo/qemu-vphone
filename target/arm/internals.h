@@ -2018,4 +2018,8 @@ bool arm_pan_enabled(CPUARMState *env);
 /* Compare uint64_t for qsort and bsearch. */
 int compare_u64(const void *a, const void *b);
 
+/* vphone-linux measurement markers (VPHONE_MARK, helper.c) */
+bool vphone_mark_on(void);
+void vphone_mark_op(CPUARMState *env, uint64_t op, uint64_t arg);
+
 #endif

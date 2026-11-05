@@ -1971,6 +1971,11 @@ static const char *const vphone_lookup_names[] = {
 static __thread uint64_t vphone_lookup_counts[12];
 static __thread uint64_t vphone_lookup_total;
 
+void HELPER(vphone_mark)(CPUARMState *env)
+{
+    vphone_mark_op(env, env->xregs[0], env->xregs[1]);
+}
+
 void HELPER(vphone_lookup_stat)(uint32_t reason)
 {
     if (reason >= ARRAY_SIZE(vphone_lookup_counts)) {

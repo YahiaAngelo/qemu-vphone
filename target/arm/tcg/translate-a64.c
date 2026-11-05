@@ -2454,6 +2454,43 @@ static bool trans_NOP(DisasContext *s, arg_NOP *a)
     return true;
 }
 
+/*
+ * vphone diagnostic (VPHONE_INSN_STATS=1): generated code counts executed
+ * instructions of a few classes in env->vphone_icount[], summed over the vCPUs
+ * at each VPHONE_MARK begin/end (helper.c).
+ */
+enum {
+    VPI_LDAR, VPI_LDAPR, VPI_STLR, VPI_LDAXR, VPI_STLXR, VPI_LDXR, VPI_STXR,
+    VPI_CAS, VPI_ATOMIC, VPI_DMB_FULL, VPI_DMB_LDST, VPI_ISB, VPI_MRS, VPI_MSR,
+};
+
+static void vphone_icount(DisasContext *s, int cls)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_INSN_STATS");
+        on = e && *e && atoi(e) != 0;
+    }
+    if (on) {
+        TCGv_i64 t = tcg_temp_new_i64();
+        int ofs = offsetof(CPUARMState, vphone_icount[cls]);
+
+        tcg_gen_ld_i64(t, tcg_env, ofs);
+        tcg_gen_addi_i64(t, t, 1);
+        tcg_gen_st_i64(t, tcg_env, ofs);
+    }
+}
+
+/* hint #0x7e: a NOP, or a measurement marker with VPHONE_MARK=1 (helper.c) */
+static bool trans_VPHONE_MARK(DisasContext *s, arg_VPHONE_MARK *a)
+{
+    if (vphone_mark_on()) {
+        gen_helper_vphone_mark(tcg_env);
+    }
+    return true;
+}
+
 static bool trans_YIELD(DisasContext *s, arg_YIELD *a)
 {
     /*
@@ -2676,6 +2713,7 @@ static bool trans_DSB_DMB(DisasContext *s, arg_DSB_DMB *a)
         break;
     }
     tcg_gen_mb(bar);
+    vphone_icount(s, a->types == 1 || a->types == 2 ? VPI_DMB_LDST : VPI_DMB_FULL);
     return true;
 }
 
@@ -2696,6 +2734,7 @@ static bool trans_ISB(DisasContext *s, arg_ISB *a)
      * any pending interrupts immediately.
      */
     reset_btype(s);
+    vphone_icount(s, VPI_ISB);
     gen_goto_tb(s, 0, 4);
     return true;
 }
@@ -3316,6 +3355,7 @@ static void handle_sys(DisasContext *s, bool isread,
 
 static bool trans_SYS(DisasContext *s, arg_SYS *a)
 {
+    vphone_icount(s, a->l ? VPI_MRS : VPI_MSR);
     handle_sys(s, a->l, a->op0, a->op1, a->op2, a->crn, a->crm, a->rt);
     return true;
 }
@@ -3668,6 +3708,7 @@ static bool ldst_iss_sf(int size, bool sign, bool ext)
 
 static bool trans_STXR(DisasContext *s, arg_stxr *a)
 {
+    vphone_icount(s, a->lasr ? VPI_STLXR : VPI_STXR);
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -3680,6 +3721,7 @@ static bool trans_STXR(DisasContext *s, arg_stxr *a)
 
 static bool trans_LDXR(DisasContext *s, arg_stxr *a)
 {
+    vphone_icount(s, a->lasr ? VPI_LDAXR : VPI_LDXR);
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -3708,6 +3750,7 @@ static bool trans_STLR(DisasContext *s, arg_stlr *a)
         gen_check_sp_alignment(s);
     }
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+    vphone_icount(s, VPI_STLR);
     memop = check_ordered_align(s, a->rn, 0, true, a->sz);
     clean_addr = gen_mte_check1(s, cpu_reg_sp(s, a->rn),
                                 true, a->rn != 31, memop);
@@ -3736,6 +3779,7 @@ static bool trans_LDAR(DisasContext *s, arg_stlr *a)
     do_gpr_ld(s, cpu_reg(s, a->rt), clean_addr, memop, false, true,
               a->rt, iss_sf, a->lasr);
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    vphone_icount(s, VPI_LDAR);
     return true;
 }
 
@@ -3782,6 +3826,7 @@ static bool trans_CAS(DisasContext *s, arg_CAS *a)
         return false;
     }
     gen_compare_and_swap(s, a->rs, a->rt, a->rn, a->sz);
+    vphone_icount(s, VPI_CAS);
     return true;
 }
 
@@ -4233,6 +4278,8 @@ static bool do_atomic_ld(DisasContext *s, arg_atomic *a, AtomicThreeOpFn *fn,
     MemOp mop = a->sz | sign;
     TCGv_i64 clean_addr, tcg_rs, tcg_rt;
 
+    vphone_icount(s, VPI_ATOMIC);
+
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -4355,6 +4402,7 @@ static bool trans_LDAPR(DisasContext *s, arg_LDAPR *a)
     do_gpr_ld(s, cpu_reg(s, a->rt), clean_addr, mop, false,
               true, a->rt, iss_sf, true);
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    vphone_icount(s, VPI_LDAPR);
     return true;
 }
 
@@ -4427,6 +4475,7 @@ static bool trans_LDAPR_i(DisasContext *s, arg_ldapr_stlr_i *a)
     do_gpr_ld(s, cpu_reg(s, a->rt), dirty_addr, mop, a->ext, true,
               a->rt, iss_sf, true);
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    vphone_icount(s, VPI_LDAPR);
     return true;
 }
 
@@ -4452,6 +4501,7 @@ static bool trans_STLR_i(DisasContext *s, arg_ldapr_stlr_i *a)
 
     /* Store-Release semantics */
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+    vphone_icount(s, VPI_STLR);
     do_gpr_st(s, cpu_reg(s, a->rt), dirty_addr, mop, true, a->rt, iss_sf, true);
     return true;
 }

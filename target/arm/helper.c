@@ -2700,6 +2700,194 @@ static void vphone_asid_trace(CPUARMState *env, uint64_t value)
     }
 }
 
+/*
+ * vphone-linux measurement (VPHONE_MARK=1): host work spent in one guest
+ * address space, between markers the guest program places itself. The guest
+ * runs "hint #0x7e" (a NOP on any Arm CPU) with x0 = op, x1 = argument:
+ *   op 1  begin: the current TTBR0_EL1 ASID becomes the tracked one;
+ *   op 2  mark:  log the host work in that ASID since the previous marker
+ *                ("vphone-mark asid=.. tag=x1 ins=.. cyc=.. ns=.. sw=..");
+ *   op 3  end:   the same, then stop tracking.
+ * Each vCPU thread counts its own user-mode host instructions and cycles
+ * (perf_event_open on itself) and thread CPU time. At every TTBR0 ASID
+ * change into or out of the tracked ASID, the thread adds the interval to the
+ * global totals. Work of every thread of the process, on any vCPU, kernel
+ * work on its behalf included, is counted; other processes are not.
+ */
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+
+static int vphone_mark_tracked = -1;    /* ASID, or -1 */
+static uint32_t vphone_mark_gen;
+static uint64_t vphone_mark_acc[4];     /* ins, cyc, ns, switches in */
+static uint64_t vphone_mark_prev[4];
+static QemuMutex vphone_mark_lock;
+
+typedef struct {
+    int fd;                 /* group leader (instructions), cycles in it; -2 failed */
+    bool in;
+    uint32_t gen;
+    uint64_t start[3];
+} VphoneMarkThread;
+static __thread VphoneMarkThread vphone_mark_t = { .fd = -1 };
+
+bool vphone_mark_on(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_MARK");
+        on = e && *e && atoi(e) != 0;
+        if (on) {
+            qemu_mutex_init(&vphone_mark_lock);
+        }
+    }
+    return on;
+}
+
+static int vphone_mark_open(uint64_t pmu, uint64_t config, int group)
+{
+    struct perf_event_attr a = {
+        .size = sizeof(a),
+        .type = PERF_TYPE_HARDWARE,
+        .config = (pmu << 32) | config,
+        .exclude_kernel = 1,
+        .exclude_hv = 1,
+        .read_format = PERF_FORMAT_GROUP,
+    };
+    return syscall(SYS_perf_event_open, &a, 0, -1, group, 0);
+}
+
+static void vphone_mark_read(uint64_t v[3])
+{
+    VphoneMarkThread *t = &vphone_mark_t;
+    struct timespec ts;
+    uint64_t buf[3];
+
+    if (t->fd == -1) {
+        /* a hybrid CPU's P-core PMU (QEMU runs on P-cores), else the default */
+        static uint64_t pmu = ~0ULL;
+        if (pmu == ~0ULL) {
+            FILE *f = fopen("/sys/bus/event_source/devices/cpu_core/type", "r");
+            unsigned x = 0;
+            pmu = f && fscanf(f, "%u", &x) == 1 ? x : 0;
+            if (f) {
+                fclose(f);
+            }
+        }
+        t->fd = vphone_mark_open(pmu, PERF_COUNT_HW_INSTRUCTIONS, -1);
+        if (t->fd < 0 || vphone_mark_open(pmu, PERF_COUNT_HW_CPU_CYCLES, t->fd) < 0) {
+            fprintf(stderr, "vphone-mark: perf_event_open: %s\n", strerror(errno));
+            t->fd = -2;
+        }
+    }
+    v[0] = v[1] = 0;
+    if (t->fd >= 0 && read(t->fd, buf, sizeof(buf)) == sizeof(buf) && buf[0] == 2) {
+        v[0] = buf[1];
+        v[1] = buf[2];
+    }
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    v[2] = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* this thread's open interval, if any, into the totals; restarts it */
+static void vphone_mark_flush(bool restart)
+{
+    VphoneMarkThread *t = &vphone_mark_t;
+    uint64_t v[3];
+
+    if (!t->in) {
+        return;
+    }
+    vphone_mark_read(v);
+    if (t->gen == qatomic_read(&vphone_mark_gen)) {
+        for (int i = 0; i < 3; i++) {
+            qatomic_add(&vphone_mark_acc[i], v[i] - t->start[i]);
+        }
+    }
+    memcpy(t->start, v, sizeof(v));
+    t->in = restart;
+}
+
+static void vphone_mark_switch(unsigned asid)
+{
+    VphoneMarkThread *t = &vphone_mark_t;
+    int tracked = qatomic_read(&vphone_mark_tracked);
+
+    if (likely(tracked < 0 && !t->in)) {
+        return;
+    }
+    if (t->in && (int)asid != tracked) {
+        vphone_mark_flush(false);
+    } else if (!t->in && (int)asid == tracked) {
+        vphone_mark_read(t->start);
+        t->gen = qatomic_read(&vphone_mark_gen);
+        t->in = true;
+        qatomic_inc(&vphone_mark_acc[3]);
+    }
+}
+
+/* VPHONE_INSN_STATS counters, summed over the vCPUs (translate-a64.c) */
+static void vphone_mark_icount(const char *what)
+{
+    static const char *const names[] = {
+        "ldar", "ldapr", "stlr", "ldaxr", "stlxr", "ldxr", "stxr", "cas",
+        "atomic", "dmb", "dmbldst", "isb", "mrs", "msr",
+    };
+    g_autoptr(GString) line = g_string_new("vphone-icount ");
+    struct timespec ts;
+    CPUState *cs;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g_string_append_printf(line, "%s t=%" PRIu64, what,
+                           (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec);
+    for (int i = 0; i < ARRAY_SIZE(names); i++) {
+        uint64_t n = 0;
+        CPU_FOREACH(cs) {
+            n += qatomic_read(&cpu_env(cs)->vphone_icount[i]);
+        }
+        g_string_append_printf(line, " %s=%" PRIu64, names[i], n);
+    }
+    fprintf(stderr, "%s\n", line->str);
+}
+
+void vphone_mark_op(CPUARMState *env, uint64_t op, uint64_t arg)
+{
+    VphoneMarkThread *t = &vphone_mark_t;
+    unsigned asid = extract64(env->cp15.ttbr0_el[1], 48, 16);
+    uint64_t d[4];
+
+    qemu_mutex_lock(&vphone_mark_lock);
+    if (op == 1) {
+        qatomic_set(&vphone_mark_tracked, -1);
+        qatomic_inc(&vphone_mark_gen);
+        memset(vphone_mark_acc, 0, sizeof(vphone_mark_acc));
+        memset(vphone_mark_prev, 0, sizeof(vphone_mark_prev));
+        t->in = false;
+        qatomic_set(&vphone_mark_tracked, asid);
+        vphone_mark_switch(asid);
+        fprintf(stderr, "vphone-mark begin asid=%u tag=%" PRIu64 "\n", asid, arg);
+        vphone_mark_icount("begin");
+    } else if ((op == 2 || op == 3) && (int)asid == vphone_mark_tracked) {
+        vphone_mark_flush(true);
+        for (int i = 0; i < 4; i++) {
+            uint64_t a = qatomic_read(&vphone_mark_acc[i]);
+            d[i] = a - vphone_mark_prev[i];
+            vphone_mark_prev[i] = a;
+        }
+        fprintf(stderr, "vphone-mark asid=%u tag=%" PRIu64 " ins=%" PRIu64
+                " cyc=%" PRIu64 " ns=%" PRIu64 " sw=%" PRIu64 "\n",
+                asid, arg, d[0], d[1], d[2], d[3]);
+        if (op == 3) {
+            vphone_mark_icount("end");
+            qatomic_set(&vphone_mark_tracked, -1);
+            qatomic_inc(&vphone_mark_gen);
+            t->in = false;
+        }
+    }
+    qemu_mutex_unlock(&vphone_mark_lock);
+}
+
 static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
@@ -2707,6 +2895,7 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
         ri->crm == 0 && ri->opc2 == 0 &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
         vphone_asid_trace(env, value);
+        vphone_mark_switch(extract64(value, 48, 16));
     }
     /* If the ASID changes (with a 64-bit write), we must flush the TLB.  */
     if (cpreg_field_is_64bit(ri) &&
