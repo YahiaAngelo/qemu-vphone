@@ -2686,10 +2686,19 @@ static void virtio_irq(VirtQueue *vq)
 
 void virtio_notify(VirtIODevice *vdev, VirtQueue *vq)
 {
+    bool should_notify;
+
     WITH_RCU_READ_LOCK_GUARD() {
-        if (!virtio_should_notify(vdev, vq)) {
-            return;
-        }
+        should_notify = virtio_should_notify(vdev, vq);
+    }
+    if (trace_event_get_state_backends(TRACE_VUSB_VIRTIO_NOTIFY) &&
+        vdev->name && !strcmp(vdev->name, "vresearch-vusb")) {
+        trace_vusb_virtio_notify(g_get_monotonic_time(),
+                                virtio_get_queue_index(vq), vq->vector,
+                                should_notify);
+    }
+    if (!should_notify) {
+        return;
     }
 
     trace_virtio_notify(vdev, vq);

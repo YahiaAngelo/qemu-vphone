@@ -17,6 +17,8 @@ pci_cfg_write(const char *dev, uint32_t bus, uint32_t slot, uint32_t func, unsig
 
 # msix.c
 msix_write_config(char *name, bool enabled, bool masked) "dev %s enabled %d masked %d"
+msix_notify_decision(int64_t monotonic_us, const char *device, unsigned vector, bool used, int masked, const char *decision) "mono_us %" PRId64 " device %s vector %u used %d masked %d decision %s"
+msix_pending_replay(int64_t monotonic_us, const char *device, unsigned vector) "mono_us %" PRId64 " device %s vector %u replay-requested"
 
 # hw/pci/pcie_sriov.c
 sriov_register_vfs(const char *name, int slot, int function, int num_vfs) "%s %02x:%x: creating %d vf devs"
