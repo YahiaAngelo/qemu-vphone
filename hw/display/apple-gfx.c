@@ -31,6 +31,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "apple-gfx.h"
+#include "apple-gfx-density.h"
 #include "trace.h"
 
 static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
@@ -1028,6 +1029,15 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                                     &window_config.mode_height,
                                     &window_config.mode_pixels_per_inch,
                                     errp)) {
+        return false;
+    }
+    if (!apple_gfx_set_density(s->pixels_per_inch,
+                              modes_property ? s->display_modes[0].width_px : 0,
+                              modes_property ? s->display_modes[0].height_px : 0,
+                              &display_config.width_millimeters,
+                              &display_config.height_millimeters)) {
+        error_setg(errp, "apple-gfx: pixels-per-inch requires display-modes "
+                   "and a density between 1 and 65535");
         return false;
     }
 

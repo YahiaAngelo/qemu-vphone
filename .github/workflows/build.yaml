@@ -30,6 +30,10 @@ jobs:
           ./configure
           make -j$(nproc)
           sudo make install
+      - name: Test display density
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror tests/display/apple-gfx-density.c -lm -o /tmp/apple-gfx-density-test
+          /tmp/apple-gfx-density-test
       - name: Build
         run: |
           mkdir build

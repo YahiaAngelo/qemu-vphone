@@ -205,6 +205,9 @@ static const Property apple_gfx_mmio_properties[] = {
      * own modes at its density.
      */
     DEFINE_PROP_STRING("resolution", AppleGFXMMIOState, common.resolution),
+    /* An explicit display-modes list describes the native panel, first. */
+    DEFINE_PROP_UINT32("pixels-per-inch", AppleGFXMMIOState,
+                       common.pixels_per_inch, 0),
     /*
      * The library's default is its own build's page size; on an x86_64 host
      * that would be 4 KiB, while every guest of this arm64 device uses 16.
