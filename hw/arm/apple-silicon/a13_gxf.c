@@ -163,7 +163,15 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
                       arm_is_guarded(env));
     }
     if (arm_current_el(env)) {
-        raw_write(env, ri, value);
+        /*
+         * vphone-linux: the kernel's write changes the permissions of the TLB
+         * entries filled at EL0 (all in E10_0) too: drop them, as an EL0 write
+         * does below, or EL0 keeps the old ones until the next flush.
+         */
+        if (raw_read(env, ri) != value) {
+            raw_write(env, ri, value);
+            tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+        }
         return;
     }
 
