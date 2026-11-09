@@ -143,7 +143,15 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     // maybe use uint64_t for mask/umask?
     uint64_t perm = raw_read(env, ri);
-    uint32_t mask = env->sprr.mprr_el_br_el1[0][0];
+    /*
+     * vphone-linux: in the M1 layout the EL0 mask is C3_0 (m1n1's
+     * SPRR_UMPRR_EL1), which iOS loads per process: TPRO's bit for all, plus
+     * the JIT index's RX<->RW bit for a process allowed to JIT. C3_1 is the
+     * kernel's mask (SPRR_PMPRR_EL1): with it, WebKit's write enabling its
+     * JIT memory changed nothing and WebContent crashed at startup.
+     */
+    uint32_t mask = env->sprr_cfg.unified_perms ? env->sprr.c3_0
+                                                : env->sprr.mprr_el_br_el1[0][0];
     static unsigned logged;
 
     if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
@@ -237,7 +245,7 @@ static void sprr_c1_6_reset(CPUARMState *env, const ARMCPRegInfo *ri)
     env->sprr.sprr_el_br_el1[1][1] = env->sprr.sprr_el_br_el1[1][0];
 }
 
-/* S3_6_C15_C3_0: EL1/BR1 table, or a register of its own when unified */
+/* S3_6_C15_C3_0: EL1/BR1 table, or when unified the EL0 write mask (SPRR_UMPRR_EL1) */
 static uint64_t sprr_c3_0_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     return env->sprr_cfg.unified_perms ? env->sprr.c3_0
