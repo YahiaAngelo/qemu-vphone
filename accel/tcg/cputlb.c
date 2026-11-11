@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/vphone-ev.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-ops.h"
@@ -285,8 +286,13 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
 }
 
+#define VPHONE_NG_LOG_MAX 2048
+
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
+    desc->ng_n = 0;
+    desc->ng_overflow = false;
+    desc->lo_global = false;
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
@@ -314,6 +320,7 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_new(CPUTLBEntry, n_entries);
     desc->fulltlb = g_new(CPUTLBEntryFull, n_entries);
+    desc->ng_log = g_new(uint32_t, VPHONE_NG_LOG_MAX);
     tlb_mmu_flush_locked(desc, fast);
 }
 
@@ -431,18 +438,87 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 }
 
 /*
- * vphone-linux: tlb_flush() for a change of address space alone, to ASID
- * @asid (tb-jmp-cache.h): the TLBs are flushed, as they hold no ASID, but
- * the jump cache keeps what it filled under @asid.
+ * vphone-linux: drop the non-global (vphone_ng) entries of @mmu_idx, the ones
+ * its ng_log names, and those of its victim TLB. Global entries stay: a change
+ * of ASID does not change them. With too many to name, flush the whole index.
  */
-void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid)
+static inline bool tlb_entry_is_empty(const CPUTLBEntry *te);
+
+static void tlb_flush_ng_one_mmuidx_locked(CPUState *cpu, int mmu_idx, int64_t now)
 {
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t n_entries = tlb_n_entries(fast);
+
+    if (desc->ng_overflow) {
+        tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
+        return;
+    }
+    for (uint32_t i = 0; i < desc->ng_n; i++) {
+        uint32_t index = desc->ng_log[i];
+
+        if (index < n_entries && desc->fulltlb[index].vphone_ng &&
+            !tlb_entry_is_empty(&fast->table[index])) {
+            memset(&fast->table[index], -1, sizeof(fast->table[index]));
+            tlb_n_used_entries_dec(cpu, mmu_idx);
+        }
+    }
+    desc->ng_n = 0;
+    for (int v = 0; v < CPU_VTLB_SIZE; v++) {
+        if (desc->vfulltlb[v].vphone_ng) {
+            memset(&desc->vtable[v], -1, sizeof(desc->vtable[v]));
+        }
+    }
+}
+
+static int vphone_asid_ng_on(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_ASID_NG");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
+/*
+ * vphone-linux: a change of address space alone, to ASID @asid
+ * (tb-jmp-cache.h). The TLBs hold no ASID, so the entries of the old address
+ * space go: in @ng_map (the ASID-tagged MMU indexes) only the non-global ones,
+ * as on hardware; @keep_map (MMU indexes no ASID applies to, such as physical
+ * ones) is left alone; every other index is flushed. The jump cache keeps what
+ * it filled under @asid. VPHONE_ASID_NG=0 flushes every index, as before.
+ */
+void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid, MMUIdxMap ng_map,
+                           MMUIdxMap keep_map)
+{
+    MMUIdxMap dirty, full_map;
+    int64_t now;
+
+    vphone_ev(VEV_FLUSH_ASID);
     assert_cpu_is_self(cpu);
-    tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
+    if (!vphone_asid_ng_on()) {
+        tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
+        return;
+    }
+    full_map = ALL_MMUIDX_BITS & ~ng_map & ~keep_map;
+    tlb_flush_mmuidx_work(cpu, full_map, asid);
+
+    now = get_clock_realtime();
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    dirty = cpu->neg.tlb.c.dirty & ng_map;
+    for (MMUIdxMap work = dirty; work != 0; work &= work - 1) {
+        tlb_flush_ng_one_mmuidx_locked(cpu, ctz32(work), now);
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
 
 void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
 {
+    vphone_ev(VEV_FLUSH_MMUIDX);
+    vphone_ev(idxmap == ALL_MMUIDX_BITS ? VEV_FLUSHIDX_ALL :
+              is_power_of_2(idxmap) ? VEV_FLUSHIDX_ONE : VEV_FLUSHIDX_OTHER);
     tlb_debug("mmu_idx: 0x%" PRIx32 "\n", idxmap);
 
     assert_cpu_is_self(cpu);
@@ -662,6 +738,7 @@ static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
 
 void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 {
+    vphone_ev(VEV_FLUSH_MMUIDX_ALL);
     const run_on_cpu_func fn = tlb_flush_by_mmuidx_async_work;
 
     tlb_debug("mmu_idx: 0x%"PRIx32"\n", idxmap);
@@ -750,6 +827,7 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
         tlb_debug("forcing full flush midx %d (%016"
                   VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, lp_addr, lp_mask);
+        vphone_ev(VEV_PAGE_FULL_LARGE);
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
     } else {
         if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
@@ -840,6 +918,7 @@ static void tlb_flush_page_by_mmuidx_async_2(CPUState *cpu,
 
 void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, MMUIdxMap idxmap)
 {
+    vphone_ev(VEV_FLUSH_PAGE);
     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%" PRIx32 "\n", addr, idxmap);
 
     assert_cpu_is_self(cpu);
@@ -859,6 +938,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
                                               vaddr addr,
                                               MMUIdxMap idxmap)
 {
+    vphone_ev(VEV_FLUSH_PAGE_ALL);
     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%"PRIx32"\n", addr, idxmap);
 
     /* This should already be page aligned */
@@ -902,6 +982,76 @@ void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
     tlb_flush_page_by_mmuidx_all_cpus_synced(src, addr, ALL_MMUIDX_BITS);
 }
 
+/* vphone-linux: the page of a valid TLB entry, or -1 */
+static vaddr vphone_entry_page(const CPUTLBEntry *te)
+{
+    uint64_t a = te->addr_read != -1 ? te->addr_read :
+                 te->addr_write != -1 ? te->addr_write : te->addr_code;
+
+    return a == -1 ? (vaddr)-1 : (vaddr)(a & TARGET_PAGE_MASK);
+}
+
+/* vphone-linux: does the mapping (@page, 1 << @lg bytes) overlap [@addr, @addr + @len)? */
+static bool vphone_overlaps(vaddr page, unsigned lg, vaddr addr, vaddr len, vaddr mask)
+{
+    vaddr size = lg > TARGET_PAGE_BITS ? (vaddr)1 << lg : TARGET_PAGE_SIZE;
+    vaddr base = (page & mask) & ~(size - 1);
+    vaddr a = addr & mask;
+
+    return base < a + len && a < base + size;
+}
+
+/*
+ * vphone-linux: a range too long to flush page by page, wholly below bit 63,
+ * in an MMU index whose entries there are all non-global: drop the logged
+ * entries (and victims) that overlap it instead of the whole index. Returns
+ * false when that does not apply.
+ */
+static bool tlb_flush_range_by_log_locked(CPUState *cpu, int midx, vaddr addr,
+                                          vaddr len, vaddr mask)
+{
+    CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
+    CPUTLBDescFast *f = cpu_tlb_fast(cpu, midx);
+    size_t n_entries = tlb_n_entries(f);
+    uint32_t keep = 0;
+
+    if (!vphone_asid_ng_on() || d->ng_overflow || d->lo_global ||
+        ((addr + len - 1) >> 63) || addr + len < addr) {
+        return false;
+    }
+    vphone_ev(VEV_RANGE_BY_LOG);
+    for (uint32_t i = 0; i < d->ng_n; i++) {
+        uint32_t index = d->ng_log[i];
+        CPUTLBEntry *te;
+        vaddr page;
+
+        if (index >= n_entries || !d->fulltlb[index].vphone_ng) {
+            continue;
+        }
+        te = &f->table[index];
+        page = vphone_entry_page(te);
+        if (page == (vaddr)-1) {
+            continue;
+        }
+        if (vphone_overlaps(page, d->fulltlb[index].lg_page_size, addr, len, mask)) {
+            memset(te, -1, sizeof(*te));
+            tlb_n_used_entries_dec(cpu, midx);
+        } else {
+            d->ng_log[keep++] = index;
+        }
+    }
+    d->ng_n = keep;
+    for (int v = 0; v < CPU_VTLB_SIZE; v++) {
+        vaddr page = vphone_entry_page(&d->vtable[v]);
+
+        if (page != (vaddr)-1 &&
+            vphone_overlaps(page, d->vfulltlb[v].lg_page_size, addr, len, mask)) {
+            memset(&d->vtable[v], -1, sizeof(d->vtable[v]));
+        }
+    }
+    return true;
+}
+
 static void tlb_flush_range_locked(CPUState *cpu, int midx,
                                    vaddr addr, vaddr len,
                                    unsigned bits)
@@ -941,6 +1091,11 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
                   midx, addr, mask, len);
+        if (mask >= f->mask &&
+            tlb_flush_range_by_log_locked(cpu, midx, addr, len, mask)) {
+            return;
+        }
+        vphone_ev(VEV_RANGE_FULL_SIZE);
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
         return;
     }
@@ -954,6 +1109,7 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, d->large_page_addr, d->large_page_mask);
+        vphone_ev(VEV_RANGE_FULL_LARGE);
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
         return;
     }
@@ -1037,6 +1193,7 @@ void tlb_flush_range_by_mmuidx(CPUState *cpu, vaddr addr,
                                vaddr len, MMUIdxMap idxmap,
                                unsigned bits)
 {
+    vphone_ev(VEV_FLUSH_RANGE);
     TLBFlushRangeData d;
 
     assert_cpu_is_self(cpu);
@@ -1076,6 +1233,7 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
                                                MMUIdxMap idxmap,
                                                unsigned bits)
 {
+    vphone_ev(VEV_FLUSH_RANGE_ALL);
     TLBFlushRangeData d, *p;
     CPUState *dst_cpu;
 
@@ -1423,6 +1581,15 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      */
     desc->fulltlb[index] = *full;
     full = &desc->fulltlb[index];
+    if (full->vphone_ng) {
+        if (desc->ng_n < VPHONE_NG_LOG_MAX) {
+            desc->ng_log[desc->ng_n++] = index;
+        } else {
+            desc->ng_overflow = true;
+        }
+    } else if (!(addr >> 63)) {
+        desc->lo_global = true;
+    }
     full->xlat_offset = iotlb - addr_page;
     full->section = section;
     full->phys_addr = paddr_page;
@@ -1509,6 +1676,8 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
                            int mmu_idx, MemOp memop, int size,
                            bool probe, uintptr_t ra)
 {
+    vphone_ev(VEV_TLB_FILL);
+    vphone_ev(VEV_FILLX + (mmu_idx & 31) * 2 + (int)(addr >> 63));
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
     CPUTLBEntryFull full;
 
@@ -1543,6 +1712,7 @@ static MemoryRegionSection *
 io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
            vaddr addr, uintptr_t retaddr)
 {
+    vphone_ev(VEV_MMIO);
     MemoryRegionSection *section;
     hwaddr mr_offset;
 
@@ -1597,6 +1767,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntryFull *f2 = &cpu->neg.tlb.d[mmu_idx].vfulltlb[vidx];
             CPUTLBEntryFull tmpf;
             tmpf = *f1; *f1 = *f2; *f2 = tmpf;
+            /* vphone-linux: a non-global entry now in @index must be named. */
+            if (f1->vphone_ng) {
+                CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+
+                qemu_spin_lock(&cpu->neg.tlb.c.lock);
+                if (desc->ng_n < VPHONE_NG_LOG_MAX) {
+                    desc->ng_log[desc->ng_n++] = index;
+                } else {
+                    desc->ng_overflow = true;
+                }
+                qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+            }
             return true;
         }
     }
@@ -1606,6 +1788,7 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
 static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
                            CPUTLBEntryFull *full, uintptr_t retaddr)
 {
+    vphone_ev(VEV_NOTDIRTY);
     ram_addr_t ram_addr = mem_vaddr + full->xlat_offset;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
