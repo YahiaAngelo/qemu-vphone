@@ -2,7 +2,9 @@
  * vphone diagnostic (VPHONE_EVENT_STATS=<seconds>): per-second rates of guest events that
  * leave translated code (exceptions by kind, GXF enter/exit, ERET), TLB fills and flushes,
  * translations, MMIO and code-page writes. Each thread counts into its own array; a logger
- * thread prints the sums to stderr every <seconds>. Off by default: one predictable branch.
+ * thread prints the sums to stderr every <seconds>, as per-second rates rounded down (an event
+ * rarer than once per <seconds> shows as 0: use a longer period, or "info jit" for TB flushes).
+ * Off by default: one predictable branch.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -19,7 +21,8 @@ enum {
     VEV_RANGE_FULL_SIZE, VEV_RANGE_FULL_LARGE, VEV_PAGE_FULL_LARGE,
     VEV_FLUSHIDX_ALL, VEV_FLUSHIDX_ONE, VEV_FLUSHIDX_OTHER, VEV_RANGE_BY_LOG,
     VEV_ASID_RECENT8, VEV_ASID_KEY_RECENT8, VEV_SPRR_EL0_FLUSH, VEV_SPRR_EL1_FLUSH,
-    VEV_GXF_ERET_FLUSH,
+    VEV_GXF_ERET_FLUSH, VEV_TB_FIRST, VEV_TB_SAMEKEY, VEV_TB_VARIANT,
+    VEV_TB_XPAGE, VEV_TB_SAMEKEY_XPAGE, VEV_TB_RACE, VEV_TB_ONEINSN, VEV_TB_INVAL, VEV_TB_INVAL_DMA, VEV_TB_FLUSH,
     /* TLB fills per (core mmu_idx & 31) * 2 + (address bit 63) */
     VEV_FILLX, VEV_FILLX_END = VEV_FILLX + 64,
     VEV_MAX = VEV_FILLX_END

@@ -36,7 +36,11 @@ static const char *const vev_names[VEV_MAX] = {
     [VEV_RANGE_BY_LOG] = "range_by_log",
     [VEV_ASID_RECENT8] = "asid_recent8", [VEV_ASID_KEY_RECENT8] = "asid_sprr_recent8",
     [VEV_SPRR_EL0_FLUSH] = "sprr_el0_flush", [VEV_SPRR_EL1_FLUSH] = "sprr_el1_flush",
-    [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush",
+    [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush", [VEV_TB_FIRST] = "tb_first",
+    [VEV_TB_SAMEKEY] = "tb_again_samekey", [VEV_TB_VARIANT] = "tb_again_variant",
+    [VEV_TB_XPAGE] = "tb_crosspage", [VEV_TB_SAMEKEY_XPAGE] = "tb_again_samekey_crosspage",
+    [VEV_TB_RACE] = "tb_race", [VEV_TB_ONEINSN] = "tb_oneinsn", [VEV_TB_INVAL] = "tb_inval",
+    [VEV_TB_INVAL_DMA] = "tb_inval_dma_calls", [VEV_TB_FLUSH] = "tb_flush",
 };
 
 void vphone_ev_register(void)
