@@ -6928,8 +6928,135 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
 }
 
+/*
+ * vphone-linux diagnostic (VPHONE_TCG_SIZES=<path>): host code bytes per TCG opcode and per
+ * helper call, plus the TB start check, the out-of-line memory slow paths and the constant
+ * pool. Each translating thread counts on its own; a thread rewrites <path> every 20 s
+ * with the sums (one "kind name count bytes" line each).
+ */
+#define VTS_CALLS 256
+typedef struct VTSStats {
+    uint64_t op_bytes[NB_OPS], op_count[NB_OPS];
+    const TCGHelperInfo *call_info[VTS_CALLS];
+    uint64_t call_bytes[VTS_CALLS], call_count[VTS_CALLS];
+    uint64_t start, ldst, pool, tbs, insns, total;
+    struct VTSStats *next;
+} VTSStats;
+static __thread VTSStats *vts_tls;
+static VTSStats *vts_list;
+static const char *vts_path;
+static int vts_on = -1;
+
+static void *vts_thread(void *opaque)
+{
+    for (;;) {
+        g_autofree char *tmp = g_strdup_printf("%s.tmp", vts_path);
+        static uint64_t ob[NB_OPS], oc[NB_OPS];
+        const TCGHelperInfo *ci[VTS_CALLS * 4];
+        uint64_t cb[VTS_CALLS * 4], cc[VTS_CALLS * 4];
+        uint64_t st = 0, ld = 0, po = 0, tbs = 0, ins = 0, tot = 0;
+        int nc = 0;
+        FILE *f;
+
+        g_usleep(20 * 1000 * 1000);
+        memset(ob, 0, sizeof(ob)); memset(oc, 0, sizeof(oc));
+        for (VTSStats *v = qatomic_read(&vts_list); v; v = v->next) {
+            for (int i = 0; i < NB_OPS; i++) {
+                ob[i] += v->op_bytes[i]; oc[i] += v->op_count[i];
+            }
+            for (int i = 0; i < VTS_CALLS && v->call_info[i]; i++) {
+                int j;
+                for (j = 0; j < nc && ci[j] != v->call_info[i]; j++) {
+                }
+                if (j == nc) {
+                    if (nc == VTS_CALLS * 4) {
+                        continue;
+                    }
+                    ci[nc] = v->call_info[i]; cb[nc] = cc[nc] = 0; nc++;
+                }
+                cb[j] += v->call_bytes[i]; cc[j] += v->call_count[i];
+            }
+            st += v->start; ld += v->ldst; po += v->pool;
+            tbs += v->tbs; ins += v->insns; tot += v->total;
+        }
+        f = fopen(tmp, "w");
+        if (!f) {
+            continue;
+        }
+        fprintf(f, "total tbs %" PRIu64 " %" PRIu64 "\n", tbs, tot);
+        fprintf(f, "total insns %" PRIu64 " 0\n", ins);
+        fprintf(f, "part tb_start %" PRIu64 " %" PRIu64 "\n", tbs, st);
+        fprintf(f, "part ldst_slow %" PRIu64 " %" PRIu64 "\n", tbs, ld);
+        fprintf(f, "part pool %" PRIu64 " %" PRIu64 "\n", tbs, po);
+        for (int i = 0; i < NB_OPS; i++) {
+            if (oc[i]) {
+                fprintf(f, "op %s %" PRIu64 " %" PRIu64 "\n", tcg_op_defs[i].name, oc[i], ob[i]);
+            }
+        }
+        for (int i = 0; i < nc; i++) {
+            fprintf(f, "call %s %" PRIu64 " %" PRIu64 "\n", ci[i]->name, cc[i], cb[i]);
+        }
+        fclose(f);
+        rename(tmp, vts_path);
+    }
+    return NULL;
+}
+
+static VTSStats *vts_get(void)
+{
+    if (unlikely(vts_on < 0)) {
+        static QemuMutex lock;
+        static bool init;
+        if (!init) {
+            qemu_mutex_init(&lock);
+            init = true;
+        }
+        qemu_mutex_lock(&lock);
+        if (vts_on < 0) {
+            vts_path = getenv("VPHONE_TCG_SIZES");
+            if (vts_path && *vts_path) {
+                QemuThread th;
+                qemu_thread_create(&th, "vphone-tcgsz", vts_thread, NULL,
+                                   QEMU_THREAD_DETACHED);
+                qatomic_set(&vts_on, 1);
+            } else {
+                qatomic_set(&vts_on, 0);
+            }
+        }
+        qemu_mutex_unlock(&lock);
+    }
+    if (!vts_on) {
+        return NULL;
+    }
+    if (!vts_tls) {
+        VTSStats *v = g_new0(VTSStats, 1), *old;
+        do {
+            old = qatomic_read(&vts_list);
+            v->next = old;
+        } while (qatomic_cmpxchg(&vts_list, old, v) != old);
+        vts_tls = v;
+    }
+    return vts_tls;
+}
+
+static void vts_call(VTSStats *v, const TCGHelperInfo *info, size_t n)
+{
+    for (int i = 0; i < VTS_CALLS; i++) {
+        if (v->call_info[i] == info) {
+            v->call_bytes[i] += n; v->call_count[i]++;
+            return;
+        }
+        if (!v->call_info[i]) {
+            v->call_info[i] = info; v->call_bytes[i] = n; v->call_count[i] = 1;
+            return;
+        }
+    }
+}
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
+    VTSStats *vts = vts_get();
+    size_t vts_at;
     int i, num_insns;
     TCGOp *op;
 
@@ -7024,12 +7151,16 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         tcg_malloc(sizeof(uint64_t) * s->gen_tb->icount * INSN_START_WORDS);
 
     tcg_out_tb_start(s);
+    if (vts) {
+        vts->start += tcg_current_code_size(s);
+    }
 
     num_insns = -1;
     s->carry_live = false;
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
 
+        vts_at = tcg_current_code_size(s);
         switch (opc) {
         case INDEX_op_extrl_i64_i32:
             assert(TCG_TARGET_REG_BITS == 64);
@@ -7107,6 +7238,15 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             tcg_reg_alloc_op(s, op);
             break;
         }
+        if (vts) {
+            size_t n = tcg_current_code_size(s) - vts_at;
+            if (opc == INDEX_op_call) {
+                vts_call(vts, tcg_call_info(op), n);
+            } else {
+                vts->op_bytes[opc] += n;
+                vts->op_count[opc]++;
+            }
+        }
         /* Test for (pending) buffer overflow.  The assumption is that any
            one operation beginning below the high water mark cannot overrun
            the buffer completely.  Thus we can test for overflow after
@@ -7125,13 +7265,24 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
 
     /* Generate TB finalization at the end of block */
+    vts_at = tcg_current_code_size(s);
     i = tcg_out_ldst_finalize(s);
     if (i < 0) {
         return i;
     }
+    if (vts) {
+        vts->ldst += tcg_current_code_size(s) - vts_at;
+        vts_at = tcg_current_code_size(s);
+    }
     i = tcg_out_pool_finalize(s);
     if (i < 0) {
         return i;
+    }
+    if (vts) {
+        vts->pool += tcg_current_code_size(s) - vts_at;
+        vts->tbs++;
+        vts->insns += num_insns + 1;
+        vts->total += tcg_current_code_size(s);
     }
     if (!tcg_resolve_relocs(s)) {
         return -2;
