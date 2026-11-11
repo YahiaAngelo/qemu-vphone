@@ -8,7 +8,8 @@
  * AVPSEPBooter's drivers (offsets per bank):
  *
  *   0x010  CTRL     bit 0 enable
- *   0x014  STATUS   bit 31 ready (set by writing it); bits 3:0 cause, W1C
+ *   0x014  STATUS   bit 31 ready (set by writing it); bits 3:0 cause, W1C;
+ *                   bit 4 inbox not empty, bit 5 outbox empty (read only)
  *   0x018  IRQ_EN   bit 4 inbox not empty, bit 5 outbox empty
  *   0x01c  INBOX    bit 17 empty, bit 16 full, 7:0 count
  *   0x020  OUTBOX   bit 17 empty, bit 16 full, 7:0 count
@@ -189,7 +190,20 @@ static uint64_t vpiop_read(void *opaque, hwaddr addr, unsigned size)
         val = me->ctrl;
         break;
     case REG_STATUS:
+        /*
+         * sepOS 18's mailbox interrupt handler takes an interrupt with
+         * neither bit 4 nor bit 5 set as spurious and never reads the
+         * inbox; sepOS 26 reads the queue registers instead.
+         */
         val = me->status;
+        if (b->side == SIDE_SEP) {
+            if (me->inbox.count) {
+                val |= IRQ_EN_INBOX;
+            }
+            if (!s->side[!b->side].inbox.count) {
+                val |= IRQ_EN_OUTBOX;
+            }
+        }
         break;
     case REG_IRQ_EN:
         val = me->irq_en;

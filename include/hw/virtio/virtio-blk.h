@@ -74,6 +74,11 @@ struct VirtIOBlock {
     uint64_t host_features;
     size_t config_size;
     BlockRAMRegistrar blk_ram_registrar;
+    /*
+     * Accept a discard larger than max_discard_sectors as one request.
+     * Apple's restore (iOS 18 clean_nand) discards the whole disk at once.
+     */
+    bool unbounded_discard;
 };
 
 typedef struct VirtIOBlockReq {

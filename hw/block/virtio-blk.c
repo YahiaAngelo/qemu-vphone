@@ -12,6 +12,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/defer-call.h"
 #include "qapi/error.h"
 #include "qemu/iov.h"
@@ -157,6 +158,10 @@ static void virtio_blk_discard_write_zeroes_complete(void *opaque, int ret)
     bool is_write_zeroes = (virtio_ldl_p(VIRTIO_DEVICE(s), &req->out.type) &
                             ~VIRTIO_BLK_T_BARRIER) == VIRTIO_BLK_T_WRITE_ZEROES;
 
+    if (ret) {
+        qemu_log_mask(LOG_GUEST_ERROR, "vblk-dbg: discard/wz completed %d\n",
+                      ret);
+    }
     if (ret && virtio_blk_handle_rw_error(req, -ret, false, is_write_zeroes)) {
         return;
     }
@@ -373,6 +378,17 @@ static bool virtio_blk_sect_range_ok(VirtIOBlock *dev,
     return true;
 }
 
+/*
+ * Apple's virtio-blk (vmapple, the only subclass with a handler for unknown
+ * requests) takes a discard of any size: Apple's restore (iOS 18 clean_nand)
+ * discards the whole disk in one request.
+ */
+static bool virtio_blk_unbounded_discard(VirtIOBlock *s)
+{
+    return s->unbounded_discard ||
+           VIRTIO_BLK_GET_CLASS(s)->handle_unknown_request != NULL;
+}
+
 static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
     struct virtio_blk_discard_write_zeroes *dwz_hdr, bool is_write_zeroes)
 {
@@ -381,7 +397,7 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
     uint64_t sector;
     uint32_t num_sectors, flags, max_sectors;
     uint8_t err_status;
-    int bytes;
+    int64_t bytes;
 
     sector = virtio_ldq_p(vdev, &dwz_hdr->sector);
     num_sectors = virtio_ldl_p(vdev, &dwz_hdr->num_sectors);
@@ -394,12 +410,19 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
      * make us sure that "num_sectors << BDRV_SECTOR_BITS" can fit in
      * the integer variable.
      */
-    if (unlikely(num_sectors > max_sectors)) {
+    if (unlikely(num_sectors > max_sectors) &&
+        !(virtio_blk_unbounded_discard(s) && !is_write_zeroes)) {
         err_status = VIRTIO_BLK_S_IOERR;
         goto err;
     }
 
-    bytes = num_sectors << BDRV_SECTOR_BITS;
+    bytes = (int64_t)num_sectors << BDRV_SECTOR_BITS;
+    if (!is_write_zeroes && bytes > BDRV_REQUEST_MAX_BYTES &&
+        virtio_blk_unbounded_discard(s)) {
+        /* advisory: discard the largest whole-block piece one request takes */
+        bytes = QEMU_ALIGN_DOWN(BDRV_REQUEST_MAX_BYTES,
+                                s->conf.conf.logical_block_size);
+    }
 
     if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
         err_status = VIRTIO_BLK_S_IOERR;
@@ -445,6 +468,12 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
     return VIRTIO_BLK_S_OK;
 
 err:
+    qemu_log_mask(LOG_GUEST_ERROR, "vblk-dbg: %s sector %" PRIu64
+                  " num %u flags 0x%x (max %u) -> status %u ub=%d cls=%s h=%p\n",
+                  is_write_zeroes ? "write-zeroes" : "discard", sector,
+                  num_sectors, flags, max_sectors, err_status,
+                  s->unbounded_discard, object_get_typename(OBJECT(s)),
+                  (void *)VIRTIO_BLK_GET_CLASS(s)->handle_unknown_request);
     if (is_write_zeroes) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_WRITE);
     }
@@ -970,6 +999,8 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
         VirtIOBlkClass *vbk = VIRTIO_BLK_GET_CLASS(s);
         if (!vbk->handle_unknown_request ||
             !vbk->handle_unknown_request(req, mrb, type)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "vblk-dbg: unsupported type 0x%x\n",
+                          type);
             virtio_blk_req_complete(req, VIRTIO_BLK_S_UNSUPP);
             g_free(req);
         }

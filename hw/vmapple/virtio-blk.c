@@ -151,6 +151,7 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
     virtio_add_feature(&dev->vdev.parent_obj.host_features, VIRTIO_BLK_F_ZONED);
     /* Propagate the apple type down to the virtio-blk device */
     dev->vdev.apple_type = dev->variant;
+    dev->vdev.parent_obj.unbounded_discard = true;
     /* and spawn the virtio-blk device */
     qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
 
