@@ -21,6 +21,7 @@
 #include "tcg/tcg-op-common.h"
 #include "translate.h"
 #include "translate-a64.h"
+#include "qemu/vphone-ab.h"
 #include "host-fpcr.h"
 #include "qemu/log.h"
 #include "arm_ldst.h"
@@ -486,6 +487,9 @@ static void vphone_gen_prefetch_ret(DisasContext *s, TCGv_i64 lr)
         const char *e = getenv("VPHONE_RET_PREFETCH");
         on = e && *e ? atoi(e) : 0;
     }
+    if (vphone_ab("ret_prefetch_off")) {
+        return;
+    }
     if (on == 1) {
         gen_helper_vphone_prefetch_ret(tcg_env, lr);
     } else if (on == 2) {
@@ -524,7 +528,7 @@ static bool vphone_xpage_links(void)
         const char *e = getenv("VPHONE_XPAGE_LINKS");
         on = e && *e && *e != '0';
     }
-    return on;
+    return on && !vphone_ab("xpage_off");
 }
 
 /*
@@ -641,7 +645,7 @@ static bool vphone_ras(DisasContext *s)
         const char *e = getenv("VPHONE_RAS");
         mode = e && *e ? atoi(e) : 1;
     }
-    return mode && vphone_inline_lookup() >= 1 &&
+    return mode && !vphone_ab("ras_off") && vphone_inline_lookup() >= 1 &&
            (tb_cflags(s->base.tb) & CF_PCREL) && !s->ss_active;
 }
 
@@ -805,7 +809,7 @@ static bool vphone_ibc(DisasContext *s)
     default:
         return false;
     }
-    return mode && vphone_inline_lookup() >= 1 &&
+    return mode && !vphone_ab("ibc_off") && vphone_inline_lookup() >= 1 &&
            (tb_cflags(s->base.tb) & CF_PCREL) && !s->ss_active &&
            !dc_isar_feature(aa64_bti, s);
 }
