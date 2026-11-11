@@ -72,8 +72,18 @@ static inline VirtIOPCIProxy *to_virtio_pci_proxy_fast(DeviceState *d)
 static void virtio_pci_notify(DeviceState *d, uint16_t vector)
 {
     VirtIOPCIProxy *proxy = to_virtio_pci_proxy_fast(d);
+    bool use_msix = msix_enabled(&proxy->pci_dev);
 
-    if (msix_enabled(&proxy->pci_dev)) {
+    if (trace_event_get_state_backends(TRACE_VIRTIO_PCI_NOTIFY_ROUTE)) {
+        VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+
+        trace_virtio_pci_notify_route(g_get_monotonic_time(),
+                                      object_get_typename(OBJECT(vdev)),
+                                      vdev->name ? vdev->name : "", vector,
+                                      use_msix, vector != VIRTIO_NO_VECTOR);
+    }
+
+    if (use_msix) {
         if (vector != VIRTIO_NO_VECTOR) {
             msix_notify(&proxy->pci_dev, vector);
         }

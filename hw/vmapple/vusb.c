@@ -266,12 +266,21 @@ static void vusb_do_rx(VUSBState *s)
 
 static void vusb_queue_host_msg(VUSBState *s, GByteArray *msg)
 {
-    if (g_queue_get_length(&s->host_msgs) >= VUSB_HOST_FIFO) {
+    unsigned int backlog = g_queue_get_length(&s->host_msgs);
+
+    if (backlog >= VUSB_HOST_FIFO) {
         qemu_log_mask(LOG_GUEST_ERROR, "vusb: host message dropped\n");
         g_byte_array_unref(msg);
         return;
     }
     g_queue_push_tail(&s->host_msgs, msg);
+    if (trace_event_get_state_backends(TRACE_VUSB_HOST_ENQUEUE) &&
+        msg->len >= VUSB_MSG_HDR &&
+        (!(msg->data[4] & 0x7f) || msg->data[5] == 2)) {
+        trace_vusb_host_enqueue(g_get_monotonic_time(), msg->len,
+                               msg->data[4], msg->data[5], backlog + 1,
+                               s->alt_active);
+    }
     if (s->alt_active) {
         if (s->alt.kick) {
             s->alt.kick(s->alt.opaque);
