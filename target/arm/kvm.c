@@ -1719,6 +1719,15 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
     }
     if (apple_virt_handle_hvc_fast(cs, imm)) {
         vr_steptrace_maybe_start(cs, imm);
+        if (imm == 0x80ae && getenv("VR_DEBUG_STATUS")) { /* debug */
+            uint64_t x14 = 0;
+
+            kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.regs[14]), &x14);
+            if (x14) {
+                fprintf(stderr, "STATUS-FAST cpu%d x14=0x%" PRIx64 " status=0x%" PRIx64 " dirty=%d\n",
+                        cs->cpu_index, x14, cpu_env(cs)->gxf.gxf_status_el[1], cs->vcpu_dirty);
+            }
+        }
         return 0;
     }
     kvm_cpu_synchronize_state(cs);
@@ -1728,6 +1737,10 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
     bql_unlock();
     if (handled) {
         vr_steptrace_maybe_start(cs, imm);
+        if (imm == 0x80ae && getenv("VR_DEBUG_STATUS") && cpu_env(cs)->xregs[14]) { /* debug */
+            fprintf(stderr, "STATUS-SLOW cpu%d x14=0x%" PRIx64 " status=0x%" PRIx64 "\n",
+                    cs->cpu_index, cpu_env(cs)->xregs[14], cpu_env(cs)->gxf.gxf_status_el[1]);
+        }
         return 0;
     }
     /*

@@ -127,7 +127,9 @@ static bool ck_virt_is_vector_table(const uint8_t* table, bool inline_slots)
 
         if (inline_slots ?
                 first == 0 || first == NOP || (uint32_t)ldl_le_p(slot + 0x7C) != NOP :
-                (first & 0xFC000000) != 0x14000000 || (first & 0x3FFFFFF) == 0 || (uint32_t)ldl_le_p(slot + 4) != NOP)
+                (first & 0xFC000000) != 0x14000000 || (first & 0x3FFFFFF) == 0
+                    // vphone-linux: vresearch101's SPTM pads its last slot with zeros rather than NOPs.
+                    || ((uint32_t)ldl_le_p(slot + 4) != NOP && ldl_le_p(slot + 4) != 0))
         {
             return false;
         }

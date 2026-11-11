@@ -1138,6 +1138,58 @@ static void gxf_resume_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
 
 // An `msr`/`mrs` of a register that is only in `env`, or that the vCPU holds as it is.
 // `after` is whether the vCPU is already after the instruction, which changes to the shadows need.
+/*
+ * vphone-linux: an M1-style monitor's access to a register genter/gexit bank (TPIDR, VBAR, SPSR,
+ * ELR, ESR, FAR): its own (`_GL1`) or the unguarded world's (`_EL1`). The world that runs has its
+ * bank in the vCPU's EL1 registers, the other's is in `env`.
+ */
+static bool virt_m1_bank_fast(CPUState* cs, CPUARMState* env, int vreg, bool read, uint32_t rt)
+{
+    bool      gl      = vreg >= APPLE_VIRT_VREG_M1_SP_GL1;
+    int       i;
+    bool      live    = gl == !!(env->gxf.gxf_status_el[1] & 1);
+    uint64_t* field;
+    uint64_t  value;
+
+    // The index of gxf_bank_regs / gxf_bank_field.
+    switch (vreg) {
+        case APPLE_VIRT_VREG_M1_TPIDR_EL1: case APPLE_VIRT_VREG_M1_TPIDR_GL1: i = 1; break;
+        case APPLE_VIRT_VREG_M1_VBAR_EL1 : case APPLE_VIRT_VREG_M1_VBAR_GL1 : i = 2; break;
+        case APPLE_VIRT_VREG_M1_SPSR_EL1 : case APPLE_VIRT_VREG_M1_SPSR_GL1 : i = 3; break;
+        case APPLE_VIRT_VREG_M1_ELR_EL1  : case APPLE_VIRT_VREG_M1_ELR_GL1  : i = 4; break;
+        case APPLE_VIRT_VREG_M1_ESR_EL1  : case APPLE_VIRT_VREG_M1_ESR_GL1  : i = 5; break;
+        case APPLE_VIRT_VREG_M1_FAR_EL1  : case APPLE_VIRT_VREG_M1_FAR_GL1  : i = 6; break;
+        default                          : return false;
+    }
+    field = live ? NULL : gxf_bank_field(env, gl, i);
+
+    if (read) {
+        value = live ? virt.ops->get_reg(cs, gxf_bank_regs[i]) : *field;
+        if (getenv("VR_CHECK_M1")) {
+            // Debug: compare with what the slow path reads from the synced state.
+            static unsigned reported;
+            uint64_t slow;
+
+            cpu_synchronize_state(cs);
+            slow = *virt_vreg_field(env, vreg);
+            if (slow != value && reported++ < 40) {
+                fprintf(stderr, "M1-CHECK cpu%d vreg %d gl=%d guarded=%d fast=0x%" PRIx64 " slow=0x%" PRIx64 "\n",
+                        cs->cpu_index, vreg, gl, (int)(env->gxf.gxf_status_el[1] & 1), value, slow);
+            }
+            if (rt != 31) { env->xregs[rt] = slow; }
+            return true;
+        }
+        if (rt != 31) { virt.ops->set_xreg(cs, rt, value); }
+        return true;
+    }
+    value = rt == 31 ? 0 : virt.ops->get_xreg(cs, rt);
+    if (live) { virt.ops->set_reg(cs, gxf_bank_regs[i], value); }
+    else {
+        *field = value;
+    }
+    return true;
+}
+
 static bool virt_handle_sysreg_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c, int vreg, bool read, uint32_t rt,
                                     bool after)
 {
@@ -1145,6 +1197,16 @@ static bool virt_handle_sysreg_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU
     uint64_t  value;
 
     switch (vreg) {
+        case APPLE_VIRT_VREG_M1_TPIDR_EL1 ... APPLE_VIRT_VREG_M1_FAR_EL1:
+        case APPLE_VIRT_VREG_M1_TPIDR_GL1:
+        case APPLE_VIRT_VREG_M1_VBAR_GL1 :
+        case APPLE_VIRT_VREG_M1_SPSR_GL1 :
+        case APPLE_VIRT_VREG_M1_ESR_GL1  :
+        case APPLE_VIRT_VREG_M1_ELR_GL1  :
+        case APPLE_VIRT_VREG_M1_FAR_GL1  :
+            if (getenv("VR_NO_M1_FAST")) { return false; }    // debug: compare with the slow path
+            return virt_m1_bank_fast(cs, env, vreg, read, rt);
+        case APPLE_VIRT_VREG_M1_ASPSR_GL1: break;
         case APPLE_VIRT_VREG_SPRR_CONFIG_EL1   :
         case APPLE_VIRT_VREG_GXF_CONFIG_EL1    :
         case APPLE_VIRT_VREG_GXF_STATUS_EL1    :
