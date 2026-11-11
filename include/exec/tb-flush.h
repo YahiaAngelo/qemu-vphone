@@ -33,6 +33,10 @@ void tb_flush__exclusive_or_serial(void);
  */
 void queue_tb_flush(CPUState *cs);
 
+/* vphone-linux: the code buffer is full (tb-maint.c, VPHONE_TB_RECYCLE). */
+void queue_tb_recycle(CPUState *cs);
+void tb_recycle_or_flush__exclusive_or_serial(void);
+
 void tcg_flush_jmp_cache(CPUState *cs);
 void tcg_stale_jmp_cache(CPUState *cs);
 void tcg_switch_jmp_cache(CPUState *cs, uint32_t asid);

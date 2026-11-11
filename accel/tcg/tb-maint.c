@@ -35,6 +35,7 @@
 #include "internal-common.h"
 #include "system/runstate.h"
 #include "qemu/vphone-ev.h"
+#include "qemu/vphone-ab.h"
 
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
@@ -702,6 +703,122 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
     if (tb_ctx.tb_flush_count == tb_flush_count.host_int) {
         tb_flush__exclusive_or_serial();
     }
+}
+
+/*
+ * vphone-linux region recycling (VPHONE_TB_RECYCLE=1, or arm 1 of
+ * VPHONE_AB_WHAT=tb_recycle): when the code buffer is full, invalidate the
+ * TBs of the oldest quarter of its regions and reuse those regions, instead
+ * of flushing every TB. Hot code then survives a full buffer (the iPhone
+ * guest fills 2 GiB every 1-2 minutes during boot and app launches, and a
+ * flush made ~40% of its translations redo work). Besides QEMU's own links
+ * (unlinked by tb_phys_invalidate), the jump caches and the RAS (flushed,
+ * which also outdates the RAS stamp) and the TB pointers of the indirect-
+ * branch cache and of call sites' return TBs into those regions (cleared in
+ * every surviving TB) must not outlive them. Runs as safe work: no vCPU is in
+ * generated code or translating.
+ */
+static bool vphone_tb_recycle_on(void)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        const char *e = getenv("VPHONE_TB_RECYCLE");
+        on = e && *e && *e != '0';
+    }
+    return on || vphone_ab("tb_recycle");
+}
+
+typedef struct {
+    size_t n;
+    uintptr_t lo[64], hi[64];
+} VphoneRecycleRanges;
+
+static bool vr_in(const VphoneRecycleRanges *r, const void *p)
+{
+    for (size_t i = 0; i < r->n; i++) {
+        if ((uintptr_t)p >= r->lo[i] && (uintptr_t)p < r->hi[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static gboolean vr_collect(gpointer key, gpointer value, gpointer data)
+{
+    g_ptr_array_add(data, value);
+    return FALSE;
+}
+
+static gboolean vr_fix(gpointer key, gpointer value, gpointer data)
+{
+    TranslationBlock *tb = value;
+
+    if (tb->vphone_ibr_tb && vr_in(data, tb->vphone_ibr_tb)) {
+        qatomic_set(&tb->vphone_ibr_tb, NULL);
+    }
+    if (tb->vphone_ret_tb && vr_in(data, tb->vphone_ret_tb)) {
+        qatomic_set(&tb->vphone_ret_tb, NULL);
+    }
+    return FALSE;
+}
+
+static bool tb_recycle__exclusive(void)
+{
+    size_t idx[64];
+    size_t n = MIN(tcg_region_count(), 64), got;
+    VphoneRecycleRanges r = { 0 };
+    g_autoptr(GPtrArray) tbs = g_ptr_array_new();
+    CPUState *cpu;
+
+    if (n < 4) {
+        return false;
+    }
+    got = tcg_region_recycle_pick(n / 4, idx);
+    if (!got) {
+        return false;
+    }
+    for (size_t i = 0; i < got; i++) {
+        void *start, *end;
+
+        tcg_region_recycle_bounds(idx[i], &start, &end);
+        r.lo[r.n] = (uintptr_t)start;
+        r.hi[r.n++] = (uintptr_t)end;
+        tcg_region_recycle_foreach(idx[i], vr_collect, tbs);
+    }
+    for (guint i = 0; i < tbs->len; i++) {
+        tb_phys_invalidate(g_ptr_array_index(tbs, i), -1);
+    }
+    tcg_tb_foreach(vr_fix, &r);
+    CPU_FOREACH(cpu) {
+        tcg_flush_jmp_cache(cpu);
+    }
+    tcg_region_recycle_done(got, idx);
+    qatomic_inc(&tb_ctx.tb_flush_count);
+    vphone_ev(VEV_TB_RECYCLE);
+    return true;
+}
+
+/* The code buffer is full: recycle its oldest regions, or flush every TB. */
+void tb_recycle_or_flush__exclusive_or_serial(void)
+{
+    if (!vphone_tb_recycle_on() || !tb_recycle__exclusive()) {
+        tb_flush__exclusive_or_serial();
+    }
+}
+
+static void do_tb_recycle(CPUState *cpu, run_on_cpu_data tb_flush_count)
+{
+    if (tb_ctx.tb_flush_count == tb_flush_count.host_int) {
+        tb_recycle_or_flush__exclusive_or_serial();
+    }
+}
+
+void queue_tb_recycle(CPUState *cs)
+{
+    unsigned tb_flush_count = qatomic_read(&tb_ctx.tb_flush_count);
+
+    async_safe_run_on_cpu(cs, do_tb_recycle, RUN_ON_CPU_HOST_INT(tb_flush_count));
 }
 
 void queue_tb_flush(CPUState *cs)

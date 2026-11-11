@@ -39,7 +39,7 @@ static const char *const vev_names[VEV_MAX] = {
     [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush", [VEV_TB_FIRST] = "tb_first",
     [VEV_TB_SAMEKEY] = "tb_again_samekey", [VEV_TB_VARIANT] = "tb_again_variant",
     [VEV_TB_XPAGE] = "tb_crosspage", [VEV_TB_SAMEKEY_XPAGE] = "tb_again_samekey_crosspage",
-    [VEV_TB_RACE] = "tb_race", [VEV_TB_ONEINSN] = "tb_oneinsn", [VEV_TB_INVAL] = "tb_inval",
+    [VEV_TB_RECYCLE] = "tb_recycle", [VEV_TB_RACE] = "tb_race", [VEV_TB_ONEINSN] = "tb_oneinsn", [VEV_TB_INVAL] = "tb_inval",
     [VEV_TB_INVAL_DMA] = "tb_inval_dma_calls", [VEV_TB_FLUSH] = "tb_flush",
 };
 

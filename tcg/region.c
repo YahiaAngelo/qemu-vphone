@@ -77,6 +77,16 @@ struct tcg_region_state {
 static struct tcg_region_state region;
 
 /*
+ * vphone-linux region recycling (VPHONE_TB_RECYCLE, accel/tcg/tb-maint.c):
+ * the allocation sequence of each region, and the regions freed by a
+ * recycle, handed out again before the buffer counts as full.
+ */
+static uint64_t *vr_seq;
+static uint64_t vr_next_seq;
+static size_t *vr_free;
+static size_t vr_nfree;
+
+/*
  * This is an array of struct tcg_region_tree's, with padding.
  * We use void * to simplify the computation of region_trees[i]; each
  * struct is found every tree_size bytes.
@@ -359,12 +369,120 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
 
 static bool tcg_region_alloc__locked(TCGContext *s)
 {
-    if (region.current == region.n) {
+    size_t idx;
+
+    if (region.current < region.n) {
+        idx = region.current++;
+    } else if (vr_nfree) {
+        idx = vr_free[--vr_nfree];
+    } else {
         return true;
     }
-    tcg_region_assign(s, region.current);
-    region.current++;
+    tcg_region_assign(s, idx);
+    if (vr_seq) {
+        vr_seq[idx] = ++vr_next_seq;
+    }
     return false;
+}
+
+static size_t tcg_region_index(const void *p)
+{
+    ptrdiff_t offset = p - region.start_aligned;
+
+    if (p < region.start_aligned) {
+        return 0;
+    }
+    return MIN(offset / region.stride, region.n - 1);
+}
+
+/*
+ * vphone-linux: pick up to @k of the oldest regions that are full (allocated,
+ * not a translation context's current region, not free). Call from a
+ * safe-work context. Returns how many, in @idx.
+ */
+size_t tcg_region_recycle_pick(size_t k, size_t *idx)
+{
+    unsigned int n_ctxs = qatomic_read(&tcg_cur_ctxs);
+    g_autofree bool *busy = g_new0(bool, region.n);
+    size_t got = 0;
+
+    qemu_mutex_lock(&region.lock);
+    if (!vr_seq) {
+        vr_seq = g_new0(uint64_t, region.n);
+        vr_free = g_new(size_t, region.n);
+        for (size_t i = 0; i < region.current; i++) {
+            vr_seq[i] = ++vr_next_seq;
+        }
+    }
+    for (unsigned int i = 0; i < n_ctxs; i++) {
+        TCGContext *s = qatomic_read(&tcg_ctxs[i]);
+
+        busy[tcg_region_index(s->code_gen_buffer)] = true;
+    }
+    for (size_t i = 0; i < vr_nfree; i++) {
+        busy[vr_free[i]] = true;
+    }
+    for (size_t i = region.current; i < region.n; i++) {
+        busy[i] = true;
+    }
+    while (got < k) {
+        size_t best = region.n;
+
+        for (size_t i = 0; i < region.n; i++) {
+            if (!busy[i] && (best == region.n || vr_seq[i] < vr_seq[best])) {
+                best = i;
+            }
+        }
+        if (best == region.n) {
+            break;
+        }
+        busy[best] = true;
+        idx[got++] = best;
+    }
+    qemu_mutex_unlock(&region.lock);
+    return got;
+}
+
+/* vphone-linux: the number of regions. */
+size_t tcg_region_count(void)
+{
+    return region.n;
+}
+
+/* vphone-linux: the bounds of region @i, for tb-maint.c. */
+void tcg_region_recycle_bounds(size_t i, void **start, void **end)
+{
+    tcg_region_bounds(i, start, end);
+}
+
+/* vphone-linux: visit the TBs of region @i. */
+void tcg_region_recycle_foreach(size_t i, GTraverseFunc func, gpointer data)
+{
+    struct tcg_region_tree *rt = region_trees + i * tree_size;
+
+    qemu_mutex_lock(&rt->lock);
+    q_tree_foreach(rt->tree, func, data);
+    qemu_mutex_unlock(&rt->lock);
+}
+
+/* vphone-linux: empty the regions in @idx (their TBs invalidated) and free them. */
+void tcg_region_recycle_done(size_t n, const size_t *idx)
+{
+    qemu_mutex_lock(&region.lock);
+    for (size_t j = 0; j < n; j++) {
+        struct tcg_region_tree *rt = region_trees + idx[j] * tree_size;
+        void *start, *end;
+
+        qemu_mutex_lock(&rt->lock);
+        q_tree_ref(rt->tree);
+        q_tree_destroy(rt->tree);
+        qemu_mutex_unlock(&rt->lock);
+        tcg_region_bounds(idx[j], &start, &end);
+        region.agg_size_full -= MIN(region.agg_size_full,
+                                    (size_t)(end - start) - TCG_HIGHWATER);
+        vr_free[vr_nfree++] = idx[j];
+    }
+    qemu_mutex_unlock(&region.lock);
 }
 
 /*
@@ -412,6 +530,7 @@ void tcg_region_reset_all(void)
     qemu_mutex_lock(&region.lock);
     region.current = 0;
     region.agg_size_full = 0;
+    vr_nfree = 0;
 
     for (i = 0; i < n_ctxs; i++) {
         TCGContext *s = qatomic_read(&tcg_ctxs[i]);

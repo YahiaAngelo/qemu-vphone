@@ -378,10 +378,10 @@ static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s)
     if (unlikely(!tb)) {
         /* flush must be done */
         if (cpu_in_serial_context(cpu)) {
-            tb_flush__exclusive_or_serial();
+            tb_recycle_or_flush__exclusive_or_serial();
             goto buffer_overflow;
         }
-        queue_tb_flush(cpu);
+        queue_tb_recycle(cpu);
 
         /* Make the execution loop process the flush as soon as possible.  */
         cpu->exception_index = EXCP_INTERRUPT;

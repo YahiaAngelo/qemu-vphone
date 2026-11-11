@@ -644,6 +644,12 @@ void tcg_pool_reset(TCGContext *s);
 TranslationBlock *tcg_tb_alloc(TCGContext *s);
 
 void tcg_region_reset_all(void);
+/* vphone-linux region recycling (accel/tcg/tb-maint.c) */
+size_t tcg_region_count(void);
+size_t tcg_region_recycle_pick(size_t k, size_t *idx);
+void tcg_region_recycle_bounds(size_t i, void **start, void **end);
+void tcg_region_recycle_foreach(size_t i, GTraverseFunc func, gpointer data);
+void tcg_region_recycle_done(size_t n, const size_t *idx);
 
 size_t tcg_code_size(void);
 size_t tcg_code_capacity(void);
