@@ -239,6 +239,13 @@ struct CPUTLBEntryFull {
     uint8_t tlb_fill_flags;
 
     /*
+     * vphone-linux: the mapping is not global (an Arm nG descriptor): it
+     * belongs to the current ASID only. tlb_flush_asid_switch() drops just
+     * these entries of the ASID-tagged MMU indexes.
+     */
+    uint8_t vphone_ng;
+
+    /*
      * Additional tlb flags for use by the slow path. If non-zero,
      * the corresponding CPUTLBEntry comparator must have TLB_FORCE_SLOW.
      */
@@ -290,6 +297,17 @@ typedef struct CPUTLBDesc {
     CPUTLBEntry vtable[CPU_VTLB_SIZE];
     CPUTLBEntryFull vfulltlb[CPU_VTLB_SIZE];
     CPUTLBEntryFull *fulltlb;
+    /*
+     * vphone-linux: indexes of fulltlb entries filled with vphone_ng since the
+     * last flush of this MMU index, so that an ASID switch can drop them
+     * without scanning the table. ng_overflow: more than fit; the next ASID
+     * switch flushes the whole index.
+     */
+    uint32_t *ng_log;
+    uint32_t ng_n;
+    bool ng_overflow;
+    /* vphone-linux: a global entry below bit 63 was filled since the last flush */
+    bool lo_global;
 } CPUTLBDesc;
 
 /*

@@ -2309,6 +2309,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
         if (aarch64 && cpu_isar_feature(aa64_bti, cpu)) {
             result->f.extra.arm.guarded = extract64(attrs, 50, 1); /* GP */
         }
+        /* vphone-linux: nG, for tlb_flush_asid_switch() (two-range regimes only). */
+        if (aarch64 && regime_has_2_ranges(mmu_idx)) {
+            result->f.vphone_ng = extract64(attrs, 11, 1);
+        }
         device = S1_attrs_are_device(result->cacheattrs.attrs);
     }
 
@@ -3519,6 +3523,7 @@ static bool get_phys_addr_twostage(CPUARMState *env, S1Translate *ptw,
     int s1_prot, s1_lgpgsz;
     ARMSecuritySpace in_space = ptw->in_space;
     bool ret, ipa_secure, s1_guarded;
+    uint8_t s1_ng;
     ARMCacheAttrs cacheattrs1;
     ARMSecuritySpace ipa_space;
     uint64_t hcr;
@@ -3547,6 +3552,7 @@ static bool get_phys_addr_twostage(CPUARMState *env, S1Translate *ptw,
     s1_prot = result->f.prot;
     s1_lgpgsz = result->f.lg_page_size;
     s1_guarded = result->f.extra.arm.guarded;
+    s1_ng = result->f.vphone_ng;
     cacheattrs1 = result->cacheattrs;
     memset(result, 0, sizeof(*result));
 
@@ -3600,6 +3606,7 @@ static bool get_phys_addr_twostage(CPUARMState *env, S1Translate *ptw,
 
     /* No BTI GP information in stage 2, we just use the S1 value */
     result->f.extra.arm.guarded = s1_guarded;
+    result->f.vphone_ng = s1_ng;
 
     /*
      * Check if IPA translates to secure or non-secure PA space.
