@@ -369,6 +369,8 @@ int kvm_arch_put_registers(CPUState *cpu, int level, Error **errp);
 int kvm_arch_get_default_type(MachineState *ms);
 
 int kvm_arch_init(MachineState *ms, KVMState *s);
+/* After system memory's listener is registered. */
+void kvm_arch_init_memory(MachineState *ms, KVMState *s);
 
 int kvm_arch_pre_create_vcpu(CPUState *cpu, Error **errp);
 int kvm_arch_init_vcpu(CPUState *cpu);

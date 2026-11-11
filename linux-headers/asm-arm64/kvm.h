@@ -208,6 +208,19 @@ struct kvm_arm_counter_offset {
 	__u64 reserved;
 };
 
+/*
+ * Guest physical range to write-protect, or to stop write-protecting.
+ * To be used with KVM_ARM_SET_WRITE_PROTECT.
+ */
+#define KVM_ARM_WRITE_PROTECT_ENABLE	(1U << 0)
+
+struct kvm_arm_write_protect {
+	__u64 gpa;
+	__u64 size;
+	__u32 flags;
+	__u32 reserved[3];
+};
+
 #define KVM_ARM_TAGS_TO_GUEST		0
 #define KVM_ARM_TAGS_FROM_GUEST		1
 

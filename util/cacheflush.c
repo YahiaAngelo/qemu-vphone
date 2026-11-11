@@ -7,6 +7,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cacheflush.h"
+
+bool qemu_guest_ram_noncoherent;
 #include "qemu/cacheinfo.h"
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
@@ -300,6 +302,17 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
     }
 
     asm volatile("isb" : : : "memory");
+}
+
+void qemu_dcache_flush_poc(const void *p, size_t len)
+{
+    const uintptr_t lsize = qemu_dcache_linesize;
+    uintptr_t start = (uintptr_t)p, q;
+
+    for (q = start & -lsize; q < start + len; q += lsize) {
+        asm volatile("dc\tcivac, %0" : : "r" (q) : "memory");
+    }
+    asm volatile("dsb\tsy" : : : "memory");
 }
 #endif /* CONFIG_DARWIN */
 

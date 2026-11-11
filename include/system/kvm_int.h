@@ -173,6 +173,12 @@ void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,
                                   AddressSpace *as, int as_id, const char *name);
 
 void kvm_set_max_memslot_size(hwaddr max_slot_size);
+/*
+ * Maps host memory at [ipa, ipa + size) of the guest outside of system
+ * memory, read-only unless `writable`.
+ */
+void kvm_map_ram(void *host, hwaddr ipa, uint64_t size, bool writable);
+void kvm_unmap_ram(hwaddr ipa, uint64_t size);
 
 /**
  * kvm_hwpoison_page_add:

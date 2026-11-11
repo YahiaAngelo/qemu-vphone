@@ -14,6 +14,8 @@ arm_system_ss.add(files(
   'arm-qmp-cmds.c',
 ))
 arm_system_ss.add(when: 'CONFIG_KVM', if_true: files('hyp_gdbstub.c', 'kvm.c'))
+# vphone-linux: Apple GXF/SPRR and PAC emulation under KVM (from ChefKiss Inferno)
+arm_system_ss.add(when: 'CONFIG_KVM', if_true: files('apple-virt.c'), if_false: files('apple-virt-stub.c'))
 arm_system_ss.add(when: 'CONFIG_HVF', if_true: files('hyp_gdbstub.c'))
 
 arm_common_system_ss.add(files('cpu.c'))

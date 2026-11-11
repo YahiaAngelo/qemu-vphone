@@ -26,6 +26,7 @@ arm_common_ss.add(when: 'CONFIG_APPLE_SOC', if_true: files(
     'sep.c',
     'gfx_asc_fw.c',
     'patcher.c',
+    'virt_patches.c',
     'kernel_patches.c',
     'lm-backlight.c',
     's8000.c',

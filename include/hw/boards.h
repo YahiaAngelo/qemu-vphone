@@ -265,6 +265,13 @@ struct MachineClass {
     ObjectClass parent_class;
     /*< public >*/
 
+    /*
+     * vphone-linux: under KVM, run Apple GXF/SPRR and PAC emulation
+     * (target/arm/apple-virt.c) with the guest's interrupt controllers in
+     * QEMU. Needs linux-aurora-kvm's userspace exits.
+     */
+    bool kvm_apple_virt;
+
     const char *family; /* NULL iff @name identifies a standalone machtype */
     char *name;
     const char *alias;

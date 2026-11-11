@@ -2945,6 +2945,7 @@ static MemTxResult flatview_write_continue_step(MemTxAttrs attrs,
                                                false, true);
 
         memmove(ram_ptr, buf, *l);
+        qemu_guest_ram_sync(ram_ptr, *l);
         invalidate_and_set_dirty(mr, mr_addr, *l);
 
         return MEMTX_OK;
@@ -3037,6 +3038,7 @@ static MemTxResult flatview_read_continue_step(MemTxAttrs attrs, uint8_t *buf,
         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
                                                false, false);
 
+        qemu_guest_ram_sync(ram_ptr, *l);
         memcpy(buf, ram_ptr, *l);
 
         return MEMTX_OK;
@@ -3185,6 +3187,7 @@ static inline MemTxResult address_space_write_rom_internal(AddressSpace *as,
             switch (type) {
             case WRITE_DATA:
                 memcpy(ram_ptr, buf, l);
+                qemu_guest_ram_sync(ram_ptr, l);
                 invalidate_and_set_dirty(mr, addr1, l);
                 break;
             case FLUSH_CACHE:
@@ -3434,7 +3437,14 @@ void *address_space_map(AddressSpace *as,
     memory_region_ref(mr);
     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
                                         l, is_write, attrs);
-    return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
+    {
+        void *ptr = qemu_ram_ptr_length(mr->ram_block, xlat, plen, true,
+                                        is_write);
+
+        /* The device may read what a non-cacheable guest wrote. */
+        qemu_guest_ram_sync(ptr, *plen);
+        return ptr;
+    }
 }
 
 /* Unmaps a memory region previously mapped by address_space_map().
@@ -3450,6 +3460,7 @@ void address_space_unmap(AddressSpace *as, void *buffer, hwaddr len,
     mr = memory_region_from_host(buffer, &addr1);
     if (mr != NULL) {
         if (is_write) {
+            qemu_guest_ram_sync(buffer, access_len);
             invalidate_and_set_dirty(mr, addr1, access_len);
         }
         if (xen_enabled()) {

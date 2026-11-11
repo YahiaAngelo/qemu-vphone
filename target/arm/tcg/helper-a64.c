@@ -808,6 +808,15 @@ illegal_return:
 
 void HELPER(gexit)(CPUARMState *env)
 {
+    /* Debug: VR_GXF_CALLS=1 logs what each GEXIT returns (x0, x1) */
+    if (getenv("VR_GXF_CALLS") && env_cpu(env)->cpu_index == 0) {
+        static unsigned n;
+        if (n++ < 40) {
+            fprintf(stderr, "GXF-CALL exit x0=0x%" PRIx64 " x1=0x%" PRIx64
+                    " elr_gl=0x%" PRIx64 "\n", env->xregs[0], env->xregs[1],
+                    env->gxf.elr_gl[1]);
+        }
+    }
     int cur_el = arm_current_el(env);
     uint32_t spsr = env->gxf.spsr_gl[cur_el];
     bool return_to_gl = (env->gxf.aspsr_gl[cur_el] & 1) != 0;

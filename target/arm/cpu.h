@@ -639,6 +639,8 @@ typedef struct CPUArchState {
         uint64_t mprr_s3_6_c15_c3_5;
         /* S3_6_C15_C3_0 when sprr_cfg.unified_perms is set */
         uint64_t c3_0;
+        /* S3_6_C15_C1_7: unused by the M1 layout, kept for GXF/PAC emulation */
+        uint64_t c1_7;
     } sprr;
 
     struct {

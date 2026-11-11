@@ -38,6 +38,12 @@
 #include "hw/usb.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/apple-silicon/a13_gxf.h"
+#include "system/kvm.h"
+#include "target/arm/apple-virt.h"
+#include "hw/arm/apple_virt_hvc.h"
+#include "target/arm/kvm_arm.h"
+#include "hw/arm/apple-silicon/virt_patches.h"
+#include "qemu/cacheflush.h"
 #include "hw/char/pl011.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/misc/pvpanic.h"
@@ -481,6 +487,296 @@ static void define_impdef_sink(ARMCPU *cpu)
  * 0x6000000. Model that as a container holding the private ROM, SRAM and
  * TZ0 over an alias of the whole system address space.
  */
+/*
+ * Under KVM the AP cores run SPTM, TXM and XNU natively, so their GXF
+ * transitions, exception entries and returns and SPRR/MMU register accesses
+ * must be rewritten to `hvc` for GXF/PAC emulation (target/arm/apple-virt.c)
+ * before they run. iBoot loads all three and jumps to SPTM, whose first act is
+ * to program SPRR and GXF: Apple registers, which trap. On that first trap
+ * QEMU finds the images in guest RAM and rewrites them once.
+ */
+#define MH_MAGIC_64      0xfeedfacfU
+#define MH_CPU_ARM64     0x0100000cU
+#define MH_FT_EXECUTE    0x2U
+#define MH_FT_FILESET    0xcU
+/* iBoot places images on 4 KiB boundaries; load commands fit in 16 KiB */
+#define VR_KVM_SCAN_STEP (4 * KiB)
+#define VR_KVM_MAX_CMDS_SIZE (16 * KiB)
+
+static VResearchMachineState *vr_kvm_machine;
+static bool vr_kvm_patched_sptm, vr_kvm_patched_txm, vr_kvm_patched_kernel;
+static bool vr_kvm_managed;
+
+static bool vr_kvm_image_has(const uint8_t *img, size_t len, const char *s)
+{
+    return memmem(img, len, s, strlen(s)) != NULL;
+}
+
+/*
+ * The span of the Mach-O image at `hdr`, or 0 if it isn't a complete one
+ * (load commands within `avail` bytes, a text segment at file offset 0 and a
+ * read-only one): RAM holds stray headers too, such as an image's copy in a
+ * load buffer, and apple_boot_get_kc_bounds() asserts on those.
+ */
+static uint64_t vr_kvm_macho_span(MachoHeader64 *hdr, uint64_t avail)
+{
+    uint64_t lo = UINT64_MAX, hi = 0, off = sizeof(*hdr);
+    uint64_t end = sizeof(*hdr) + (uint64_t)hdr->size_of_cmds;
+    bool text = false, ro = false;
+
+    if (end > avail) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < hdr->n_cmds; i++) {
+        MachoLoadCommand *cmd = (MachoLoadCommand *)((uint8_t *)hdr + off);
+        MachoSegmentCommand64 *seg = (MachoSegmentCommand64 *)cmd;
+
+        if (off + sizeof(*cmd) > end || cmd->cmd_size < sizeof(*cmd) ||
+            off + cmd->cmd_size > end) {
+            return 0;
+        }
+        off += cmd->cmd_size;
+        if (cmd->cmd != LC_SEGMENT_64 || cmd->cmd_size < sizeof(*seg) ||
+            seg->vmsize == 0 || !strncmp(seg->segname, "__PAGEZERO", 10)) {
+            continue;
+        }
+        if (seg->vmaddr + seg->vmsize < seg->vmaddr) {
+            return 0;
+        }
+        text |= seg->filesize != 0 && seg->fileoff == 0;
+        ro |= !(seg->maxprot & VM_PROT_WRITE) &&
+              strncmp(seg->segname, "__LINKEDIT", 10);
+        lo = MIN(lo, seg->vmaddr);
+        hi = MAX(hi, seg->vmaddr + seg->vmsize);
+    }
+    return text && ro && hi > lo ? hi - lo : 0;
+}
+
+/*
+ * What runs isn't laid out like the header-bearing copies the scan finds:
+ * iBoot packs SPTM's, TXM's and the kernel's segments into physical memory
+ * its own way, and the code that runs has no Mach-O header to find. So after
+ * an image is patched, every 4 KiB page of it that changed is written to
+ * every RAM page that still holds its original contents. RAM pages are
+ * indexed by their first 16 bytes (pages starting with zeros are left out).
+ */
+#define VR_KVM_PAGE (4 * KiB)
+
+static GHashTable *vr_kvm_page_index;
+
+static uint64_t vr_kvm_page_key(const uint8_t *p)
+{
+    return ldq_le_p(p) * 0x9e3779b97f4a7c15ULL ^ ldq_le_p(p + 8);
+}
+
+static void vr_kvm_index_ram(uint8_t *ram, uint64_t size)
+{
+    vr_kvm_page_index = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                              g_free,
+                                              (GDestroyNotify)g_array_unref);
+    for (uint64_t off = 0; off + VR_KVM_PAGE <= size; off += VR_KVM_PAGE) {
+        uint64_t key;
+        GArray *pages;
+
+        if (ldq_le_p(ram + off) == 0 && ldq_le_p(ram + off + 8) == 0) {
+            continue;
+        }
+        key = vr_kvm_page_key(ram + off);
+        pages = g_hash_table_lookup(vr_kvm_page_index, &key);
+        if (pages == NULL) {
+            pages = g_array_new(false, false, sizeof(uint32_t));
+            g_hash_table_insert(vr_kvm_page_index, g_memdup2(&key, 8), pages);
+        }
+        g_array_append_val(pages, (uint32_t){ off / VR_KVM_PAGE });
+    }
+}
+
+/* Writes the changes `buf` has over `orig` (`len` bytes) to RAM's other copies */
+static unsigned vr_kvm_propagate(uint8_t *ram, uint64_t size,
+                                 const uint8_t *orig, uint8_t *buf,
+                                 uint64_t len)
+{
+    unsigned copies = 0, changed = 0, hits = 0, cands = 0;
+
+    for (uint64_t k = 0; k < len; k += VR_KVM_PAGE) {
+        uint64_t n = MIN(VR_KVM_PAGE, len - k), key;
+        GArray *pages;
+
+        if (memcmp(orig + k, buf + k, n) == 0 || n < 16) {
+            continue;
+        }
+        key = vr_kvm_page_key(orig + k);
+        pages = g_hash_table_lookup(vr_kvm_page_index, &key);
+        changed++;
+        hits += pages != NULL;
+        cands += pages ? pages->len : 0;
+        for (guint i = 0; pages != NULL && i < pages->len; i++) {
+            uint64_t off = (uint64_t)g_array_index(pages, uint32_t, i) *
+                           VR_KVM_PAGE;
+            uint8_t *page = ram + off;
+
+            if (page == buf + k || off + n > size ||
+                memcmp(page, orig + k, n) != 0) {
+                continue;
+            }
+            memcpy(page, buf + k, n);
+            flush_idcache_range((uintptr_t)page, (uintptr_t)page, n);
+            copies++;
+        }
+    }
+    info_report("  propagate: %u changed pages, %u with candidates (%u), "
+                "index %u keys", changed, hits, cands,
+                g_hash_table_size(vr_kvm_page_index));
+    return copies;
+}
+
+/* Patches the image at `hdr` (`len` bytes) and every other copy of its code */
+static void vr_kvm_patch_image(uint8_t *ram, uint64_t size,
+                               MachoHeader64 *hdr, uint64_t len, bool kernel)
+{
+    /*
+     * The image starts at its header (its text segment is its lowest); the
+     * patcher's own base, apple_boot_get_macho_buffer(), is rounded down.
+     */
+    uint8_t *buf = (uint8_t *)hdr;
+    g_autofree uint8_t *orig = NULL;
+    unsigned copies;
+
+    if (buf < ram || (uint64_t)(buf - ram) + len > size) {
+        warn_report("vresearch101: image at %p runs past RAM", hdr);
+        return;
+    }
+    orig = g_memdup2(buf, len);
+    if (kernel) {
+        ck_patch_virt(hdr);
+        ck_patch_virt_monitor(hdr);
+    } else {
+        ck_patch_virt_m1_monitor(hdr);
+    }
+    flush_idcache_range((uintptr_t)buf, (uintptr_t)buf, len);
+    copies = vr_kvm_propagate(ram, size, orig, buf, len);
+    info_report("vresearch101: patched %u more copies of its pages", copies);
+}
+
+static void vr_kvm_patch_images(CPUState *cs, uint32_t op0, uint32_t op1,
+                                uint32_t crn, uint32_t crm, uint32_t op2)
+{
+    MachineState *ms = MACHINE(vr_kvm_machine);
+    uint8_t *ram = memory_region_get_ram_ptr(ms->ram);
+    hwaddr ram_base = vr_kvm_machine->memmap[VR_MEM].base;
+    uint64_t skip_from = 0, skip_to = 0;
+
+    /* SPTM's SPRR (C1_x) and GXF (C8_x) setup at S3_6_C15 */
+    if (!(op1 == 6 && crn == 15 && (crm == 1 || crm == 8))) {
+        return;
+    }
+
+    /*
+     * The boot ROM, LLB and iBoot run unpatched, so they change SCTLR, the
+     * TTBRs and the PAC keys natively: GXF/PAC emulation can't track them and
+     * must stay out of the way until here. SPTM, TXM and XNU are patched
+     * below to make those changes through it. Read the vCPU's state while it
+     * is still a plain one, then hand the AP cores over.
+     */
+    if (!vr_kvm_managed) {
+        CPUState *other;
+
+        kvm_cpu_synchronize_state(cs);
+        CPU_FOREACH(other) {
+            if (ARM_CPU(other) != vr_kvm_machine->sep_cpu) {
+                apple_virt_manage_cpu(other);
+            }
+        }
+        vr_kvm_managed = true;
+    }
+
+    vr_kvm_index_ram(ram, ms->ram_size);
+
+    for (uint64_t off = 0; off + sizeof(MachoHeader64) <= ms->ram_size;
+         off += VR_KVM_SCAN_STEP) {
+        MachoHeader64 *hdr = (MachoHeader64 *)(ram + off);
+        uint64_t len;
+
+        if (off >= skip_from && off < skip_to) {
+            continue;
+        }
+        if (hdr->magic != MH_MAGIC_64 || hdr->cpu_type != MH_CPU_ARM64 ||
+            hdr->n_cmds == 0 || hdr->n_cmds > 512 ||
+            hdr->size_of_cmds > VR_KVM_MAX_CMDS_SIZE) {
+            continue;
+        }
+        len = vr_kvm_macho_span(hdr, ms->ram_size - off);
+        if (len == 0 || len > ms->ram_size - off) {
+            continue;
+        }
+        /*
+         * RAM holds iBoot's load buffers as well as the images it placed for
+         * SPTM, so patch every copy: the one that runs is among them.
+         */
+        if (hdr->file_type == MH_FT_FILESET) {
+            info_report("vresearch101: kernelcache at 0x%" HWADDR_PRIx
+                        " (%" PRIu64 " MiB), patching for KVM",
+                        ram_base + off, len / MiB);
+            vr_kvm_patch_image(ram, ms->ram_size, hdr, len, true);
+            vr_kvm_patched_kernel = true;
+            /* Its kexts' headers aren't images of their own. */
+            skip_from = off + VR_KVM_SCAN_STEP;
+            skip_to = off + len;
+        } else if (hdr->file_type == MH_FT_EXECUTE) {
+            bool sptm = vr_kvm_image_has((uint8_t *)hdr, len, "[SPTM]");
+            bool txm = vr_kvm_image_has((uint8_t *)hdr, len,
+                                        "TrustedExecutionMonitor");
+
+            if (sptm == txm) {
+                continue;
+            }
+            info_report("vresearch101: %s at 0x%" HWADDR_PRIx
+                        ", patching for KVM", sptm ? "SPTM" : "TXM",
+                        ram_base + off);
+            vr_kvm_patch_image(ram, ms->ram_size, hdr, len, false);
+            if (sptm) {
+                vr_kvm_patched_sptm = true;
+            } else {
+                vr_kvm_patched_txm = true;
+            }
+        }
+    }
+
+    g_clear_pointer(&vr_kvm_page_index, g_hash_table_destroy);
+    if (vr_kvm_patched_sptm && vr_kvm_patched_txm && vr_kvm_patched_kernel) {
+        kvm_arm_set_apple_sysreg_hook(NULL);
+    } else {
+        warn_report("vresearch101: at an Apple register write from 0x%" PRIx64
+                    " found SPTM %d, TXM %d, kernelcache %d; still looking",
+                    cpu_env(cs)->pc, vr_kvm_patched_sptm, vr_kvm_patched_txm,
+                    vr_kvm_patched_kernel);
+    }
+}
+
+/* Debug: prints the current vCPU's guest call stack (frame records) */
+void vr_debug_guest_stack(const char *tag)
+{
+    CPUARMState *env;
+    uint64_t fp, rec[2];
+
+    if (current_cpu == NULL) {
+        return;
+    }
+    env = cpu_env(current_cpu);
+    kvm_enabled() ? kvm_cpu_synchronize_state(current_cpu) : (void)0;
+    fprintf(stderr, "%s pc=0x%" PRIx64 " lr=0x%" PRIx64 "\n", tag, env->pc,
+            env->xregs[30] & 0xffffffffffULL);
+    fp = env->xregs[29];
+    for (int i = 0; i < 24 && fp; i++) {
+        if (cpu_memory_rw_debug(current_cpu, fp, rec, 16, false)) {
+            break;
+        }
+        fprintf(stderr, "  frame %d ret=0x%" PRIx64 "\n", i,
+                rec[1] & 0xffffffffffULL);
+        fp = rec[0];
+    }
+}
+
 static void create_sep(VResearchMachineState *vms)
 {
     MachineState *ms = MACHINE(vms);
@@ -994,6 +1290,18 @@ static void mach_vresearch_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, vms->memmap[VR_MEM].base,
                                 machine->ram);
+    if (kvm_enabled()) {
+        /*
+         * Apple's boot code maps DMA buffers non-cacheable, and an M1 host
+         * has no stage-2 forced write-back: keep QEMU's accesses to guest RAM
+         * coherent with it.
+         */
+        qemu_guest_ram_noncoherent = true;
+        /* Its SPTM and TXM name the GL1 registers the M1 way */
+        apple_virt_m1_gl_names = true;
+        vr_kvm_machine = vms;
+        kvm_arm_set_apple_sysreg_hook(vr_kvm_patch_images);
+    }
 
     create_gic(vms);
     create_gic_msi(vms);
@@ -1021,6 +1329,15 @@ static void mach_vresearch_init(MachineState *machine)
     create_sep(vms);
     create_sep_gic(vms);
     create_cfg(vms);
+
+    if (kvm_enabled()) {
+        CPUState *cs;
+
+        /* KVM refuses to run a vCPU whose PMU was requested but never set up */
+        CPU_FOREACH(cs) {
+            kvm_arm_pmu_init(ARM_CPU(cs));
+        }
+    }
 
     vms->powerdown_notifier.notify = vresearch_powerdown_req;
     qemu_register_powerdown_notifier(&vms->powerdown_notifier);
@@ -1134,6 +1451,18 @@ static void vresearch_set_serial(Object *obj, const char *value, Error **errp)
     vms->serial = g_strdup(value);
 }
 
+/*
+ * The largest IPA space KVM offers: GXF/PAC emulation keeps its shadow page
+ * tables and its TLB flush stub at the top of it (apple_virt_set_ops()).
+ */
+static int vresearch_kvm_type(MachineState *ms, const char *type_str)
+{
+    bool fixed_ipa;
+    int ipa = kvm_arm_get_max_vm_ipa_size(ms, &fixed_ipa);
+
+    return fixed_ipa ? 0 : KVM_VM_TYPE_ARM_IPA_SIZE(ipa);
+}
+
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1168,6 +1497,9 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     mc->possible_cpu_arch_ids = vresearch_possible_cpu_arch_ids;
     mc->cpu_index_to_instance_props = vresearch_cpu_index_to_props;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("apple-gxf");
+    /* Under KVM: GXF/SPRR and PAC emulation, both GICs in QEMU */
+    mc->kvm_apple_virt = true;
+    mc->kvm_type = vresearch_kvm_type;
     mc->get_default_cpu_node_id = vresearch_get_default_cpu_node_id;
     mc->default_ram_id = "mach-vresearch101.ram";
     mc->default_ram_size = 8 * GiB;

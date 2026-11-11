@@ -179,6 +179,10 @@ static void vblk_cmd(uint64_t devid, BlockBackend *blk, uint64_t gp_addr,
         r = blk_pread(blk, off, req.data.len, buf, 0);
         trace_bdif_vblk_read(devid == DEVID_AUX ? "aux" : "root",
                              req.data.addr, off, req.data.len, r);
+        /* Debug: BDIF_WHO=<disk offset> prints the guest stack that reads it */
+        if (getenv("BDIF_WHO") && off == strtoull(getenv("BDIF_WHO"), NULL, 0)) {
+            vr_debug_guest_stack("BDIF_WHO");
+        }
         if (r < 0) {
             goto out;
         }

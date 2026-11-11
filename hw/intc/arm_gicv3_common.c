@@ -32,6 +32,7 @@
 #include "gicv3_internal.h"
 #include "hw/arm/linux-boot-if.h"
 #include "system/kvm.h"
+#include "target/arm/kvm_arm.h"
 
 
 static void gicv3_gicd_no_migration_shift_bug_post_load(GICv3State *cs)
@@ -664,7 +665,7 @@ const char *gicv3_class_name(void)
     if (kvm_irqchip_in_kernel()) {
         return "kvm-arm-gicv3";
     } else {
-        if (kvm_enabled()) {
+        if (kvm_enabled() && !kvm_arm_gic_sysreg_to_user()) {
             error_report("Userspace GICv3 is not supported with KVM");
             exit(1);
         }

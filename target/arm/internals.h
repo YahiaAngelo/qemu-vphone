@@ -535,6 +535,12 @@ static inline bool arm_cpu_data_is_big_endian(CPUARMState *env)
     }
 }
 
+/*
+ * GEXIT: back from the current guarded level to where ASPSR_GL selects,
+ * without TCG's logging or hflags (vphone-linux, for GXF emulation).
+ */
+void aarch64_gxf_exit(CPUARMState *env);
+
 static inline void aarch64_save_sp(CPUARMState *env, int el)
 {
     if (env->pstate & PSTATE_SP) {

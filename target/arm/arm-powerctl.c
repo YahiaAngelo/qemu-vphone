@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/hw_accel.h"
 #include "cpu.h"
 #include "cpu-qom.h"
 #include "internals.h"
@@ -99,6 +100,12 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
     /* Finally set the power status */
     assert(bql_locked());
     target_cpu->power_state = PSCI_ON;
+
+    /*
+     * vphone-linux: with PSCI in QEMU under KVM (no in-kernel PSCI), the vCPU
+     * needs the state set up here, and its new power state, written back.
+     */
+    cpu_synchronize_post_reset(target_cpu_state);
 }
 
 int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,

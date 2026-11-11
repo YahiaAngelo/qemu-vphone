@@ -50,4 +50,7 @@ void vusb_unpop_host_msg(DeviceState *vusb, GByteArray *msg);
 /* A device to host message ({u8 code; u8 ep; data}). */
 void vusb_msg_to_host(DeviceState *vusb, const uint8_t *msg, uint32_t len);
 
+/* Debug: prints the current vCPU's guest call stack */
+void vr_debug_guest_stack(const char *tag);
+
 #endif /* HW_VMAPPLE_VMAPPLE_H */

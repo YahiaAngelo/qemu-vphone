@@ -124,3 +124,13 @@ bool kvm_arm_cpu_post_load(ARMCPU *cpu)
 {
     assert_not_reached();
 }
+
+bool kvm_arm_gic_sysreg_to_user(void)
+{
+    return false;
+}
+
+void kvm_arm_set_apple_sysreg_hook(KVMArmAppleSysregHook *hook)
+{
+}
+void vr_steptrace_start(CPUState *cs) {}

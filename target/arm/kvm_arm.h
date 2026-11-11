@@ -177,6 +177,22 @@ bool kvm_arm_aarch32_supported(void);
  */
 bool kvm_arm_pmu_supported(void);
 
+/*
+ * vphone-linux: whether the guest's GICv3 CPU interface accesses reach
+ * QEMU's GIC (KVM_CAP_ARM_GIC_SYSREG_TO_USER), for a machine with
+ * MachineClass::kvm_apple_virt.
+ */
+bool kvm_arm_gic_sysreg_to_user(void);
+
+/*
+ * vphone-linux: called before a trapped write to an Apple system register is
+ * emulated, so the machine can prepare images its firmware loaded (rewrite
+ * them for GXF/PAC emulation) before they run. NULL removes it.
+ */
+typedef void KVMArmAppleSysregHook(CPUState *cs, uint32_t op0, uint32_t op1,
+                                   uint32_t crn, uint32_t crm, uint32_t op2);
+void kvm_arm_set_apple_sysreg_hook(KVMArmAppleSysregHook *hook);
+
 /**
  * kvm_arm_sve_supported:
  *
@@ -207,6 +223,9 @@ bool kvm_arm_el2_supported(void);
  * Returns the number of bits in the IPA address space supported by KVM
  */
 int kvm_arm_get_max_vm_ipa_size(MachineState *ms, bool *fixed_ipa);
+
+/* Debug: VR_STEPTRACE=1 single-steps CPU 0 from here on, logging exceptions */
+void vr_steptrace_start(CPUState *cs);
 
 int kvm_arm_vgic_probe(void);
 

@@ -51,6 +51,7 @@
 #include "qemu/range.h"
 
 #include "hw/boards.h"
+#include "accel/accel-private.h"
 #include "system/stats.h"
 
 /* This check must be after config-host.h is included */
@@ -1665,6 +1666,54 @@ static void kvm_dirty_ring_reaper_init(KVMState *s)
                        s, QEMU_THREAD_JOINABLE);
 }
 
+/*
+ * vphone-linux (from ChefKiss Inferno): maps host memory at [ipa, ipa + size)
+ * of the guest outside of system memory, read-only unless `writable`. Used for
+ * the pages of other address spaces (the SEP's) and the GXF shadow pool.
+ */
+void kvm_map_ram(void *host, hwaddr ipa, uint64_t size, bool writable)
+{
+    KVMMemoryListener *kml = &kvm_state->memory_listener;
+    KVMSlot *mem;
+
+    kvm_slots_lock();
+    mem = kvm_alloc_slot(kml);
+    mem->as_id = kml->as_id;
+    mem->memory_size = size;
+    mem->start_addr = ipa;
+    mem->ram = host;
+    mem->flags = writable ? 0 : KVM_MEM_READONLY;
+    mem->guest_memfd = -1;
+    if (kvm_set_user_memory_region(kml, mem, true)) {
+        abort();
+    }
+    kml->nr_slots_used++;
+    kvm_slots_unlock();
+}
+
+void kvm_unmap_ram(hwaddr ipa, uint64_t size)
+{
+    KVMMemoryListener *kml = &kvm_state->memory_listener;
+    KVMSlot *mem;
+
+    kvm_slots_lock();
+    mem = kvm_lookup_matching_slot(kml, ipa, size);
+    if (mem != NULL) {
+        mem->memory_size = 0;
+        mem->flags = 0;
+        if (kvm_set_user_memory_region(kml, mem, false)) {
+            abort();
+        }
+        kml->nr_slots_used--;
+    }
+    kvm_slots_unlock();
+}
+
+static const AccelPrivateOps kvm_private_ops = {
+    .map = kvm_map_ram,
+    .unmap = kvm_unmap_ram,
+};
+
 static int kvm_dirty_ring_init(KVMState *s)
 {
     uint32_t ring_size = s->kvm_dirty_ring_size;
@@ -1762,6 +1811,13 @@ static void kvm_region_commit(MemoryListener *listener)
     if (QSIMPLEQ_EMPTY(&kml->transaction_add) &&
         QSIMPLEQ_EMPTY(&kml->transaction_del)) {
         return;
+    }
+
+    /* System memory now covers these: drop private mappings in the way. */
+    if (kml == &kvm_state->memory_listener) {
+        QSIMPLEQ_FOREACH(u1, &kml->transaction_add, next) {
+            accel_private_system_region_add(&u1->section);
+        }
     }
 
     /*
@@ -2774,6 +2830,8 @@ static int kvm_init(AccelState *as, MachineState *ms)
                                  &address_space_memory, 0, "kvm-memory");
     memory_listener_register(&kvm_io_listener,
                              &address_space_io);
+    accel_private_init(&kvm_private_ops);
+    kvm_arch_init_memory(ms, s);
 
     s->sync_mmu = !!kvm_vm_check_extension(kvm_state, KVM_CAP_SYNC_MMU);
     if (!s->sync_mmu) {
@@ -3216,7 +3274,13 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
-            address_space_rw(&address_space_memory,
+            /*
+             * A CPU may have an address space of its own (the SEP's): map
+             * its RAM in on first use, or emulate the access through it.
+             */
+            accel_private_map_page(cpu->as, run->mmio.phys_addr,
+                                   run->mmio.is_write);
+            address_space_rw(cpu->as,
                              run->mmio.phys_addr, attrs,
                              run->mmio.data,
                              run->mmio.len,

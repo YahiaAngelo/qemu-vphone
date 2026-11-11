@@ -9111,6 +9111,15 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     case EXCP_GENTER:
         addr = env->gxf.gxf_enter_el[new_el];
         genter = true;
+        if (getenv("VR_GXF_CALLS") && cs->cpu_index == 0) {
+            static unsigned n;
+            if (n++ < 40) {
+                fprintf(stderr, "GXF-CALL enter pc=0x%" PRIx64 " x16=0x%"
+                        PRIx64 " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%"
+                        PRIx64 "\n", env->pc, env->xregs[16], env->xregs[0],
+                        env->xregs[1], env->xregs[2]);
+            }
+        }
         env->gxf.esr_gl[new_el] = env->exception.syndrome;
         if (cs->cpu_index == 0 && (env->xregs[16] >> 48) != 0 &&
             __atomic_fetch_add(&gxf_enter_event_log, 1,
@@ -9993,4 +10002,26 @@ ARMSecuritySpace arm_security_space_below_el3(CPUARMState *env)
     } else {
         return ARMSS_NonSecure;
     }
+}
+
+void aarch64_gxf_exit(CPUARMState *env)
+{
+    int cur_el = arm_current_el(env);
+    uint32_t spsr = env->gxf.spsr_gl[cur_el];
+    bool return_to_gl = (env->gxf.aspsr_gl[cur_el] & 1) != 0;
+
+    aarch64_save_sp(env, cur_el);
+    if (arm_generate_debug_exceptions(env)) {
+        spsr &= ~PSTATE_SS;
+    }
+    spsr &= aarch64_pstate_valid_mask(&env_archcpu(env)->isar);
+    pstate_write(env, spsr);
+    if (!arm_singlestep_active(env)) {
+        env->pstate &= ~PSTATE_SS;
+    }
+    /* ASPSR_GL[0] selects whether GEXIT returns to GL or the ordinary EL. */
+    env->gxf.gxf_status_el[cur_el] =
+        (env->gxf.gxf_status_el[cur_el] & ~1ULL) | return_to_gl;
+    aarch64_restore_sp(env, cur_el);
+    env->pc = env->gxf.elr_gl[cur_el];
 }

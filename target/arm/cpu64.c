@@ -749,6 +749,15 @@ static void aarch64_apple_gxf_initfn(Object *obj)
     ARMCPU *cpu = ARM_CPU(obj);
 
     aarch64_max_initfn(obj);
+    set_feature(&ARM_CPU(obj)->env, ARM_FEATURE_GXF);
+    if (!tcg_enabled()) {
+        /*
+         * vphone-linux: under KVM the vCPU is the host's (an M1), whose ID
+         * registers KVM won't let us raise; GXF and Apple's PAC are emulated
+         * (target/arm/apple-virt.c), and iOS emulates CSSC itself.
+         */
+        return;
+    }
     SET_IDREG(&cpu->isar, ID_AA64ISAR1, REG_FIELD_DP64(GET_IDREG(&cpu->isar, ID_AA64ISAR1), ID_AA64ISAR1, APA, PauthFeat_2));
     /*
      * vphone-linux: FEAT_CSSC. The iOS 27 userland is built with the scalar
@@ -766,11 +775,7 @@ static void aarch64_apple_gxf_initfn(Object *obj)
     SET_IDREG(&cpu->isar, ID_AA64PFR1,
               REG_FIELD_DP64(GET_IDREG(&cpu->isar, ID_AA64PFR1), ID_AA64PFR1, BT, 0));
 
-    if (tcg_enabled()) {
-        object_property_set_bool(obj, "pauth-noop", true, NULL);
-    }
-
-    set_feature(&ARM_CPU(obj)->env, ARM_FEATURE_GXF);
+    object_property_set_bool(obj, "pauth-noop", true, NULL);
 }
 
 static const ARMCPUInfo aarch64_cpus[] = {
