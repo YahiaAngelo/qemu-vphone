@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/vphone-ev.h"
 
 #include "trace.h"
 #include "tcg/tcg.h"
@@ -255,7 +256,22 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s);
+
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+{
+    if (unlikely(vphone_ev_on)) {
+        uint64_t t0 = __builtin_ia32_rdtsc();
+        TranslationBlock *tb = tb_gen_code_inner(cpu, s);
+
+        vphone_ev(VEV_TB_GEN);
+        vphone_ev_add(VEV_TB_GEN_KCYC, (__builtin_ia32_rdtsc() - t0) / 1000);
+        return tb;
+    }
+    return tb_gen_code_inner(cpu, s);
+}
+
+static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s)
 {
     CPUArchState *env = cpu_env(cpu);
     TranslationBlock *tb, *existing_tb;

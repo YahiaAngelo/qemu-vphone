@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/vphone-ev.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "gdbstub/helpers.h"
@@ -634,6 +635,7 @@ static void cpsr_write_from_spsr_elx(CPUARMState *env,
 
 void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
 {
+    vphone_ev(VEV_ERET);
     ARMCPU *cpu = env_archcpu(env);
     int cur_el = arm_current_el(env);
     unsigned int spsr_idx = aarch64_banked_spsr_index(cur_el);
@@ -744,6 +746,7 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
             (env->gxf.gxf_status_el[0] & 1) != from_guarded) {
             env->gxf.gxf_status_el[0] =
                 (env->gxf.gxf_status_el[0] & ~1ULL) | from_guarded;
+            vphone_ev(VEV_GXF_ERET_FLUSH);
             tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
         }
         aarch64_restore_sp(env, new_el);
@@ -808,6 +811,7 @@ illegal_return:
 
 void HELPER(gexit)(CPUARMState *env)
 {
+    vphone_ev(VEV_GEXIT);
     int cur_el = arm_current_el(env);
     uint32_t spsr = env->gxf.spsr_gl[cur_el];
     bool return_to_gl = (env->gxf.aspsr_gl[cur_el] & 1) != 0;
