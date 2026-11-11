@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/vphone-ev.h"
+#include "qemu/vphone-ab.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-ops.h"
@@ -498,7 +499,7 @@ void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid, MMUIdxMap ng_map,
 
     vphone_ev(VEV_FLUSH_ASID);
     assert_cpu_is_self(cpu);
-    if (!vphone_asid_ng_on()) {
+    if (!vphone_asid_ng_on() || vphone_ab("asid_ng_off")) {
         tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
         return;
     }

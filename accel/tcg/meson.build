@@ -20,6 +20,7 @@ system_ss.add_all(tcg_ss)
 
 system_ss.add(files(
   'cputlb.c',
+  'vphone-ab.c',
   'icount-common.c',
   'monitor.c',
   'tcg-accel-ops.c',
