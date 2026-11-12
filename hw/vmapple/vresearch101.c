@@ -650,6 +650,33 @@ static void vr_kvm_patch_image(uint8_t *ram, uint64_t size,
     if (kernel) {
         ck_patch_virt(hdr);
         ck_patch_virt_monitor(hdr);
+        /*
+         * Debug (VR_CATCH_CORRUPT): the GXF_STATUS check's spin
+         * (`hvc #0x80ae; cmp x14, #0; b.ne .`) traps instead, so the first
+         * arrival with x14 nonzero is caught (target/arm/kvm.c, hvc 0x13ff).
+         */
+        if (getenv("VR_CATCH_CORRUPT")) {
+            static const uint32_t check[] = { 0xd41015c2, 0xf10001df, 0x54000001 };
+            unsigned n = 0;
+
+            for (uint64_t off = 0; off + sizeof(check) <= len; off += 4) {
+                if (!memcmp(buf + off, check, sizeof(check))) {
+                    stl_le_p(buf + off + 8, 0xd4000002 | (0x13ff << 5));
+                    n++;
+                }
+            }
+            info_report("vresearch101: trapped %u GXF_STATUS check spins", n);
+            /* and the instruction after each emulated eret, which nothing should reach */
+            n = 0;
+            for (uint64_t off = 0; off + 8 <= len; off += 4) {
+                if (ldl_le_p(buf + off) == (0xd4000002 | (0x1341 << 5)) &&
+                    ldl_le_p(buf + off + 4) == 0xd5033fdf) {
+                    stl_le_p(buf + off + 4, 0xd4000002 | (0x13fe << 5));
+                    n++;
+                }
+            }
+            info_report("vresearch101: trapped %u fall-throughs of emulated erets", n);
+        }
     } else {
         ck_patch_virt_m1_monitor(hdr);
     }

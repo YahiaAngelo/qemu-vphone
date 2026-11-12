@@ -144,7 +144,7 @@ static uint32_t ck_virt_vectors(CKPatcherRange* range, vaddr va, CKVirtFlags fla
     uint32_t entries = 0;
     bool     gic     = apple_virt_gic_interrupts();
 
-    if (!(flags & CK_VIRT_PAC) && !gic) { return 0; }
+    if (!(flags & CK_VIRT_PAC) && !gic && !getenv("VR_CATCH_CORRUPT")) { return 0; }
 
     for (vaddr off = -va & 0x7FF; off + 0x800 <= range->length; off += 0x800) {
         if (!ck_virt_is_vector_table(range->ptr + off, flags & CK_VIRT_UNMANAGED)) { continue; }
@@ -158,11 +158,45 @@ static uint32_t ck_virt_vectors(CKPatcherRange* range, vaddr va, CKVirtFlags fla
             if ((uint32_t)ldl_le_p(insn) != hvc && ck_virt_slot_insert(insn, hvc)) { ++entries; }
         }
 
+        // vphone-linux debug: VR_CATCH_CORRUPT also traps FIQs from the current EL (the timers), so the
+        // corruption catcher (target/arm/kvm.c) sees where they interrupt. The host does nothing for them.
+        // Slots 1 and 2 (IRQ and FIQ, SP0), 5 and 6 (IRQ and FIQ, SPx).
+        for (int slot = 1; getenv("VR_CATCH_CORRUPT") && !(flags & CK_VIRT_UNMANAGED) && slot < 7;
+             slot += (slot == 2 ? 3 : 1)) {
+            uint8_t* insn = range->ptr + off + slot * 0x80;
+            uint32_t hvc  = CK_VIRT_HVC(APPLE_VIRT_HVC_IRQ_ENTRY);
+
+            if ((uint32_t)ldl_le_p(insn) != hvc && ck_virt_slot_insert(insn, hvc)) { ++entries; }
+        }
+
+        // vphone-linux debug: and the synchronous exceptions from the current EL (slots 0 and 4).
+        for (int slot = 0; getenv("VR_CATCH_CORRUPT") && !(flags & CK_VIRT_UNMANAGED) && slot < 8; slot += 4) {
+            uint8_t* insn = range->ptr + off + slot * 0x80;
+            uint32_t hvc  = CK_VIRT_HVC(0x13fd);
+
+            if ((uint32_t)ldl_le_p(insn) != hvc && ck_virt_slot_insert(insn, hvc)) { ++entries; }
+        }
+
         // The branch moves one instruction down.
         for (int slot = 8; (flags & CK_VIRT_PAC) && slot < 12; slot++) {
             uint8_t* insn = range->ptr + off + slot * 0x80;
 
             if (gic && slot == 9) { continue; }
+            // vphone-linux debug (VR_CATCH_CORRUPT): `hvc 0x1340; hvc 0x13fc; b handler`, the host skipping the
+            // second, which only an entry that skipped the first reaches (target/arm/kvm.c).
+            if (getenv("VR_CATCH_CORRUPT") && !(flags & CK_VIRT_UNMANAGED) &&
+                (uint32_t)ldl_le_p(insn + 8) == NOP && (uint32_t)ldl_le_p(insn + 12) == NOP) {
+                // `isb` first when VR_VECTOR_ISB is set (a test of the first instruction after the entry).
+                int pre = getenv("VR_VECTOR_ISB") ? 1 : 0;
+                uint32_t b = ldl_le_p(insn);
+
+                stl_le_p(insn + 8 + pre * 4, 0x14000000 | ((b - 2 - pre) & 0x3FFFFFF));
+                stl_le_p(insn + 4 + pre * 4, CK_VIRT_HVC(0x13fc));
+                stl_le_p(insn + pre * 4, CK_VIRT_HVC(APPLE_VIRT_HVC_LOWER_ENTRY));
+                if (pre) { stl_le_p(insn, 0xD5033FDF); }
+                ++entries;
+                continue;
+            }
             stl_le_p(insn + 4, 0x14000000 | ((ldl_le_p(insn) - 1) & 0x3FFFFFF));
             stl_le_p(insn, CK_VIRT_HVC(APPLE_VIRT_HVC_LOWER_ENTRY));
             ++entries;

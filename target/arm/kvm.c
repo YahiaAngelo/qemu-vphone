@@ -11,6 +11,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/target_page.h"
 #include <sys/ioctl.h>
 
 #include <linux/kvm.h>
@@ -1402,8 +1403,344 @@ void kvm_arch_pre_run(CPUState *cs, struct kvm_run *run)
     }
 }
 
+/*
+ * Debug (VR_CATCH_CORRUPT=1): a ring of each vCPU's recent exits, dumped when
+ * the vCPU is found spinning on the kernel's GXF_STATUS check with Z clear
+ * (`hvc #0x80ae; cmp x14, #0; b.ne .` whose cmp can't have cleared Z).
+ */
+#define VR_CC_RING 512
+typedef struct {
+    uint32_t reason, imm;
+    uint64_t pc, pstate, x14, pc_after, pstate_after, x14_after;
+    uint64_t sp1, sp1_after, esp1, esp1_after;  /* hw SP_EL1, env->sp_el[1] */
+    uint64_t ns;    /* CLOCK_MONOTONIC at the exit */
+    uint64_t esr, elr, far;     /* for lower-EL entries */
+} VrCcEntry;
+static struct {
+    VrCcEntry ring[VR_CC_RING];
+    unsigned head;
+    bool dumped;
+} vr_cc[16];
+static uint64_t vr_cc_site;     /* the hvc #0x80ae's PC + 4, once seen */
+static void vr_cc_dump(CPUState *cs, const char *why);
+
+static uint64_t vr_cc_reg(CPUState *cs, uint64_t id)
+{
+    uint64_t v = 0;
+
+    kvm_get_one_reg(cs, id, &v);
+    return v;
+}
+
+
+/*
+ * Debug: each world's VBAR is fixed once the kernel runs, and so is SPTM's
+ * per-CPU TPIDR. Check that the vCPU holds the running world's and `env`
+ * the other's, on exit (`when` 0) and after the exit is handled (1).
+ */
+static uint64_t vr_kvbar, vr_gvbar, vr_gtpidr[16];
+static bool vr_cc_kernel[16];
+
+static void vr_cc_check(CPUState *cs, int when)
+{
+    CPUARMState *env = cpu_env(cs);
+    unsigned c = cs->cpu_index;
+    bool guarded;
+    uint64_t hvbar, htpidr, evbar, etpidr;
+    char why[256];
+
+    if (c >= 16 || !vr_cc_kernel[c] || vr_cc[c].dumped || cs->vcpu_dirty) {
+        return;
+    }
+    guarded = env->gxf.gxf_status_el[1] & 1;
+    /* EL1t (the kernel on SP_EL0) with SP_EL0 outside the kernel */
+    {
+        uint64_t ps = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+        uint64_t sp0 = vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp));
+
+        VrCcEntry *last = &vr_cc[c].ring[(vr_cc[c].head - 1) % VR_CC_RING];
+
+        /* XNU's return to EL0 sets SP to the user's just before its eret (hvc 0x1341) */
+        if ((ps & 0xf) == 4 && (sp0 >> 48) != 0xffff && sp0 && !(last->imm == 0x1341 && !when)) {
+            fprintf(stderr, "CATCH: cpu%u %s: EL1t on SP_EL0 0x%" PRIx64 " pc 0x%" PRIx64 " ps 0x%" PRIx64
+                    " guarded %d\n", c, when ? "after handling" : "on exit", sp0,
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)), ps, guarded);
+            vr_cc_dump(cs, "EL1t on a user SP_EL0");
+            return;
+        }
+    }
+    hvbar = vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 12, 0, 0));
+    htpidr = vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 13, 0, 4));
+    evbar = guarded ? env->cp15.vbar_el[1] : env->gxf.vbar_gl[1];
+    etpidr = guarded ? 0 : env->gxf.tpidr_gl[1];
+    if (guarded) {
+        etpidr = htpidr;
+        htpidr = 0;
+    }
+    /* learn: the kernel's VBAR and SPTM's VBAR and per-CPU TPIDR */
+    if (!vr_kvbar && !guarded) {
+        vr_kvbar = hvbar;
+        fprintf(stderr, "CHECK: kernel VBAR 0x%" PRIx64 "\n", hvbar);
+    }
+    if (!vr_gvbar && !guarded && evbar) {
+        vr_gvbar = evbar;
+        fprintf(stderr, "CHECK: SPTM VBAR 0x%" PRIx64 "\n", evbar);
+    }
+    if (!vr_gtpidr[c] && etpidr) {
+        vr_gtpidr[c] = etpidr;
+    }
+    why[0] = 0;
+    if (guarded) {
+        if (hvbar != vr_gvbar || evbar != vr_kvbar || etpidr != vr_gtpidr[c]) {
+            snprintf(why, sizeof(why), "guarded: hw VBAR 0x%" PRIx64 " (SPTM 0x%" PRIx64
+                     ") env kernel VBAR 0x%" PRIx64 " hw TPIDR 0x%" PRIx64 " (SPTM 0x%" PRIx64 ")",
+                     hvbar, vr_gvbar, evbar, etpidr, vr_gtpidr[c]);
+        }
+    } else if (hvbar != vr_kvbar || evbar != vr_gvbar || (vr_gtpidr[c] && etpidr != vr_gtpidr[c]) ||
+               htpidr == vr_gtpidr[c]) {
+        snprintf(why, sizeof(why), "unguarded: hw VBAR 0x%" PRIx64 " (kernel 0x%" PRIx64
+                 ") env SPTM VBAR 0x%" PRIx64 " env SPTM TPIDR 0x%" PRIx64 " (0x%" PRIx64
+                 ") hw TPIDR 0x%" PRIx64, hvbar, vr_kvbar, evbar, etpidr, vr_gtpidr[c], htpidr);
+    }
+    /*
+     * The kernel's SP_EL1 and SPTM's resting SP_GL1: log each change (the
+     * kernel on SP0, so SP_EL1 is at rest).
+     */
+    {
+        static uint64_t ksp1[16], gsp1[16];
+        static int logged;
+        uint64_t pstate = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+        uint64_t hsp1 = vr_cc_reg(cs, AARCH64_CORE_REG(sp_el1));
+        uint64_t k = guarded ? env->sp_el[1] : hsp1;
+        uint64_t g = guarded ? 0 : env->gxf.sp_gl[1];
+
+        if (guarded || !(pstate & 1)) {
+            if (ksp1[c] != k && logged < 60) {
+                logged++;
+                fprintf(stderr, "CHECK: cpu%u %s kernel SP_EL1 0x%" PRIx64 " -> 0x%" PRIx64
+                        " (%s, pstate 0x%" PRIx64 ", pc 0x%" PRIx64 ")\n", c,
+                        when ? "after" : "exit", ksp1[c], k, guarded ? "env" : "hw", pstate,
+                        vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)));
+                /* a settled kernel exception stack moving: dump how it happened */
+                if (ksp1[c] && (k >> 32) == (ksp1[c] >> 32) && !vr_cc[c].dumped) {
+                    ksp1[c] = k;
+                    vr_cc_dump(cs, "kernel SP_EL1 changed");
+                    return;
+                }
+            }
+            ksp1[c] = k;
+        }
+        if (!guarded && g) {
+            if (gsp1[c] != g && logged < 60) {
+                logged++;
+                fprintf(stderr, "CHECK: cpu%u %s SPTM SP_GL1 0x%" PRIx64 " -> 0x%" PRIx64 "\n",
+                        c, when ? "after" : "exit", gsp1[c], g);
+            }
+            gsp1[c] = g;
+        }
+    }
+    if (why[0]) {
+        fprintf(stderr, "CHECK: cpu%u %s %s\n", c, when ? "after handling" : "on exit", why);
+        vr_cc_dump(cs, "bank check failed");
+    }
+}
+
+
+/* debug: print how the hardware (shadows) and the guest's tables translate `va`, and the word at each */
+static void vr_print_xlat(CPUState *cs, const char *what, uint64_t va)
+{
+    extern bool apple_virt_debug_translate(CPUState *cs, uint64_t va, hwaddr *pa);
+    hwaddr hpa = 0, gpa;
+    uint32_t hw = 0, gw = 0;
+    bool hok = apple_virt_debug_translate(cs, va, &hpa);
+    MemTxAttrs attrs = {};
+
+    if (hok) {
+        hw = address_space_ldl_le(&address_space_memory, hpa, MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    gpa = arm_cpu_get_phys_page_attrs_debug(cs, va, &attrs);
+    if (gpa != -1) {
+        gpa |= va & (qemu_target_page_size() - 1);
+        gw = address_space_ldl_le(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    fprintf(stderr, "XLAT: cpu%d %s VA 0x%" PRIx64 ": hardware PA %s0x%" HWADDR_PRIx " word 0x%08x;"
+            " guest PA 0x%" HWADDR_PRIx " word 0x%08x\n", cs->cpu_index, what, va, hok ? "" : "(failed) ",
+            hpa, hw, gpa, gw);
+}
+
+/* debug: each vCPU's registers at its last hvc #0x1340 exit (x0-x30, sp, pc, pstate) */
+static struct { uint64_t r[34]; uint64_t ns; bool valid; } vr_snap[16];
+
+static void vr_snap_regs(CPUState *cs, uint64_t *r)
+{
+    for (int i = 0; i < 31; i++) {
+        r[i] = vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[i]));
+    }
+    r[31] = vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp));
+    r[32] = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc));
+    r[33] = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+}
+
+static void vr_cc_post_run(CPUState *cs, struct kvm_run *run)
+{
+    VrCcEntry *e;
+    unsigned c = cs->cpu_index;
+
+    if (c >= 16) {
+        return;
+    }
+    if (cs->vcpu_dirty) {
+        static int told;
+        VrCcEntry *last = &vr_cc[c].ring[(vr_cc[c].head - 1) % VR_CC_RING];
+
+        if (told++ < 20) {
+            fprintf(stderr, "DIRTY-AT-EXIT: cpu%u exit reason %u nr 0x%llx; previous exit reason %u imm 0x%x"
+                    " pc 0x%" PRIx64 " -> 0x%" PRIx64 "\n", c, run->exit_reason,
+                    run->exit_reason == KVM_EXIT_HYPERCALL ? (unsigned long long)run->hypercall.nr : 0ULL,
+                    last->reason, last->imm, last->pc, last->pc_after);
+        }
+        return;
+    }
+    e = &vr_cc[c].ring[vr_cc[c].head++ % VR_CC_RING];
+    memset(e, 0, sizeof(*e));
+    e->reason = run->exit_reason;
+    {
+        struct timespec ts;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        e->ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+    e->imm = run->exit_reason == KVM_EXIT_HYPERCALL ? run->hypercall.nr : 0;
+    e->pc = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc));
+    e->pstate = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+    e->x14 = vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[14]));
+    e->sp1 = vr_cc_reg(cs, AARCH64_CORE_REG(sp_el1));
+    e->esp1 = cpu_env(cs)->sp_el[1];
+    if (e->imm == 0x80ae && !vr_cc_site) {
+        vr_cc_site = e->pc;     /* the PC is already past the hvc */
+        fprintf(stderr, "CATCH: GXF_STATUS check at 0x%" PRIx64 "\n", e->pc - 4);
+    }
+    if (e->imm == 0x80ae) {
+        vr_cc_kernel[c] = true;
+    }
+    if (e->imm == 0x1340 || e->imm == 0x13fc) {
+        e->esr = vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 5, 2, 0));
+        e->elr = vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1));
+        e->far = vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 6, 0, 0));
+    }
+    if (e->imm == 0x1340 && c < 16) {
+        vr_snap_regs(cs, vr_snap[c].r);
+        vr_snap[c].ns = e->ns;
+        vr_snap[c].valid = true;
+    }
+    if (vr_cc_site) {
+        vr_cc_check(cs, 0);
+    }
+    if (vr_cc_site && e->pc == vr_cc_site + 4 && !(e->pstate & PSTATE_Z) &&
+        !vr_cc[c].dumped) {
+        vr_cc_dump(cs, "stuck");
+    }
+}
+
+static void vr_cc_dump(CPUState *cs, const char *why)
+{
+    unsigned c = cs->cpu_index;
+
+    {
+        vr_cc[c].dumped = true;
+        {
+            /* stop the kernel's trace here (debug, if tracing_on is writable) */
+            int fd = open("/sys/kernel/tracing/tracing_on", O_WRONLY);
+
+            if (fd >= 0) {
+                if (write(fd, "0", 1) < 0) {
+                    /* ignore */
+                }
+                close(fd);
+            }
+        }
+        fprintf(stderr, "CATCH: cpu%u (tid %d) %s; its last exits (oldest first):\n", c,
+                (int)qemu_get_thread_id(), why);
+        for (unsigned i = 0; i < VR_CC_RING; i++) {
+            VrCcEntry *r = &vr_cc[c].ring[(vr_cc[c].head + i) % VR_CC_RING];
+
+            if (r->pc == 0) {
+                continue;
+            }
+            fprintf(stderr, "  t %llu.%06llu", (unsigned long long)(r->ns / 1000000000ULL),
+                    (unsigned long long)(r->ns % 1000000000ULL / 1000));
+            fprintf(stderr, "  reason %2u imm %04x pc %016" PRIx64 " ps %08" PRIx64
+                    " x14 %" PRIx64 " sp1 %" PRIx64 "/%" PRIx64 " -> pc %016" PRIx64 " ps %08" PRIx64
+                    " x14 %" PRIx64 " sp1 %" PRIx64 "/%" PRIx64 "\n",
+                    r->reason, r->imm, r->pc, r->pstate, r->x14, r->sp1, r->esp1, r->pc_after,
+                    r->pstate_after, r->x14_after, r->sp1_after, r->esp1_after);
+            if (r->esr || r->elr) {
+                fprintf(stderr, "      esr %" PRIx64 " elr %" PRIx64 " far %" PRIx64 "\n", r->esr, r->elr, r->far);
+            }
+        }
+    }
+}
+
+/* After an exit is handled: what the vCPU resumes with */
+static void vr_cc_after(CPUState *cs)
+{
+    unsigned c = cs->cpu_index;
+    VrCcEntry *e;
+    CPUARMState *env = cpu_env(cs);
+
+    if (c >= 16 || !getenv("VR_CATCH_CORRUPT")) {
+        return;
+    }
+    e = &vr_cc[c].ring[(vr_cc[c].head - 1) % VR_CC_RING];
+    if (cs->vcpu_dirty) {
+        e->pc_after = env->pc;
+        e->pstate_after = pstate_read(env);
+        e->x14_after = env->xregs[14];
+    } else {
+        e->pc_after = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc));
+        e->pstate_after = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+        e->x14_after = vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[14]));
+    }
+    e->sp1_after = cs->vcpu_dirty ? 0 : vr_cc_reg(cs, AARCH64_CORE_REG(sp_el1));
+    e->esp1_after = env->sp_el[1];
+    /*
+     * Pair each genter with the kernel world's resumption: same PC, mode and
+     * SP_EL0 (which the worlds share), or report it.
+     */
+    if (!cs->vcpu_dirty) {
+        static uint64_t gpc[16], gps[16], gsp0[16];
+        static int told;
+
+        if ((e->imm & 0xfff8) == 0x1420) {
+            gpc[c] = e->pc;
+            gps[c] = e->pstate;
+            gsp0[c] = vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp));
+        } else if ((e->imm == 0x1400 || e->imm == 0x1300) && gpc[c] &&
+                   e->pc_after != 0xfc0000000ULL && !(env->gxf.gxf_status_el[1] & 1)) {
+            uint64_t sp0 = vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp));
+
+            /* the kernel resumed on SP_EL0 that isn't a kernel stack */
+            if ((e->pstate_after & 0xf) == 4 && (sp0 >> 48) != 0xffff && told++ < 10) {
+                fprintf(stderr, "CATCH: cpu%u bad world return: last genter at 0x%" PRIx64 " ps 0x%" PRIx64
+                        " sp0 0x%" PRIx64 " -> resumed at 0x%" PRIx64 " ps 0x%" PRIx64 " sp0 0x%" PRIx64 "\n",
+                        c, gpc[c], gps[c], gsp0[c], e->pc_after, e->pstate_after, sp0);
+                if (!vr_cc[c].dumped) {
+                    vr_cc_dump(cs, "kernel resumed on a user SP_EL0");
+                }
+            }
+        }
+    }
+    if (vr_cc_site) {
+        vr_cc_check(cs, 1);
+    }
+}
+
 MemTxAttrs kvm_arch_post_run(CPUState *cs, struct kvm_run *run)
 {
+    if (getenv("VR_CATCH_CORRUPT")) {
+        vr_cc_post_run(cs, run);
+    }
+
     ARMCPU *cpu;
     uint32_t switched_level;
 
@@ -1717,6 +2054,214 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
         kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pc), &pc);
         fprintf(stderr, "HVC %04x pc=0x%" PRIx64 "\n", imm, pc);
     }
+    if (imm == 0x1342 && vr_cc_site && getenv("VR_CATCH_CORRUPT") &&
+        cs->cpu_index < 16 && !vr_cc[cs->cpu_index].dumped) {
+        /* debug: an IRQ taken at the GXF_STATUS check with x14 still nonzero */
+        uint64_t elr = vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1));
+        uint64_t x14 = vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[14]));
+
+        if ((elr == vr_cc_site || elr == vr_cc_site + 4) && x14) {
+            fprintf(stderr, "CATCH: cpu%d interrupted at 0x%" PRIx64 " with x14 0x%" PRIx64 "\n",
+                    cs->cpu_index, elr, x14);
+            vr_cc_dump(cs, "IRQ at the check");
+        }
+    }
+    if (imm == 0x1424 && getenv("VR_CATCH_CORRUPT")) {
+        /* debug: the kernel's panic call into SPTM; the exception that led to it is still in the EL1 bank */
+        static int told;
+
+        if (told++ < 6) {
+            fprintf(stderr, "CATCH: cpu%d genter 0x1424 at 0x%" PRIx64 " pstate 0x%" PRIx64
+                    ": ELR_EL1 0x%" PRIx64 " SPSR_EL1 0x%" PRIx64 " ESR_EL1 0x%" PRIx64
+                    " FAR_EL1 0x%" PRIx64 " SP_EL0 0x%" PRIx64 " SP_EL1 0x%" PRIx64 "\n",
+                    cs->cpu_index, vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate)),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1)), vr_cc_reg(cs, AARCH64_CORE_REG(spsr[KVM_SPSR_EL1])),
+                    vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 5, 2, 0)), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 6, 0, 0)),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp)), vr_cc_reg(cs, AARCH64_CORE_REG(sp_el1)));
+        }
+    }
+    if (imm == 0x13fc) {
+        /* debug: a lower-EL entry that skipped its hvc #0x1340; report, then do what it would have */
+        extern void apple_virt_debug_pac_el1(CPUState *cs);
+        static int told;
+
+        if (told < 20 && cs->cpu_index < 16 && vr_snap[cs->cpu_index].valid) {
+            uint64_t now[34];
+            int same = 0;
+            char diff[512] = "";
+            size_t dl = 0;
+
+            vr_snap_regs(cs, now);
+            for (int i = 0; i < 34; i++) {
+                if (now[i] == vr_snap[cs->cpu_index].r[i]) {
+                    same++;
+                } else if (dl < sizeof(diff) - 40) {
+                    dl += snprintf(diff + dl, sizeof(diff) - dl, " r%d:%" PRIx64 "->%" PRIx64, i,
+                                   vr_snap[cs->cpu_index].r[i], now[i]);
+                }
+            }
+            fprintf(stderr, "SNAP: cpu%d vs its last 0x1340 exit (%" PRIu64 " us ago): %d of 34 same;%s\n",
+                    cs->cpu_index, (vr_cc[cs->cpu_index].ring[(vr_cc[cs->cpu_index].head - 1) % VR_CC_RING].ns -
+                                    vr_snap[cs->cpu_index].ns) / 1000, same, diff);
+        }
+        if (told < 6) {
+            uint64_t elr = vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1));
+
+            fprintf(stderr, "USER: cpu%d x16 0x%" PRIx64 " x0 0x%" PRIx64 " x1 0x%" PRIx64 " x30 0x%" PRIx64 "\n",
+                    cs->cpu_index, vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[16])),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[0])), vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[1])),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[30])));
+            for (int i = -4; i <= 2; i++) {
+                char what[32];
+
+                snprintf(what, sizeof(what), "ELR%+d", i * 4);
+                vr_print_xlat(cs, what, elr + i * 4);
+            }
+        }
+        if (told++ < 20) {
+            fprintf(stderr, "CATCH: cpu%d lower-EL entry skipped its hvc: pc 0x%" PRIx64 " ps 0x%" PRIx64
+                    " ELR 0x%" PRIx64 " SPSR 0x%" PRIx64 " ESR 0x%" PRIx64 " FAR 0x%" PRIx64 "\n",
+                    cs->cpu_index, vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate)),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1)), vr_cc_reg(cs, AARCH64_CORE_REG(spsr[KVM_SPSR_EL1])),
+                    vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 5, 2, 0)), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 6, 0, 0)));
+            if (told == 1 && cs->cpu_index < 16) {
+                vr_cc[cs->cpu_index].dumped = false;
+                vr_cc_dump(cs, "lower-EL entry skipped its hvc");
+            }
+        }
+        apple_virt_debug_pac_el1(cs);
+        return 0;
+    }
+    if (imm == 0x13fd) {
+        /* debug: a synchronous exception from EL1 (VR_CATCH_CORRUPT); report one from a user PC */
+        uint64_t elr = vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1));
+        static int told;
+
+        uint64_t vbar = vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 12, 0, 0));
+        uint64_t pcx = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc));
+        bool spx = pcx - vbar == 0x204;      /* slot 4: sync from EL1 on SP_EL1 */
+
+        if (((elr >> 48) != 0xffff || (spx && vr_cc_site)) && told++ < 10) {
+            fprintf(stderr, "CATCH: cpu%d EL1 sync exception (%s): ELR 0x%" PRIx64 " SPSR 0x%" PRIx64
+                    " ESR 0x%" PRIx64 " FAR 0x%" PRIx64 " SP_EL0 0x%" PRIx64 " VBAR 0x%" PRIx64 " TPIDR 0x%" PRIx64
+                    " status 0x%" PRIx64 "\n", cs->cpu_index, spx ? "SPx" : "user PC", elr,
+                    vr_cc_reg(cs, AARCH64_CORE_REG(spsr[KVM_SPSR_EL1])), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 5, 2, 0)),
+                    vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 6, 0, 0)), vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp)),
+                    vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 12, 0, 0)), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 13, 0, 4)),
+                    cpu_env(cs)->gxf.gxf_status_el[1]);
+            {
+                uint64_t vb = vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 12, 0, 0));
+
+                vr_print_xlat(cs, "VBAR+0x400 (EL0 sync slot)", vb + 0x400);
+                vr_print_xlat(cs, "VBAR+0x404", vb + 0x404);
+                vr_print_xlat(cs, "VBAR+0x200 (EL1 sync SPx slot)", vb + 0x200);
+            }
+            if (told == 1 && cs->cpu_index < 16) {
+                vr_cc[cs->cpu_index].dumped = false;
+                vr_cc_dump(cs, "EL1 sync exception");
+            }
+        }
+        return 0;
+    }
+    if (imm == 0x13fe) {
+        /* debug: execution fell through an emulated eret (VR_CATCH_CORRUPT) */
+        static int told;
+
+        if (told++ < 20) {
+            unsigned c = cs->cpu_index < 16 ? cs->cpu_index : 0;
+            VrCcEntry *last = NULL;
+
+            for (unsigned i = 1; i <= VR_CC_RING; i++) {
+                VrCcEntry *r = &vr_cc[c].ring[(vr_cc[c].head - i) % VR_CC_RING];
+
+                if (r->imm == 0x1341) {
+                    last = r;
+                    break;
+                }
+            }
+            fprintf(stderr, "CATCH: cpu%d fell through an eret: pc 0x%" PRIx64 " ps 0x%" PRIx64
+                    " ELR_EL1 0x%" PRIx64 " SPSR_EL1 0x%" PRIx64 "; last 0x1341 exit wrote pc 0x%" PRIx64
+                    " ps 0x%" PRIx64 " (%u exits ago)\n", cs->cpu_index,
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)), vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate)),
+                    vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1)), vr_cc_reg(cs, AARCH64_CORE_REG(spsr[KVM_SPSR_EL1])),
+                    last ? last->pc_after : 0, last ? last->pstate_after : 0,
+                    last ? (unsigned)(vr_cc[c].ring[(vr_cc[c].head - 1) % VR_CC_RING].ns - last->ns) / 1000 : 0);
+            if (told == 1 && cs->cpu_index < 16) {
+                vr_cc[cs->cpu_index].dumped = false;
+                vr_cc_dump(cs, "fell through an eret");
+            }
+        }
+        /* redo it */
+        if (apple_virt_handle_hvc_fast(cs, 0x1341)) {
+            return 0;
+        }
+    }
+    if (imm == 0x13ff) {
+        /* debug: the GXF_STATUS check's spin, trapped (VR_CATCH_CORRUPT) */
+        uint64_t pstate = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+
+        static int bad13ff;
+
+        if (!(pstate & PSTATE_Z) && bad13ff++ < 3) {
+            static const struct { const char *n; uint64_t id; } sr[] = {
+                { "ELR_EL1", AARCH64_CORE_REG(elr_el1) },
+                { "SPSR_EL1", AARCH64_CORE_REG(spsr[KVM_SPSR_EL1]) },
+                { "ESR_EL1", ARM64_SYS_REG(3, 0, 5, 2, 0) },
+                { "FAR_EL1", ARM64_SYS_REG(3, 0, 6, 0, 0) },
+                { "TPIDR_EL1", ARM64_SYS_REG(3, 0, 13, 0, 4) },
+                { "VBAR_EL1", ARM64_SYS_REG(3, 0, 12, 0, 0) },
+            };
+
+            fprintf(stderr, "CATCH: cpu%d arrived at the check's spin with Z clear: pc 0x%" PRIx64
+                    " pstate 0x%" PRIx64 " sp 0x%" PRIx64 " sp_el1 0x%" PRIx64 " status 0x%" PRIx64 "\n",
+                    cs->cpu_index, vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)), pstate,
+                    vr_cc_reg(cs, AARCH64_CORE_REG(regs.sp)), vr_cc_reg(cs, AARCH64_CORE_REG(sp_el1)),
+                    cpu_env(cs)->gxf.gxf_status_el[1]);
+            for (int i = 0; i < 31; i++) {
+                fprintf(stderr, "%sx%-2d %016" PRIx64, i % 4 ? "  " : "\n  ", i,
+                        vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[i])));
+            }
+            {
+                extern bool apple_virt_debug_translate(CPUState *cs, uint64_t va, hwaddr *pa);
+                uint64_t va = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)) - 12;     /* the hvc #0x80ae */
+                hwaddr hpa = 0, gpa = 0;
+                uint32_t hw = 0, gw = 0;
+                bool hok = apple_virt_debug_translate(cs, va, &hpa);
+                ARMCPU *acpu = ARM_CPU(cs);
+                MemTxAttrs attrs = {};
+
+                if (hok) {
+                    hw = address_space_ldl_le(&address_space_memory, hpa, MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+                gpa = arm_cpu_get_phys_page_attrs_debug(CPU(acpu), va, &attrs);
+                if (gpa != -1) {
+                    gpa |= va & (qemu_target_page_size() - 1);
+                    gw = address_space_ldl_le(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, NULL);
+                }
+                fprintf(stderr, "\n  hvc VA 0x%" PRIx64 ": hardware/shadow PA %s0x%" HWADDR_PRIx " word 0x%08x;"
+                        " guest-table PA 0x%" HWADDR_PRIx " word 0x%08x", va, hok ? "" : "(failed) ", hpa, hw,
+                        gpa, gw);
+            }
+            fprintf(stderr, "\n ");
+            for (int i = 0; i < ARRAY_SIZE(sr); i++) {
+                fprintf(stderr, " %s %016" PRIx64, sr[i].n, vr_cc_reg(cs, sr[i].id));
+            }
+            fprintf(stderr, "\n");
+            if (cs->cpu_index < 16) {
+                vr_cc[cs->cpu_index].dumped = false;
+                vr_cc_dump(cs, "bad arrival");
+            }
+        }
+        if (!(pstate & PSTATE_Z)) {
+            /* spin as the original `b.ne .` would: back to this hvc */
+            uint64_t pc = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)) - 4;
+
+            kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.pc), &pc);
+        }
+        return 0;
+    }
     if (apple_virt_handle_hvc_fast(cs, imm)) {
         vr_steptrace_maybe_start(cs, imm);
         if (imm == 0x80ae && getenv("VR_DEBUG_STATUS")) { /* debug */
@@ -1944,6 +2489,7 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
                       __func__, run->exit_reason);
         break;
     }
+    vr_cc_after(cs);
     return ret;
 }
 
@@ -2583,6 +3129,25 @@ int kvm_arch_put_registers(CPUState *cs, int level, Error **errp)
         aarch64_sync_32_to_64(env);
     }
 
+    if (getenv("VR_CATCH_CORRUPT")) {
+        /* debug: a put that moves the vCPU somewhere other than where KVM has it */
+        static int told;
+        uint64_t kpc = 0, kps = 0, kx14 = 0;
+
+        kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pc), &kpc);
+        kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pstate), &kps);
+        kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.regs[14]), &kx14);
+        if (vr_cc_site && level != KVM_PUT_FULL_STATE &&
+            (((kps & 0xf) == 0 && (pstate_read(env) & 0xf) != 0) ||
+             (kpc == env->pc && kx14 != env->xregs[14])) && told++ < 30) {
+            fprintf(stderr, "PUT-REWIND: cpu%d level %d dirty %d: KVM pc 0x%" PRIx64 " ps 0x%" PRIx64
+                    " x14 0x%" PRIx64 " <- env pc 0x%" PRIx64 " ps 0x%x x14 0x%" PRIx64
+                    " (callers %p %p %p)\n", cs->cpu_index, level, cs->vcpu_dirty, kpc, kps, kx14,
+                    env->pc, pstate_read(env), env->xregs[14], __builtin_return_address(0),
+                    __builtin_return_address(1), __builtin_return_address(2));
+        }
+    }
+
     for (i = 0; i < 31; i++) {
         ret = kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.regs[i]),
                               &env->xregs[i]);
@@ -3071,10 +3636,22 @@ static uint64_t kvm_virt_reg_id(AppleVirtReg reg)
     }
 }
 
+/* debug: a direct KVM register access while QEMU's copy is newer (vcpu_dirty) is lost or stale */
+static void vr_dirty_access(CPUState *cs, const char *what, void *caller)
+{
+    static int reported;
+
+    if (cs->vcpu_dirty && qatomic_fetch_inc(&reported) < 20) {
+        fprintf(stderr, "DIRTY: cpu%d %s from %p (offset 0x%lx)\n", cs->cpu_index, what,
+                caller, (unsigned long)((uintptr_t)caller - (uintptr_t)&vr_dirty_access));
+    }
+}
+
 static uint64_t kvm_virt_get_xreg(CPUState *cs, int n)
 {
     uint64_t value;
 
+    vr_dirty_access(cs, "get_xreg", __builtin_return_address(0));
     if (kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.regs[n]), &value)) {
         abort();
     }
@@ -3083,6 +3660,7 @@ static uint64_t kvm_virt_get_xreg(CPUState *cs, int n)
 
 static void kvm_virt_set_xreg(CPUState *cs, int n, uint64_t value)
 {
+    vr_dirty_access(cs, "set_xreg", __builtin_return_address(0));
     if (kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.regs[n]), &value)) {
         abort();
     }
@@ -3090,6 +3668,7 @@ static void kvm_virt_set_xreg(CPUState *cs, int n, uint64_t value)
 
 static void kvm_virt_get_qreg(CPUState *cs, int n, uint64_t value[2])
 {
+    vr_dirty_access(cs, "get_qreg", __builtin_return_address(0));
     if (kvm_get_one_reg(cs, AARCH64_SIMD_CORE_REG(fp_regs.vregs[n]), value)) {
         abort();
     }
@@ -3099,6 +3678,7 @@ static uint64_t kvm_virt_get_reg(CPUState *cs, AppleVirtReg reg)
 {
     uint64_t value;
 
+    vr_dirty_access(cs, "get_reg", __builtin_return_address(0));
     if (kvm_get_one_reg(cs, kvm_virt_reg_id(reg), &value)) {
         abort();
     }
@@ -3107,6 +3687,7 @@ static uint64_t kvm_virt_get_reg(CPUState *cs, AppleVirtReg reg)
 
 static void kvm_virt_set_reg(CPUState *cs, AppleVirtReg reg, uint64_t value)
 {
+    vr_dirty_access(cs, "set_reg", __builtin_return_address(0));
     if (kvm_set_one_reg(cs, kvm_virt_reg_id(reg), &value)) {
         abort();
     }
@@ -3268,8 +3849,8 @@ static bool vr_steptrace_step(CPUState *cs)
     }
     vr_st.last_esr = esr;
     kvm_get_one_reg(cs, ARM64_SYS_REG(3, 0, 6, 0, 0), &far);
-    kvm_get_one_reg(cs, ARM64_SYS_REG(3, 0, 4, 0, 1), &elr);
-    kvm_get_one_reg(cs, ARM64_SYS_REG(3, 0, 4, 0, 0), &spsr);
+    kvm_get_one_reg(cs, AARCH64_CORE_REG(elr_el1), &elr);
+    kvm_get_one_reg(cs, AARCH64_CORE_REG(spsr[KVM_SPSR_EL1]), &spsr);
     kvm_get_one_reg(cs, ARM64_SYS_REG(3, 0, 12, 0, 0), &vbar);
     fprintf(stderr, "STEPTRACE: exception after %" PRIu64 " steps: pc=0x%"
             PRIx64 " esr=0x%" PRIx64 " far=0x%" PRIx64 " elr=0x%" PRIx64

@@ -239,7 +239,15 @@ static hwaddr gxf_pool_alloc(void)
 {
     hwaddr pa;
 
-    if (g_queue_get_length(&virt.pool_free) < GXF_POOL_AGED && virt.pool_cursor + GXF_PAGE_SIZE <= virt.pool_end) {
+    static long aged = -1;
+
+    // vphone-linux debug: VR_POOL_AGED overrides how many freed tables wait before reuse.
+    if (aged < 0) {
+        const char* e = getenv("VR_POOL_AGED");
+
+        aged = e ? strtol(e, NULL, 0) : GXF_POOL_AGED;
+    }
+    if (g_queue_get_length(&virt.pool_free) < (guint)aged && virt.pool_cursor + GXF_PAGE_SIZE <= virt.pool_end) {
         pa                = virt.pool_cursor;
         virt.pool_cursor += GXF_PAGE_SIZE;
     }
@@ -718,7 +726,7 @@ static void gxf_flush_tlb(AppleVirtCPU* c, GXFWorld* w, bool broadcast)
     w->sctlr &= ~SCTLR_M;
     if (extract32(w->pstate, 2, 2) == 0) { w->pstate = deposit32(w->pstate, 0, 4, PSTATE_MODE_EL1h); }
     w->pstate |= PSTATE_DAIF;
-    w->pc      = virt.stub + (broadcast ? 0x10 : 0);
+    w->pc      = virt.stub + (broadcast ? 0x18 : 0);
 }
 
 static void gxf_update_world_regs(CPUARMState* env, AppleVirtCPU* c, GXFWorld* w, bool force_flush)
@@ -1025,8 +1033,11 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
         return false;
     }
     // The synchronous exception slot of a lower AArch64 EL, after the `hvc`.
-    if (virt.ops->get_reg(cs, APPLE_VIRT_REG_PC) != virt.ops->get_reg(cs, APPLE_VIRT_REG_VBAR_EL1) + 0x404) {
-        return false;
+    {
+        uint64_t off = virt.ops->get_reg(cs, APPLE_VIRT_REG_PC) - virt.ops->get_reg(cs, APPLE_VIRT_REG_VBAR_EL1);
+
+        // vphone-linux debug: 0x408 with VR_VECTOR_ISB's `isb` in front of the `hvc`.
+        if (off != 0x404 && off != 0x408) { return false; }
     }
     spsr = virt.ops->get_reg(cs, APPLE_VIRT_REG_SPSR_EL1);
     elr  = virt.ops->get_reg(cs, APPLE_VIRT_REG_ELR_EL1);
@@ -1366,8 +1377,13 @@ bool apple_virt_handle_hvc_fast(CPUState* cs, uint16_t imm)
         return true;
     }
     if (imm == APPLE_VIRT_HVC_LOWER_ENTRY) {
+        static int skip = -1;
+
         if (virt_el0_sprr_fast(cs, env, c)) { return true; }
         pac_load(cs, env, c, 1);
+        // vphone-linux debug: step over the `hvc 0x13fc` behind it (see `ck_virt_vectors`).
+        if (skip < 0) { skip = getenv("VR_CATCH_CORRUPT") != NULL; }
+        if (skip) { virt.ops->set_reg(cs, APPLE_VIRT_REG_PC, virt.ops->get_reg(cs, APPLE_VIRT_REG_PC) + 4); }
         return true;
     }
     if (imm == APPLE_VIRT_HVC_IRQ_LOWER) {
@@ -1828,6 +1844,14 @@ static bool gxf_live_translate(CPUState* cs, uint64_t va, hwaddr* pa)
     return false;
 }
 
+// vphone-linux debug: install the kernel's PAC keys, as a lower-EL entry does.
+void apple_virt_debug_pac_el1(CPUState* cs);
+void apple_virt_debug_pac_el1(CPUState* cs) { pac_load(cs, cpu_env(cs), virt_cpu(cs), 1); }
+
+// vphone-linux debug: translate `va` as the vCPU's hardware does (through the shadows).
+bool apple_virt_debug_translate(CPUState* cs, uint64_t va, hwaddr* pa);
+bool apple_virt_debug_translate(CPUState* cs, uint64_t va, hwaddr* pa) { return gxf_live_translate(cs, va, pa); }
+
 static bool gxf_fetch_insn(GXFStore* st, uint64_t pc, uint32_t* insn)
 {
     hwaddr pa;
@@ -2003,7 +2027,7 @@ void apple_virt_sync_begin(CPUState* cs)
     c->guest_sctlr        = env->cp15.sctlr_el[1];
     env->cp15.sctlr_el[1] = pac_hw_sctlr(env, c->guest_sctlr, el);
     // A vCPU reset in the TLB flush stub left it.
-    if (c->flushing && env->pc - virt.stub > 0x20) { c->flushing = false; }
+    if (c->flushing && env->pc - virt.stub > 0x30) { c->flushing = false; }
     // The TLB flush stub runs with the MMU off.
     if (c->flushing) { env->cp15.sctlr_el[1] &= ~SCTLR_M; }
     c->pac_loaded = true;
@@ -2087,8 +2111,9 @@ void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end)
 {
     // tlbi vmalle1[is]; dsb nsh/ish; isb; hvc #RESUME
     static const uint32_t stub[] = {
-        0xD508871F, 0xD503379F, 0xD5033FDF, 0xD4000002 | (APPLE_VIRT_HVC_RESUME << 5),
-        0xD508831F, 0xD5033B9F, 0xD5033FDF, 0xD4000002 | (APPLE_VIRT_HVC_RESUME << 5),
+        // tlbi vmalle1; dsb nsh; ic iallu; dsb nsh; isb; hvc  (and the inner-shareable forms)
+        0xD508871F, 0xD503379F, 0xD508751F, 0xD503379F, 0xD5033FDF, 0xD4000002 | (APPLE_VIRT_HVC_RESUME << 5),
+        0xD508831F, 0xD5033B9F, 0xD508711F, 0xD5033B9F, 0xD5033FDF, 0xD4000002 | (APPLE_VIRT_HVC_RESUME << 5),
     };
 
     virt.ops = ops;
