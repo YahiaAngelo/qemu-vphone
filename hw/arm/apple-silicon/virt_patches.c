@@ -25,7 +25,8 @@
 
 #define NOP (0xD503201F)
 
-#define CK_VIRT_HVC(imm) (0xD4000002 | ((uint32_t)(imm) << 5))
+// An `hvc #imm`, or its system register form (`apple_virt_trap_sysreg`).
+#define CK_VIRT_HVC(imm) apple_virt_trap_insn(imm)
 
 // What `ck_virt_patch` rewrites to `hvc`, for a hardware accelerator to emulate.
 typedef enum

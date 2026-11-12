@@ -125,6 +125,31 @@ typedef enum
 /// Whether the guest's guarded monitors use the M1-style register names (vphone-linux).
 extern bool apple_virt_m1_gl_names;
 
+/// vphone-linux: whether the patched traps are IMPLEMENTATION DEFINED system register accesses rather than
+/// `hvc`s. On an Apple M1 under KVM an `hvc` occasionally runs without trapping to the hypervisor (seen in
+/// the lower-EL vector, the kernel's GXF_STATUS check and its eret), while a trapped system register access
+/// in the same place always traps. The access is `msr`/`mrs S3_<op1>_C11_C<crm>_<op2>, X<rt>` (CRn 11, which
+/// neither XNU nor the Apple CPU models use), carrying the `hvc`'s 16-bit immediate as
+/// read:1 op1:3 crm:4 op2:3 rt:5. Unlike an `hvc`, it exits with the PC still on it.
+extern bool apple_virt_trap_sysreg;
+
+/// The instruction that traps with `imm`: an `hvc`, or its system register form.
+static inline uint32_t apple_virt_trap_insn(uint16_t imm)
+{
+    if (!apple_virt_trap_sysreg) { return 0xD4000002u | ((uint32_t)imm << 5); }
+    return 0xD518B000u | ((uint32_t)(imm >> 15) << 21) | ((uint32_t)((imm >> 12) & 7) << 16) |
+           ((uint32_t)((imm >> 8) & 15) << 8) | ((uint32_t)((imm >> 5) & 7) << 5) | (imm & 31);
+}
+
+/// The immediate of a trapped system register access that `apple_virt_trap_insn` made; false if it isn't one.
+static inline bool apple_virt_trap_imm(uint32_t op0, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2,
+                                       bool read, uint32_t rt, uint16_t* imm)
+{
+    if (!apple_virt_trap_sysreg || op0 != 3 || crn != 11) { return false; }
+    *imm = (uint16_t)(((uint32_t)read << 15) | (op1 << 12) | (crm << 8) | (op2 << 5) | rt);
+    return true;
+}
+
 /// The `AppleVirtVReg` of `S<op0>_<op1>_C<crn>_C<crm>_<op2>`, or -1 if GXF/PAC emulation doesn't handle it.
 static inline int apple_virt_vreg(uint32_t op0, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2)
 {

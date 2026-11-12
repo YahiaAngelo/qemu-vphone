@@ -26,6 +26,7 @@
 #include "system/kvm.h"
 #include "system/kvm_int.h"
 #include "kvm_arm.h"
+#include "hw/arm/apple_virt_hvc.h"
 #include "cpu.h"
 #include "cpu-sysregs.h"
 #include "trace.h"
@@ -600,6 +601,8 @@ static int kvm_arm_apple_virt_init(KVMState *s)
         }
     }
     kvm_apple_virt = true;
+    /* On the M1, an hvc occasionally doesn't trap: patch traps as system register accesses instead */
+    apple_virt_trap_sysreg = !getenv("VR_TRAP_HVC");
     return 0;
 }
 
@@ -1613,12 +1616,27 @@ static void vr_cc_post_run(CPUState *cs, struct kvm_run *run)
     e->imm = run->exit_reason == KVM_EXIT_HYPERCALL ? run->hypercall.nr : 0;
     e->pc = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc));
     e->pstate = vr_cc_reg(cs, AARCH64_CORE_REG(regs.pstate));
+    if (run->exit_reason == KVM_EXIT_ARM_SYSREG) {
+        /* apple-virt's trap in its system register form: log it as the hvc, PC past it */
+        uint64_t iss = run->arm_sysreg.esr_iss;
+        uint16_t imm;
+
+        if (apple_virt_trap_imm(extract64(iss, 20, 2), extract64(iss, 14, 3), extract64(iss, 10, 4),
+                                extract64(iss, 1, 4), extract64(iss, 17, 3), iss & 1, extract64(iss, 5, 5), &imm)) {
+            e->reason = KVM_EXIT_HYPERCALL;
+            e->imm = imm;
+            e->pc += 4;
+        }
+    }
     e->x14 = vr_cc_reg(cs, AARCH64_CORE_REG(regs.regs[14]));
     e->sp1 = vr_cc_reg(cs, AARCH64_CORE_REG(sp_el1));
     e->esp1 = cpu_env(cs)->sp_el[1];
     if (e->imm == 0x80ae && !vr_cc_site) {
         vr_cc_site = e->pc;     /* the PC is already past the hvc */
         fprintf(stderr, "CATCH: GXF_STATUS check at 0x%" PRIx64 "\n", e->pc - 4);
+        fprintf(stderr, "TCR: cpu%u TCR_EL1 0x%" PRIx64 " MAIR 0x%" PRIx64 "\n", c, vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 2, 0, 2)), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 10, 2, 0)));
+        fprintf(stderr, "ACTLR: cpu%u ACTLR_EL1 0x%" PRIx64 " SCTLR_EL1 0x%" PRIx64 "\n", c,
+                vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 1, 0, 1)), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 1, 0, 0)));
     }
     if (e->imm == 0x80ae) {
         vr_cc_kernel[c] = true;
@@ -2120,6 +2138,8 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
             }
         }
         if (told++ < 20) {
+            fprintf(stderr, "ACTLR: cpu%d ACTLR_EL1 0x%" PRIx64 " SCTLR_EL1 0x%" PRIx64 "\n", cs->cpu_index,
+                    vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 1, 0, 1)), vr_cc_reg(cs, ARM64_SYS_REG(3, 0, 1, 0, 0)));
             fprintf(stderr, "CATCH: cpu%d lower-EL entry skipped its hvc: pc 0x%" PRIx64 " ps 0x%" PRIx64
                     " ELR 0x%" PRIx64 " SPSR 0x%" PRIx64 " ESR 0x%" PRIx64 " FAR 0x%" PRIx64 "\n",
                     cs->cpu_index, vr_cc_reg(cs, AARCH64_CORE_REG(regs.pc)),
@@ -2329,6 +2349,16 @@ static int kvm_arm_handle_sysreg(CPUState *cs, uint64_t iss)
     uint32_t crn = extract64(iss, 10, 4);
     uint32_t crm = extract64(iss, 1, 4);
     uint32_t op2 = extract64(iss, 17, 3);
+
+    /* apple-virt's patched traps (apple_virt_trap_insn): past it, then as the hvc it stands for */
+    {
+        uint16_t imm;
+
+        if (apple_virt_trap_imm(op0, op1, crn, crm, op2, read, rt, &imm)) {
+            kvm_arm_advance_pc(cs);
+            return kvm_arm_handle_hvc(cs, imm);
+        }
+    }
     const ARMCPRegInfo *ri;
     uint64_t value;
 

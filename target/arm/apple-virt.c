@@ -211,6 +211,7 @@ static const uint8_t gxf_gl_rwx[16] = {
 static const uint8_t gxf_lvl_off[4] = {47, 36, 25, 14};
 
 bool apple_virt_m1_gl_names;
+bool apple_virt_trap_sysreg;
 
 static AppleVirtCPU* virt_cpu(CPUState* cs)
 {
@@ -2110,10 +2111,10 @@ static void apple_virt_reset(void* opaque)
 void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end)
 {
     // tlbi vmalle1[is]; dsb nsh/ish; isb; hvc #RESUME
-    static const uint32_t stub[] = {
+    uint32_t stub[] = {
         // tlbi vmalle1; dsb nsh; ic iallu; dsb nsh; isb; hvc  (and the inner-shareable forms)
-        0xD508871F, 0xD503379F, 0xD508751F, 0xD503379F, 0xD5033FDF, 0xD4000002 | (APPLE_VIRT_HVC_RESUME << 5),
-        0xD508831F, 0xD5033B9F, 0xD508711F, 0xD5033B9F, 0xD5033FDF, 0xD4000002 | (APPLE_VIRT_HVC_RESUME << 5),
+        0xD508871F, 0xD503379F, 0xD508751F, 0xD503379F, 0xD5033FDF, 0,
+        0xD508831F, 0xD5033B9F, 0xD508711F, 0xD5033B9F, 0xD5033FDF, 0,
     };
 
     virt.ops = ops;
@@ -2130,6 +2131,7 @@ void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end)
     virt.stub      = virt.pool_base;
     virt.empty     = virt.pool_base + GXF_PAGE_SIZE;
     memset(virt.pool_host, 0, 2 * GXF_PAGE_SIZE);
+    stub[5] = stub[11] = apple_virt_trap_insn(APPLE_VIRT_HVC_RESUME);
     for (size_t i = 0; i < ARRAY_SIZE(stub); i++) { stl_le_p(virt.pool_host + i * 4, stub[i]); }
     // The stub page is executed, the rest only walked.
     ops->map(virt.pool_host, virt.pool_base, GXF_PAGE_SIZE, true);

@@ -30,3 +30,4 @@ bool apple_virt_rewrites_impdef(void) { assert_not_reached(); }
 int apple_virt_impdef_vreg(uint32_t sysreg) { assert_not_reached(); }
 
 bool apple_virt_m1_gl_names;
+bool apple_virt_trap_sysreg;
