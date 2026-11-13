@@ -1910,9 +1910,13 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
         }
         f->nreads = ARRAY_SIZE(apple_virt_fast_reads);
     }
+    // While a flush is pending `env` holds the stub's SCTLR (its MMU off); the entries and returns
+    // after the kernel resumes run with the one it resumes to.
+    uint64_t sctlr = c->flushing ? c->resume_sctlr : env->cp15.sctlr_el[1];
+
     for (int el = 0; el < 2; el++) {
         for (int k = 0; k < ARRAY_SIZE(c->guest_keys); k++) { f->keys[el][k] = pac_key(env, k, el); }
-        f->sctlr[el] = pac_hw_sctlr(env, env->cp15.sctlr_el[1], el);
+        f->sctlr[el] = pac_hw_sctlr(env, sctlr, el);
     }
     f->pstate_mask = aarch64_pstate_valid_mask(&env_archcpu(env)->isar) & ~PSTATE_SS;
     f->pac_el      = c->pac_loaded ? c->pac_el : 2;
