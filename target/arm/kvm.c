@@ -2401,7 +2401,24 @@ static int kvm_arm_handle_sysreg(CPUState *cs, uint64_t iss)
      * emulation keeps them in the vCPU's EL1 registers, so `env` only has
      * them once the vCPU's state is synced (which swaps the banks back).
      */
-    if (ri == NULL || ri->accessfn != NULL ||
+    /*
+     * vphone-linux: the GICv3 CPU interface (KVM_CAP_ARM_GIC_SYSREG_TO_USER) depends on the
+     * vCPU's state only through its current EL (the access checks; no EL2 or EL3 here): that
+     * alone, from PSTATE, rather than a whole sync, which took ~340 us an access under
+     * apple-virt and made every interrupt acknowledge, end and SGI that slow.
+     */
+    bool gic_cpuif = kvm_arm_gic_sysreg_to_user() && op0 == 3 && op1 <= 2 &&
+        ((crn == 12 && crm >= 8 && crm <= 12) ||
+         (op1 == 0 && crn == 4 && crm == 6 && op2 == 0));
+
+    if (gic_cpuif && ri != NULL && !cs->vcpu_dirty && !VR_ENV("VR_GIC_SYNC")) {
+        uint64_t pstate;
+
+        if (kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pstate), &pstate)) {
+            abort();
+        }
+        pstate_write(env, pstate);
+    } else if (ri == NULL || ri->accessfn != NULL ||
         (ri->type & ARM_CP_SPECIAL_MASK) ||
         !(read || ri->writefn == NULL || (ri->type & ARM_CP_IO)) ||
         (kvm_apple_virt && op0 == 3 && op1 == 6 && crn == 15 && crm == 10)) {
