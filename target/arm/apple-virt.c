@@ -1982,7 +1982,9 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     f->pstate_mask = aarch64_pstate_valid_mask(&env_archcpu(env)->isar) & ~PSTATE_SS;
     // An M1-style monitor's own exception registers while guarded (`virt_m1_bank_fast`'s live case).
     f->guarded    = env->gxf.gxf_status_el[1] & 1;
-    f->m1_bank_ok = apple_virt_m1_gl_names && !VR_ENV("VR_NO_M1_FAST");
+    // Opt-in (VR_M1_FAST=1): with these taken in the kernel (as with them native), an iOS guest's Safari and App
+    // Store icons render wrongly, which they don't with them here; cause not found (timing or a difference).
+    f->m1_bank_ok = apple_virt_m1_gl_names && VR_ENV("VR_M1_FAST") && !VR_ENV("VR_NO_M1_FAST");
     f->pac_el      = c->pac_loaded ? c->pac_el : 2;
     f->magic       = APPLE_VIRT_FAST_MAGIC;
 }
