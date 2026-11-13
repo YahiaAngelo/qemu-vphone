@@ -1015,6 +1015,32 @@ static bool virt_eret_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
     return true;
 }
 
+// EL0 reads of an SPRR register this side emulated (`virt_el0_sprr_fast`), by instruction address:
+// the kernel answers them there itself. They are the shared cache's, at one address in every
+// process. Appended only, the count after the entry.
+static struct {
+    uint64_t va[32];
+    uint16_t imm[32];
+    uint8_t  rt[32];
+    uint32_t n;
+    QemuMutex lock;
+} apple_virt_el0_sites;
+
+static void apple_virt_el0_site(uint64_t va, int vreg, uint32_t rt)
+{
+    uint16_t imm = APPLE_VIRT_HVC_SYSREG | (vreg << 6) | (1 << 5);
+    uint32_t n   = qatomic_read(&apple_virt_el0_sites.n);
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (apple_virt_el0_sites.va[i] == va) { return; }
+    }
+    if (n >= ARRAY_SIZE(apple_virt_el0_sites.va)) { return; }
+    apple_virt_el0_sites.va[n]  = va;
+    apple_virt_el0_sites.imm[n] = imm;
+    apple_virt_el0_sites.rt[n]  = rt;
+    qatomic_store_release(&apple_virt_el0_sites.n, n + 1);
+}
+
 // An EL0 SPRR access, which the vCPU UNDEFs to EL1, emulated as `sprr_uperm_br0_write` does it.
 static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
 {
@@ -1057,6 +1083,10 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
     virt.ops->set_reg(cs, APPLE_VIRT_REG_ELR_EL1, elr + 4);
     if (read) {
         if (rt != 31) { virt.ops->set_xreg(cs, rt, *virt_vreg_field(env, vreg)); }
+        // The kernel answers the next ones at this address (`apple_virt_fast_publish`).
+        qemu_mutex_lock(&apple_virt_el0_sites.lock);
+        apple_virt_el0_site(elr, vreg, rt);
+        qemu_mutex_unlock(&apple_virt_el0_sites.lock);
     }
     else {
         // EL0 only changes the EL bits that SPRR_UMPRR_BR0_EL1 lets it.
@@ -1867,7 +1897,15 @@ typedef struct {
     uint32_t pad;
     uint16_t read_imm[16];
     uint64_t read_value[16];
+    uint64_t el0_ok;
+    uint32_t nsites;
+    uint32_t pad2;
+    uint64_t site_va[32];
+    uint16_t site_imm[32];
+    uint8_t  site_rt[32];
+    uint64_t disable;
 } AppleVirtFast;
+
 
 // The registers whose reads are only `env`'s field (`virt_handle_sysreg_fast`), which only this side
 // writes: the kernel answers them from the values published before the vCPU runs.
@@ -1890,8 +1928,17 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
         f->magic = 0;
         return;
     }
-    // A pending flush resumes as `gxf_resume_fast` does it.
-    f->resume_valid = c->flushing;
+    // Debug: VR_FAST_DISABLE=<mask> leaves traps to this side (bit imm - 0x1340, 4 resume, 5 reads).
+    {
+        static int64_t disable = -1;
+
+        if (disable < 0) { disable = getenv("VR_FAST_DISABLE") ? strtoull(getenv("VR_FAST_DISABLE"), NULL, 0) : 0; }
+        f->disable = disable;
+    }
+    // A pending flush resumes as `gxf_resume_fast` does it, with VR_FAST_RESUME=1 (and not VR_FAST_DISABLE's bit
+    // 4): an iOS guest's lock-screen wallpaper rendered black with the kernel resuming, cause not found yet.
+    f->resume_valid = c->flushing && VR_ENV("VR_FAST_RESUME") && !(f->disable & (1 << 4));
+    f->pad          = f->resume_valid;    // what this side published, which the kernel leaves
     if (c->flushing) {
         int el = extract32(c->resume_pstate, 2, 2);
 
@@ -1909,6 +1956,18 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
             f->read_value[i] = *virt_vreg_field(env, vreg);
         }
         f->nreads = ARRAY_SIZE(apple_virt_fast_reads);
+    }
+    // EL0's SPRR reads, unguarded (`virt_el0_sprr_fast`'s condition), at the addresses seen so far.
+    f->el0_ok = f->nreads != 0 && !(env->gxf.gxf_status_el[1] & 1);
+    {
+        uint32_t n = qatomic_load_acquire(&apple_virt_el0_sites.n);
+
+        for (uint32_t i = f->nsites; i < n; i++) {
+            f->site_va[i]  = apple_virt_el0_sites.va[i];
+            f->site_imm[i] = apple_virt_el0_sites.imm[i];
+            f->site_rt[i]  = apple_virt_el0_sites.rt[i];
+        }
+        f->nsites = n;
     }
     // While a flush is pending `env` holds the stub's SCTLR (its MMU off); the entries and returns
     // after the kernel resumes run with the one it resumes to.
@@ -1935,7 +1994,7 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
         c->pac_el     = f->pac_el;
     }
     // The kernel resumed from the flush stub.
-    if (c->flushing && !f->resume_valid) {
+    if (c->flushing && f->pad && !f->resume_valid) {
         cpu_env(cs)->cp15.sctlr_el[1] = c->resume_sctlr;
         c->flushing                   = false;
     }
@@ -2218,6 +2277,7 @@ void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end)
 
     virt.ops = ops;
     qemu_mutex_init(&virt.lock);
+    qemu_mutex_init(&apple_virt_el0_sites.lock);
     virt.perms       = g_ptr_array_new_with_free_func(g_free);
     virt.mirrors     = g_hash_table_new(gxf_mirror_hash, gxf_mirror_equal);
     virt.pages       = g_hash_table_new(g_int64_hash, g_int64_equal);
