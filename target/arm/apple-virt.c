@@ -1904,6 +1904,8 @@ typedef struct {
     uint16_t site_imm[32];
     uint8_t  site_rt[32];
     uint64_t disable;
+    uint64_t guarded;
+    uint64_t m1_bank_ok;
 } AppleVirtFast;
 
 
@@ -1978,6 +1980,9 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
         f->sctlr[el] = pac_hw_sctlr(env, sctlr, el);
     }
     f->pstate_mask = aarch64_pstate_valid_mask(&env_archcpu(env)->isar) & ~PSTATE_SS;
+    // An M1-style monitor's own exception registers while guarded (`virt_m1_bank_fast`'s live case).
+    f->guarded    = env->gxf.gxf_status_el[1] & 1;
+    f->m1_bank_ok = apple_virt_m1_gl_names && !VR_ENV("VR_NO_M1_FAST");
     f->pac_el      = c->pac_loaded ? c->pac_el : 2;
     f->magic       = APPLE_VIRT_FAST_MAGIC;
 }

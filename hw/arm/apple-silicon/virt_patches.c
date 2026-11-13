@@ -282,11 +282,11 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
         }
         if (vreg < 0 || !(impdef || (flags & ck_virt_vreg_flags(vreg)))) { continue; }
 
-        // vphone-linux: a guarded monitor's own exception registers, which only its guarded code reads (and its
-        // exception return writes), are the vCPU's EL1 registers while it runs guarded (`virt_m1_bank_fast`'s
-        // live case): the native instruction, with no trap. Writes of its TPIDR and VBAR, which its boot code
-        // makes before it first enters the guarded world, keep the trap. VR_TRAP_M1_GL=1 traps them all.
-        if ((flags & CK_VIRT_M1_MONITOR) && !getenv("VR_TRAP_M1_GL")) {
+        // vphone-linux, VR_NATIVE_M1_GL=1: a guarded monitor's own exception registers as the native instruction,
+        // the vCPU's EL1 registers, which they are while it runs guarded (`virt_m1_bank_fast`'s live case). Not
+        // the default: some of SPTM's accesses run unguarded too (an iOS guest's Safari icon lost its needle),
+        // which the trap tells apart; the host kernel's fast path takes the live ones (`apple_virt_fast_publish`).
+        if ((flags & CK_VIRT_M1_MONITOR) && getenv("VR_NATIVE_M1_GL")) {
             uint32_t native = ck_virt_m1_gl_native(vreg, read);
 
             if (native != 0) {
