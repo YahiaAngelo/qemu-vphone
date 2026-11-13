@@ -140,6 +140,22 @@ static bool ck_virt_is_vector_table(const uint8_t* table, bool inline_slots)
 
 // Makes the lower-EL AArch64 slots of the vector tables in `range`, mapped at `va`, trap before branching to their
 // handlers, and the IRQ slots ask the host whether they're for a FIQ; returns how many.
+// vphone-linux: the native `msr`/`mrs` (without L and Rt) of the EL1 register an M1-style monitor's own guarded
+// register `vreg` is while it runs guarded, where the access may run natively: reads of TPIDR, SPSR, ELR, ESR and
+// FAR, and writes of SPSR and ELR. 0 for any other.
+static uint32_t ck_virt_m1_gl_native(int vreg, bool read)
+{
+    // op0 3: 0xD5180000 | op1 << 16 | CRn << 12 | CRm << 8 | op2 << 5.
+    switch (vreg) {
+        case APPLE_VIRT_VREG_M1_TPIDR_GL1: return read ? 0xD518D080 : 0;    // TPIDR_EL1: 3,0,13,0,4
+        case APPLE_VIRT_VREG_M1_SPSR_GL1 : return 0xD5184000;               // SPSR_EL1:  3,0,4,0,0
+        case APPLE_VIRT_VREG_M1_ELR_GL1  : return 0xD5184020;               // ELR_EL1:   3,0,4,0,1
+        case APPLE_VIRT_VREG_M1_ESR_GL1  : return read ? 0xD5185200 : 0;    // ESR_EL1:   3,0,5,2,0
+        case APPLE_VIRT_VREG_M1_FAR_GL1  : return read ? 0xD5186000 : 0;    // FAR_EL1:   3,0,6,0,0
+        default                          : return 0;
+    }
+}
+
 static uint32_t ck_virt_vectors(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
 {
     uint32_t entries = 0;
@@ -214,6 +230,7 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
     uint32_t erets          = 0;
     uint32_t sysregs        = 0;
     uint32_t unindexed      = 0;
+    uint32_t natives        = 0;
     bool     rewrite_impdef = apple_virt_rewrites_impdef();
 
     for (vaddr i = 0; i + sizeof(uint32_t) <= range->length; i += sizeof(uint32_t)) {
@@ -265,6 +282,20 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
         }
         if (vreg < 0 || !(impdef || (flags & ck_virt_vreg_flags(vreg)))) { continue; }
 
+        // vphone-linux: a guarded monitor's own exception registers, which only its guarded code reads (and its
+        // exception return writes), are the vCPU's EL1 registers while it runs guarded (`virt_m1_bank_fast`'s
+        // live case): the native instruction, with no trap. Writes of its TPIDR and VBAR, which its boot code
+        // makes before it first enters the guarded world, keep the trap. VR_TRAP_M1_GL=1 traps them all.
+        if ((flags & CK_VIRT_M1_MONITOR) && !getenv("VR_TRAP_M1_GL")) {
+            uint32_t native = ck_virt_m1_gl_native(vreg, read);
+
+            if (native != 0) {
+                stl_le_p(ptr, native | ((uint32_t)read << 21) | rt);
+                ++natives;
+                continue;
+            }
+        }
+
         // `mrs xzr, ?` only serialises.
         if (read && rt == 31 && vreg < APPLE_VIRT_VREG_MAX) { stl_le_p(ptr, NOP); }
         else {
@@ -276,6 +307,10 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
     if (unindexed != 0) {
         warn_report("`trap to the hypervisor` left %u IMPLEMENTATION DEFINED register accesses in `%s`: out of vregs.",
                     unindexed, range->name);
+    }
+    if (natives != 0) {
+        info_report("`trap to the hypervisor` left %u guarded-register accesses native in `%s`.", natives,
+                    range->name);
     }
     if (transitions + tlbis + entries + erets + sysregs == 0) { return; }
     info_report("`trap to the hypervisor` rewrote %u GXF transitions, %u TLBIs, %u exception entries, %u erets and %u "
