@@ -1941,9 +1941,9 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
         if (disable < 0) { disable = getenv("VR_FAST_DISABLE") ? strtoull(getenv("VR_FAST_DISABLE"), NULL, 0) : 0; }
         f->disable = disable;
     }
-    // A pending flush resumes as `gxf_resume_fast` does it, with VR_FAST_RESUME=1 (and not VR_FAST_DISABLE's bit
-    // 4): an iOS guest's lock-screen wallpaper rendered black with the kernel resuming, cause not found yet.
-    f->resume_valid = c->flushing && VR_ENV("VR_FAST_RESUME") && !(f->disable & (1 << 4));
+    // A pending flush resumes as `gxf_resume_fast` does it (not with VR_NO_FAST_RESUME=1 or VR_FAST_DISABLE's bit
+    // 4). The black lock screen once blamed on it was the wallpaper extension's launch watchdog.
+    f->resume_valid = c->flushing && !VR_ENV("VR_NO_FAST_RESUME") && !(f->disable & (1 << 4));
     f->pad          = f->resume_valid;    // what this side published, which the kernel leaves
     if (c->flushing) {
         int el = extract32(c->resume_pstate, 2, 2);
@@ -1993,9 +1993,8 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     f->pstate_mask = aarch64_pstate_valid_mask(&env_archcpu(env)->isar) & ~PSTATE_SS;
     // An M1-style monitor's own exception registers while guarded (`virt_m1_bank_fast`'s live case).
     f->guarded    = env->gxf.gxf_status_el[1] & 1;
-    // Opt-in (VR_M1_FAST=1): with these taken in the kernel (as with them native), an iOS guest's Safari and App
-    // Store icons render wrongly, which they don't with them here; cause not found (timing or a difference).
-    f->m1_bank_ok = apple_virt_m1_gl_names && VR_ENV("VR_M1_FAST") && !VR_ENV("VR_NO_M1_FAST");
+    // (VR_NO_M1_FAST=1 keeps them here. The icon glitches once blamed on this come and go without it too.)
+    f->m1_bank_ok = apple_virt_m1_gl_names && !VR_ENV("VR_NO_M1_FAST");
     f->pac_el      = c->pac_loaded ? c->pac_el : 2;
     f->magic       = APPLE_VIRT_FAST_MAGIC;
 }
