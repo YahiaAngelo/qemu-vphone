@@ -1993,9 +1993,8 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     f->pstate_mask = aarch64_pstate_valid_mask(&env_archcpu(env)->isar) & ~PSTATE_SS;
     // An M1-style monitor's own exception registers while guarded (`virt_m1_bank_fast`'s live case).
     f->guarded    = env->gxf.gxf_status_el[1] & 1;
-    // Opt-in (VR_KERNEL_M1=1): two boots with these taken in the kernel (one with them native) hung with every
-    // vCPU idle, cause not found. (VR_NO_M1_FAST is this side's switch to its own slow path, not this one.)
-    f->m1_bank_ok = apple_virt_m1_gl_names && VR_ENV("VR_KERNEL_M1");
+    // VR_NO_KERNEL_M1=1 keeps them here. (VR_NO_M1_FAST is this side's switch to its own slow path, not this one.)
+    f->m1_bank_ok = apple_virt_m1_gl_names && !VR_ENV("VR_NO_KERNEL_M1");
     f->pac_el      = c->pac_loaded ? c->pac_el : 2;
     f->magic       = APPLE_VIRT_FAST_MAGIC;
 }
