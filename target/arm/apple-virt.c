@@ -2112,9 +2112,11 @@ void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end)
 {
     // tlbi vmalle1[is]; dsb nsh/ish; isb; hvc #RESUME
     uint32_t stub[] = {
-        // tlbi vmalle1; dsb nsh; ic iallu; dsb nsh; isb; hvc  (and the inner-shareable forms)
-        0xD508871F, 0xD503379F, 0xD508751F, 0xD503379F, 0xD5033FDF, 0,
-        0xD508831F, 0xD5033B9F, 0xD508711F, 0xD5033B9F, 0xD5033FDF, 0,
+        // tlbi vmalle1; dsb nsh; nop; nop; isb; trap  (and the inner-shareable forms). No
+        // instruction-cache invalidate: it did not change the skipped-hvc hangs, and the stub runs
+        // tens of thousands of times a second.
+        0xD508871F, 0xD503379F, 0xD503201F, 0xD503201F, 0xD5033FDF, 0,
+        0xD508831F, 0xD5033B9F, 0xD503201F, 0xD503201F, 0xD5033FDF, 0,
     };
 
     virt.ops = ops;
