@@ -1858,7 +1858,23 @@ typedef struct {
     uint64_t sctlr[2];
     uint64_t pac_el;
     uint64_t handled;
+    uint64_t resume_valid;
+    uint64_t resume_pc;
+    uint64_t resume_pstate;
+    uint64_t resume_sctlr;
+    uint64_t resume_el;
+    uint32_t nreads;
+    uint32_t pad;
+    uint16_t read_imm[16];
+    uint64_t read_value[16];
 } AppleVirtFast;
+
+// The registers whose reads are only `env`'s field (`virt_handle_sysreg_fast`), which only this side
+// writes: the kernel answers them from the values published before the vCPU runs.
+static const int apple_virt_fast_reads[] = {
+    APPLE_VIRT_VREG_GXF_STATUS_EL1,     APPLE_VIRT_VREG_SPRR_UPERM_BR0_EL0, APPLE_VIRT_VREG_SPRR_UPERM_BR1_EL0,
+    APPLE_VIRT_VREG_SPRR_PPERM_BR1_EL1, APPLE_VIRT_VREG_M1_ASPSR_GL1,
+};
 
 #define APPLE_VIRT_FAST_MAGIC 0x3130545341464150ULL
 
@@ -1870,9 +1886,29 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     AppleVirtCPU*  c   = virt_cpu(cs);
     CPUARMState*   env = cpu_env(cs);
 
-    if (!c->managed || c->flushing || cs->singlestep_enabled || VR_ENV("VR_CATCH_CORRUPT") || VR_ENV("VR_NO_FAST")) {
+    if (!c->managed || cs->singlestep_enabled || VR_ENV("VR_CATCH_CORRUPT") || VR_ENV("VR_NO_FAST")) {
         f->magic = 0;
         return;
+    }
+    // A pending flush resumes as `gxf_resume_fast` does it.
+    f->resume_valid = c->flushing;
+    if (c->flushing) {
+        int el = extract32(c->resume_pstate, 2, 2);
+
+        f->resume_pc     = c->resume_pc;
+        f->resume_pstate = c->resume_pstate;
+        f->resume_el     = el;
+        f->resume_sctlr  = pac_hw_sctlr(env, c->resume_sctlr, el);
+    }
+    f->nreads = 0;
+    if (!VR_ENV("VR_NO_FAST_READS")) {
+        for (int i = 0; i < ARRAY_SIZE(apple_virt_fast_reads); i++) {
+            int vreg = apple_virt_fast_reads[i];
+
+            f->read_imm[i]   = APPLE_VIRT_HVC_SYSREG | (vreg << 6) | (1 << 5);
+            f->read_value[i] = *virt_vreg_field(env, vreg);
+        }
+        f->nreads = ARRAY_SIZE(apple_virt_fast_reads);
     }
     for (int el = 0; el < 2; el++) {
         for (int k = 0; k < ARRAY_SIZE(c->guest_keys); k++) { f->keys[el][k] = pac_key(env, k, el); }
@@ -1889,9 +1925,15 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
     AppleVirtFast* f = area;
     AppleVirtCPU*  c = virt_cpu(cs);
 
-    if (f->magic == APPLE_VIRT_FAST_MAGIC && f->pac_el < 2) {
+    if (f->magic != APPLE_VIRT_FAST_MAGIC) { return; }
+    if (f->pac_el < 2) {
         c->pac_loaded = true;
         c->pac_el     = f->pac_el;
+    }
+    // The kernel resumed from the flush stub.
+    if (c->flushing && !f->resume_valid) {
+        cpu_env(cs)->cp15.sctlr_el[1] = c->resume_sctlr;
+        c->flushing                   = false;
     }
 }
 
