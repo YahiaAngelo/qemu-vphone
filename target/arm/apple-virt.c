@@ -1906,6 +1906,10 @@ typedef struct {
     uint64_t disable;
     uint64_t guarded;
     uint64_t m1_bank_ok;
+    uint32_t n_el0_insn;
+    uint32_t pad3;
+    uint32_t el0_insn[4];
+    uint16_t el0_insn_imm[4];
 } AppleVirtFast;
 
 
@@ -1971,6 +1975,13 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
         }
         f->nsites = n;
     }
+    // And at any other address, by the instruction (`mrs Xt, S3_6_C15_C1_5` and `_6`, EL0's SPRR permission
+    // registers), which the kernel reads through the vCPU's stage-1 tables.
+    f->n_el0_insn       = 2;
+    f->el0_insn[0]      = 0xD53EF1A0;
+    f->el0_insn_imm[0]  = APPLE_VIRT_HVC_SYSREG | (APPLE_VIRT_VREG_SPRR_UPERM_BR0_EL0 << 6) | (1 << 5);
+    f->el0_insn[1]      = 0xD53EF1C0;
+    f->el0_insn_imm[1]  = APPLE_VIRT_HVC_SYSREG | (APPLE_VIRT_VREG_SPRR_UPERM_BR1_EL0 << 6) | (1 << 5);
     // While a flush is pending `env` holds the stub's SCTLR (its MMU off); the entries and returns
     // after the kernel resumes run with the one it resumes to.
     uint64_t sctlr = c->flushing ? c->resume_sctlr : env->cp15.sctlr_el[1];
