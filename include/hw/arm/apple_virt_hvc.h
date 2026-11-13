@@ -133,6 +133,10 @@ extern bool apple_virt_m1_gl_names;
 /// read:1 op1:3 crm:4 op2:3 rt:5. Unlike an `hvc`, it exits with the PC still on it.
 extern bool apple_virt_trap_sysreg;
 
+/* vphone-linux: whether debug variable `name` is set, read once per call site (the exit paths run
+ * hundreds of thousands of times a second). */
+#define VR_ENV(name) ({ static int vr_env_; if (!vr_env_) { vr_env_ = getenv(name) ? 1 : 2; } vr_env_ == 1; })
+
 /// The instruction that traps with `imm`: an `hvc`, or its system register form.
 static inline uint32_t apple_virt_trap_insn(uint16_t imm)
 {

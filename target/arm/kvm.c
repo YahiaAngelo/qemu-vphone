@@ -548,6 +548,11 @@ int kvm_arch_get_default_type(MachineState *ms)
 
 /* The machine asked for Apple GXF/PAC emulation (MachineClass::kvm_apple_virt). */
 static bool kvm_apple_virt;
+/* The host kernel takes apple-virt's exception entries and returns (linux-aurora-kvm's
+ * kvm_arm_apple_fast): a kernel without it ignores the area, and every trap still exits. */
+static bool kvm_apple_fast = true;
+void apple_virt_fast_publish(CPUState *cs, void *area);
+void apple_virt_fast_collect(CPUState *cs, void *area);
 
 bool kvm_arm_gic_sysreg_to_user(void)
 {
@@ -602,7 +607,7 @@ static int kvm_arm_apple_virt_init(KVMState *s)
     }
     kvm_apple_virt = true;
     /* On the M1, an hvc occasionally doesn't trap: patch traps as system register accesses instead */
-    apple_virt_trap_sysreg = !getenv("VR_TRAP_HVC");
+    apple_virt_trap_sysreg = !VR_ENV("VR_TRAP_HVC");
     return 0;
 }
 
@@ -1384,6 +1389,11 @@ void kvm_arch_pre_run(CPUState *cs, struct kvm_run *run)
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
 
+    /* apple-virt: the kernel's fast entries and returns (KVM_ARM_APPLE_FAST_OFFSET 64). */
+    if (kvm_apple_virt && kvm_apple_fast) {
+        apple_virt_fast_publish(cs, run->s.padding + 64);
+    }
+
     if (unlikely(env->ext_dabt_raised)) {
         /*
          * Verifying that the ext DABT has been properly injected,
@@ -1706,7 +1716,7 @@ static void vr_cc_after(CPUState *cs)
     VrCcEntry *e;
     CPUARMState *env = cpu_env(cs);
 
-    if (c >= 16 || !getenv("VR_CATCH_CORRUPT")) {
+    if (c >= 16 || !VR_ENV("VR_CATCH_CORRUPT")) {
         return;
     }
     e = &vr_cc[c].ring[(vr_cc[c].head - 1) % VR_CC_RING];
@@ -1755,7 +1765,11 @@ static void vr_cc_after(CPUState *cs)
 
 MemTxAttrs kvm_arch_post_run(CPUState *cs, struct kvm_run *run)
 {
-    if (getenv("VR_CATCH_CORRUPT")) {
+    if (kvm_apple_virt && kvm_apple_fast) {
+        apple_virt_fast_collect(cs, run->s.padding + 64);
+    }
+
+    if (VR_ENV("VR_CATCH_CORRUPT")) {
         vr_cc_post_run(cs, run);
     }
 
@@ -2067,12 +2081,12 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
         vr_st.calls++;
     }
 
-    if (getenv("VR_TRACE_EXITS") && cs->cpu_index == 0) { /* debug: VR_TRACE_EXITS=1 */
+    if (VR_ENV("VR_TRACE_EXITS") && cs->cpu_index == 0) { /* debug: VR_TRACE_EXITS=1 */
         uint64_t pc;
         kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pc), &pc);
         fprintf(stderr, "HVC %04x pc=0x%" PRIx64 "\n", imm, pc);
     }
-    if (imm == 0x1342 && vr_cc_site && getenv("VR_CATCH_CORRUPT") &&
+    if (imm == 0x1342 && vr_cc_site && VR_ENV("VR_CATCH_CORRUPT") &&
         cs->cpu_index < 16 && !vr_cc[cs->cpu_index].dumped) {
         /* debug: an IRQ taken at the GXF_STATUS check with x14 still nonzero */
         uint64_t elr = vr_cc_reg(cs, AARCH64_CORE_REG(elr_el1));
@@ -2084,7 +2098,7 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
             vr_cc_dump(cs, "IRQ at the check");
         }
     }
-    if (imm == 0x1424 && getenv("VR_CATCH_CORRUPT")) {
+    if (imm == 0x1424 && VR_ENV("VR_CATCH_CORRUPT")) {
         /* debug: the kernel's panic call into SPTM; the exception that led to it is still in the EL1 bank */
         static int told;
 
@@ -2284,7 +2298,7 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
     }
     if (apple_virt_handle_hvc_fast(cs, imm)) {
         vr_steptrace_maybe_start(cs, imm);
-        if (imm == 0x80ae && getenv("VR_DEBUG_STATUS")) { /* debug */
+        if (imm == 0x80ae && VR_ENV("VR_DEBUG_STATUS")) { /* debug */
             uint64_t x14 = 0;
 
             kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.regs[14]), &x14);
@@ -2302,7 +2316,7 @@ static int kvm_arm_handle_hvc(CPUState *cs, uint16_t imm)
     bql_unlock();
     if (handled) {
         vr_steptrace_maybe_start(cs, imm);
-        if (imm == 0x80ae && getenv("VR_DEBUG_STATUS") && cpu_env(cs)->xregs[14]) { /* debug */
+        if (imm == 0x80ae && VR_ENV("VR_DEBUG_STATUS") && cpu_env(cs)->xregs[14]) { /* debug */
             fprintf(stderr, "STATUS-SLOW cpu%d x14=0x%" PRIx64 " status=0x%" PRIx64 "\n",
                     cs->cpu_index, cpu_env(cs)->xregs[14], cpu_env(cs)->gxf.gxf_status_el[1]);
         }
@@ -2334,7 +2348,7 @@ static int kvm_arm_handle_sysreg(CPUState *cs, uint64_t iss)
 {
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
-    if (getenv("VR_TRACE_EXITS") && cs->cpu_index == 0) { /* debug: VR_TRACE_EXITS=1 */
+    if (VR_ENV("VR_TRACE_EXITS") && cs->cpu_index == 0) { /* debug: VR_TRACE_EXITS=1 */
         uint64_t pc;
         kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pc), &pc);
         fprintf(stderr, "SYSREG iss=%06" PRIx64 " S%u_%u_C%u_C%u_%u %s pc=0x%" PRIx64 "\n",
@@ -2495,7 +2509,7 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
         } /* otherwise return to guest */
         break;
     case KVM_EXIT_ARM_NISV:
-        if (getenv("VR_TRACE_NISV")) { /* debug: VR_TRACE_NISV=1 */
+        if (VR_ENV("VR_TRACE_NISV")) { /* debug: VR_TRACE_NISV=1 */
             uint64_t pc;
 
             kvm_get_one_reg(cs, AARCH64_CORE_REG(regs.pc), &pc);
@@ -3159,7 +3173,7 @@ int kvm_arch_put_registers(CPUState *cs, int level, Error **errp)
         aarch64_sync_32_to_64(env);
     }
 
-    if (getenv("VR_CATCH_CORRUPT")) {
+    if (VR_ENV("VR_CATCH_CORRUPT")) {
         /* debug: a put that moves the vCPU somewhere other than where KVM has it */
         static int told;
         uint64_t kpc = 0, kps = 0, kx14 = 0;
@@ -3456,7 +3470,7 @@ int kvm_arch_get_registers(CPUState *cs, Error **errp)
     }
 
     /* Debug (VR_TRACE_EXITS=1): did the vCPU change SCTLR.M behind GXF/PAC emulation? */
-    if (kvm_apple_virt && cs->cpu_index == 0 && getenv("VR_TRACE_EXITS")) {
+    if (kvm_apple_virt && cs->cpu_index == 0 && VR_ENV("VR_TRACE_EXITS")) {
         uint64_t hw_sctlr;
         static uint64_t last_hw = ~0ULL, last_env = ~0ULL;
 
@@ -3760,7 +3774,7 @@ static void kvm_virt_trap_debug(CPUState *cs, bool enable)
 
 void vr_steptrace_start(CPUState *cs)
 {
-    if (!getenv("VR_STEPTRACE") || cs->cpu_index != 0 || vr_st.on) {
+    if (!VR_ENV("VR_STEPTRACE") || cs->cpu_index != 0 || vr_st.on) {
         return;
     }
     vr_st.on = true;
@@ -3779,7 +3793,7 @@ static void vr_steptrace_maybe_start(CPUState *cs, uint16_t imm)
     static bool seen_guarded;
     bool guarded, step;
 
-    if (!getenv("VR_STEPTRACE") || cs->cpu_index != 0 || vr_st.done) {
+    if (!VR_ENV("VR_STEPTRACE") || cs->cpu_index != 0 || vr_st.done) {
         return;
     }
     guarded = cpu_env(cs)->gxf.gxf_status_el[1] & 1;

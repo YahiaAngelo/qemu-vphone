@@ -1177,7 +1177,7 @@ static bool virt_m1_bank_fast(CPUState* cs, CPUARMState* env, int vreg, bool rea
 
     if (read) {
         value = live ? virt.ops->get_reg(cs, gxf_bank_regs[i]) : *field;
-        if (getenv("VR_CHECK_M1")) {
+        if (VR_ENV("VR_CHECK_M1")) {
             // Debug: compare with what the slow path reads from the synced state.
             static unsigned reported;
             uint64_t slow;
@@ -1216,7 +1216,7 @@ static bool virt_handle_sysreg_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU
         case APPLE_VIRT_VREG_M1_ESR_GL1  :
         case APPLE_VIRT_VREG_M1_ELR_GL1  :
         case APPLE_VIRT_VREG_M1_FAR_GL1  :
-            if (getenv("VR_NO_M1_FAST")) { return false; }    // debug: compare with the slow path
+            if (VR_ENV("VR_NO_M1_FAST")) { return false; }    // debug: compare with the slow path
             return virt_m1_bank_fast(cs, env, vreg, read, rt);
         case APPLE_VIRT_VREG_M1_ASPSR_GL1: break;
         case APPLE_VIRT_VREG_SPRR_CONFIG_EL1   :
@@ -1383,7 +1383,7 @@ bool apple_virt_handle_hvc_fast(CPUState* cs, uint16_t imm)
         if (virt_el0_sprr_fast(cs, env, c)) { return true; }
         pac_load(cs, env, c, 1);
         // vphone-linux debug: step over the `hvc 0x13fc` behind it (see `ck_virt_vectors`).
-        if (skip < 0) { skip = getenv("VR_CATCH_CORRUPT") != NULL; }
+        if (skip < 0) { skip = VR_ENV("VR_CATCH_CORRUPT"); }
         if (skip) { virt.ops->set_reg(cs, APPLE_VIRT_REG_PC, virt.ops->get_reg(cs, APPLE_VIRT_REG_PC) + 4); }
         return true;
     }
@@ -1846,6 +1846,57 @@ static bool gxf_live_translate(CPUState* cs, uint64_t va, hwaddr* pa)
 }
 
 // vphone-linux debug: install the kernel's PAC keys, as a lower-EL entry does.
+/*
+ * vphone-linux: the kernel's fast path for the patched exception entries and returns
+ * (`struct kvm_arm_apple_fast` in linux-aurora-kvm's arch/arm64/include/uapi/asm/kvm.h), which
+ * installs the PAC key sets and SCTLR published here as `pac_load` would, without an exit.
+ */
+typedef struct {
+    uint64_t magic;
+    uint64_t pstate_mask;
+    uint64_t keys[2][10];
+    uint64_t sctlr[2];
+    uint64_t pac_el;
+    uint64_t handled;
+} AppleVirtFast;
+
+#define APPLE_VIRT_FAST_MAGIC 0x3130545341464150ULL
+
+// Before the vCPU runs: what an entry or a return installs, or nothing for a vCPU whose entries and
+// returns need this side (unmanaged, single-stepping, flushing, the corruption catcher's).
+void apple_virt_fast_publish(CPUState* cs, void* area)
+{
+    AppleVirtFast* f   = area;
+    AppleVirtCPU*  c   = virt_cpu(cs);
+    CPUARMState*   env = cpu_env(cs);
+
+    if (!c->managed || c->flushing || cs->singlestep_enabled || VR_ENV("VR_CATCH_CORRUPT") || VR_ENV("VR_NO_FAST")) {
+        f->magic = 0;
+        return;
+    }
+    for (int el = 0; el < 2; el++) {
+        for (int k = 0; k < ARRAY_SIZE(c->guest_keys); k++) { f->keys[el][k] = pac_key(env, k, el); }
+        f->sctlr[el] = pac_hw_sctlr(env, env->cp15.sctlr_el[1], el);
+    }
+    f->pstate_mask = aarch64_pstate_valid_mask(&env_archcpu(env)->isar) & ~PSTATE_SS;
+    f->pac_el      = c->pac_loaded ? c->pac_el : 2;
+    f->magic       = APPLE_VIRT_FAST_MAGIC;
+}
+
+// After the vCPU ran: the key set the kernel left it holding.
+void apple_virt_fast_collect(CPUState* cs, void* area)
+{
+    AppleVirtFast* f = area;
+    AppleVirtCPU*  c = virt_cpu(cs);
+
+    if (f->magic == APPLE_VIRT_FAST_MAGIC && f->pac_el < 2) {
+        c->pac_loaded = true;
+        c->pac_el     = f->pac_el;
+    }
+}
+
+void apple_virt_fast_publish(CPUState* cs, void* area);
+void apple_virt_fast_collect(CPUState* cs, void* area);
 void apple_virt_debug_pac_el1(CPUState* cs);
 void apple_virt_debug_pac_el1(CPUState* cs) { pac_load(cs, cpu_env(cs), virt_cpu(cs), 1); }
 
