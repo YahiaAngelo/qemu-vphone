@@ -1928,6 +1928,7 @@ typedef struct {
     uint64_t aspsr;
     uint64_t status_other;
     uint64_t switches;
+    uint64_t stub_pc;
 } AppleVirtFast;
 
 
@@ -2061,6 +2062,7 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
                 c->dbg_guarded = g;
             }
             f->ws_ok        = ws_mask;
+            f->stub_pc      = virt.stub;
         }
     }
     f->magic       = APPLE_VIRT_FAST_MAGIC;
@@ -2112,6 +2114,17 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
             }
         }
         c->ws_seen           = f->switches;
+    }
+    // A flush the kernel started at a world switch (VR_KERNEL_WS bit 8) that the run left in the stub: this side's
+    // own from now on, as `gxf_flush_tlb` would have started it.
+    if (f->resume_valid == 1 && !f->pad && !c->flushing) {
+        CPUARMState* env = cpu_env(cs);
+
+        c->flushing            = true;
+        c->resume_pc           = f->resume_pc;
+        c->resume_pstate       = f->resume_pstate;
+        c->resume_sctlr        = env->cp15.sctlr_el[1];
+        env->cp15.sctlr_el[1] &= ~SCTLR_M;
     }
     // The kernel resumed from the flush stub.
     if (c->flushing && f->pad && !f->resume_valid) {
