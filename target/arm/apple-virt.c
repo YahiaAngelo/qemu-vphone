@@ -2018,11 +2018,12 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     // World switches (genter, gexit) where both worlds' shadow tables are current and nothing else is pending:
     // the world that doesn't run filled now, as `gxf_update_world_regs` would fill it at the switch.
     f->ws_ok = 0;
-    // Opt-in, VR_KERNEL_WS=<mask> (1 genter, 2 gexit, 4 a flush of every CPU's TLB): with 3, two iOS boots
-    // stalled with the UI frozen, cause not found yet.
+    // VR_KERNEL_WS=<mask>: 1 genter, 2 gexit, 4 a flush of every CPU's TLB, 8 the flush through the stub (as this
+    // side does it). Default 11: genter and gexit, through the stub (an iOS guest froze in 1 boot of 6, as often
+    // as with them here; flushing from EL2 instead, 4 of 9). 0 keeps them here.
     static int64_t ws_mask = -1;
 
-    if (ws_mask < 0) { ws_mask = getenv("VR_KERNEL_WS") ? strtoll(getenv("VR_KERNEL_WS"), NULL, 0) : 0; }
+    if (ws_mask < 0) { ws_mask = getenv("VR_KERNEL_WS") ? strtoll(getenv("VR_KERNEL_WS"), NULL, 0) : 11; }
     if (c->shadowed && !c->flushing && c->nr_step_pages == 0 && (ws_mask & 3)
         && c->flushed_evictions == qatomic_read(&virt.evictions)) {
         bool     g = c->guarded;
