@@ -3817,11 +3817,18 @@ bool kvm_device_supported(int vmfd, uint64_t type)
     return (ioctl(vmfd, KVM_CREATE_DEVICE, &create_dev) >= 0);
 }
 
+/* vphone-linux: an architecture's copy of the vCPU's registers from the last exit. */
+bool (*kvm_one_reg_get_hook)(CPUState *cs, uint64_t id, void *target);
+void (*kvm_one_reg_set_hook)(CPUState *cs, uint64_t id, const void *source);
+
 int kvm_set_one_reg(CPUState *cs, uint64_t id, void *source)
 {
     struct kvm_one_reg reg;
     int r;
 
+    if (kvm_one_reg_set_hook) {
+        kvm_one_reg_set_hook(cs, id, source);
+    }
     reg.id = id;
     reg.addr = (uintptr_t) source;
     r = kvm_vcpu_ioctl(cs, KVM_SET_ONE_REG, &reg);
@@ -3836,6 +3843,9 @@ int kvm_get_one_reg(CPUState *cs, uint64_t id, void *target)
     struct kvm_one_reg reg;
     int r;
 
+    if (kvm_one_reg_get_hook && kvm_one_reg_get_hook(cs, id, target)) {
+        return 0;
+    }
     reg.id = id;
     reg.addr = (uintptr_t) target;
     r = kvm_vcpu_ioctl(cs, KVM_GET_ONE_REG, &reg);

@@ -67,7 +67,21 @@ typedef struct
     bool traps_impdef;
     /// FIQs arrive as IRQs too, which the accelerator tells apart in `APPLE_VIRT_HVC_IRQ_*`.
     bool gic_interrupts;
+    // The instruction at `pc` the vCPU faulted on, if the accelerator knows it.
+    bool (*fault_insn)(CPUState* cs, uint64_t pc, uint32_t* insn);
 } AppleVirtOps;
+
+// vphone-linux: the kernel's copy of the vCPU's registers at an exit (linux-aurora-kvm's
+// `struct kvm_arm_apple_fast` snap_*): reg[] in AppleVirtReg order, PC to TTBR1_EL1.
+typedef struct {
+    uint64_t ok;
+    uint64_t valid;
+    uint64_t x[31];
+    uint64_t reg[14];
+    uint64_t insn;
+} AppleVirtSnap;
+
+AppleVirtSnap* apple_virt_fast_snap(void* area);
 
 /// Called by an accelerator that can run GXF/PAC emulation, whose guest physical address space ends at `ipa_end`.
 void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end);

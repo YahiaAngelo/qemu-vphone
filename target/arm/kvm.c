@@ -3973,7 +3973,75 @@ static bool vr_steptrace_step(CPUState *cs)
     return true;
 }
 
+/* The kernel's copy of the registers from the vCPU's last exit, while it holds them. */
+static AppleVirtSnap *kvm_virt_snap(CPUState *cs)
+{
+    AppleVirtSnap *snap;
+
+    if (!kvm_apple_virt || !kvm_apple_fast || !cs->kvm_run) {
+        return NULL;
+    }
+    snap = apple_virt_fast_snap(cs->kvm_run->s.padding + 64);
+    return snap->valid == 1 ? snap : NULL;
+}
+
+static uint64_t *kvm_virt_snap_slot(AppleVirtSnap *snap, uint64_t id)
+{
+    for (int n = 0; n < 31; n++) {
+        if (id == AARCH64_CORE_REG(regs.regs[n])) {
+            return &snap->x[n];
+        }
+    }
+    for (int r = APPLE_VIRT_REG_PC; r <= APPLE_VIRT_REG_TTBR1_EL1; r++) {
+        if (id == kvm_virt_reg_id(r)) {
+            return &snap->reg[r - APPLE_VIRT_REG_PC];
+        }
+    }
+    return NULL;
+}
+
+static bool kvm_virt_snap_get(CPUState *cs, uint64_t id, void *target)
+{
+    AppleVirtSnap *snap = kvm_virt_snap(cs);
+    uint64_t *slot = snap ? kvm_virt_snap_slot(snap, id) : NULL;
+
+    if (!slot) {
+        return false;
+    }
+    memcpy(target, slot, sizeof(*slot));
+    return true;
+}
+
+/* A write keeps the copy current, or drops it when it doesn't hold the register. */
+static void kvm_virt_snap_set(CPUState *cs, uint64_t id, const void *source)
+{
+    AppleVirtSnap *snap = kvm_virt_snap(cs);
+    uint64_t *slot;
+
+    if (!snap) {
+        return;
+    }
+    slot = kvm_virt_snap_slot(snap, id);
+    if (slot) {
+        memcpy(slot, source, sizeof(*slot));
+    } else {
+        snap->valid = 0;
+    }
+}
+
+static bool kvm_virt_fault_insn(CPUState *cs, uint64_t pc, uint32_t *insn)
+{
+    AppleVirtSnap *snap = kvm_virt_snap(cs);
+
+    if (!snap || !(snap->insn >> 32) || snap->reg[0] != pc) {
+        return false;
+    }
+    *insn = snap->insn;
+    return true;
+}
+
 static const AppleVirtOps kvm_apple_virt_ops = {
+    .fault_insn = kvm_virt_fault_insn,
     .get_xreg = kvm_virt_get_xreg,
     .set_xreg = kvm_virt_set_xreg,
     .get_qreg = kvm_virt_get_qreg,
@@ -4001,5 +4069,6 @@ void kvm_arch_init_memory(MachineState *ms, KVMState *s)
      */
     apple_virt_set_ops(&kvm_apple_virt_ops,
                        MIN(1ULL << kvm_arm_get_max_vm_ipa_size(ms, &fixed_ipa),
-                           1ULL << 36));
+                           1ULL << 36));    kvm_one_reg_get_hook = kvm_virt_snap_get;
+    kvm_one_reg_set_hook = kvm_virt_snap_set;
 }

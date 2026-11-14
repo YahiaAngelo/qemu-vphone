@@ -1929,6 +1929,12 @@ typedef struct {
     uint64_t status_other;
     uint64_t switches;
     uint64_t stub_pc;
+    uint64_t apctl_ok;
+    uint64_t apctl;
+    uint64_t kernkey[2];
+    AppleVirtSnap snap;
+    uint64_t keys_ok;
+    uint64_t mkey[2];
 } AppleVirtFast;
 
 
@@ -1936,7 +1942,8 @@ typedef struct {
 // writes: the kernel answers them from the values published before the vCPU runs.
 static const int apple_virt_fast_reads[] = {
     APPLE_VIRT_VREG_GXF_STATUS_EL1,     APPLE_VIRT_VREG_SPRR_UPERM_BR0_EL0, APPLE_VIRT_VREG_SPRR_UPERM_BR1_EL0,
-    APPLE_VIRT_VREG_SPRR_PPERM_BR1_EL1, APPLE_VIRT_VREG_M1_ASPSR_GL1,
+    APPLE_VIRT_VREG_SPRR_PPERM_BR1_EL1, APPLE_VIRT_VREG_M1_ASPSR_GL1,       APPLE_VIRT_VREG_TTBR0_EL1,
+    APPLE_VIRT_VREG_TTBR1_EL1,          APPLE_VIRT_VREG_TCR_EL1,
 };
 
 #define APPLE_VIRT_FAST_MAGIC 0x3130545341464150ULL
@@ -2066,8 +2073,22 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
             f->stub_pc      = virt.stub;
         }
     }
-    f->magic       = APPLE_VIRT_FAST_MAGIC;
+    // APCTL at EL1 (its KernKeyEn changes the keys above EL0, `pac_key`); VR_NO_KERNEL_APCTL=1 keeps it here.
+    f->apctl_ok   = !VR_ENV("VR_NO_KERNEL_APCTL");
+    f->apctl      = env->cp15.apctl_el1;
+    f->kernkey[0] = env->keys.kernel.lo;
+    f->kernkey[1] = env->keys.kernel.hi;
+    // The registers at the next exit, for `get_reg` without an ioctl each; VR_NO_SNAP=1 reads them one by one.
+    f->snap.ok    = !VR_ENV("VR_NO_SNAP");
+    f->snap.valid = 0;
+    // PAC key writes (`virt_vreg_write_value`, then `pac_key`); VR_NO_KERNEL_KEYS=1 keeps them here.
+    f->keys_ok = !VR_ENV("VR_NO_KERNEL_KEYS");
+    f->mkey[0] = env->keys.m.lo;
+    f->mkey[1] = env->keys.m.hi;
+    f->magic      = APPLE_VIRT_FAST_MAGIC;
 }
+
+AppleVirtSnap* apple_virt_fast_snap(void* area) { return &((AppleVirtFast*)area)->snap; }
 
 // After the vCPU ran: the key set the kernel left it holding.
 void apple_virt_fast_collect(CPUState* cs, void* area)
@@ -2080,6 +2101,13 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
         c->pac_loaded = true;
         c->pac_el     = f->pac_el;
     }
+    // APCTL, and ASPSR_GL1 where a world switch could take it, which the kernel may have written.
+    if (f->apctl_ok) { cpu_env(cs)->cp15.apctl_el1 = f->apctl; }
+    // The keys as written, which are the ones EL0 uses.
+    if (f->keys_ok) {
+        for (int k = 0; k < ARRAY_SIZE(c->guest_keys); k++) { *pac_key_field(cpu_env(cs), k) = f->keys[0][k]; }
+    }
+    if (f->ws_ok) { cpu_env(cs)->gxf.aspsr_gl[1] = f->aspsr; }
     // The kernel switched worlds: its guarded state, the bank of the world that doesn't run, and the tables of the
     // one that does (it flushed the TLB as it switched).
     if (f->ws_ok != 0 && f->switches != c->ws_seen) {
@@ -2143,11 +2171,18 @@ void apple_virt_debug_pac_el1(CPUState* cs) { pac_load(cs, cpu_env(cs), virt_cpu
 bool apple_virt_debug_translate(CPUState* cs, uint64_t va, hwaddr* pa);
 bool apple_virt_debug_translate(CPUState* cs, uint64_t va, hwaddr* pa) { return gxf_live_translate(cs, va, pa); }
 
+// VPHONE-DEBUG (VR_TIME_FAULT=1): where a page-table store's time goes, printed every 20000 stores.
+static struct {
+    uint64_t n, lock, fetch, emul, upd, total;
+} vr_tf;
+static inline uint64_t vr_ns(void) { struct timespec ts; if (!VR_ENV("VR_TIME_FAULT")) { return 0; } clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ULL + ts.tv_nsec; }
+
 static bool gxf_fetch_insn(GXFStore* st, uint64_t pc, uint32_t* insn)
 {
     hwaddr pa;
 
     if (!st->live) { return cpu_memory_rw_debug(st->cs, pc, insn, sizeof(*insn), false) == 0; }
+    if (virt.ops->fault_insn && virt.ops->fault_insn(st->cs, pc, insn)) { return true; }
     if (!gxf_live_translate(st->cs, pc, &pa)) { return false; }
     *insn = address_space_ldl_le(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED, NULL);
     return true;
@@ -2155,18 +2190,26 @@ static bool gxf_fetch_insn(GXFStore* st, uint64_t pc, uint32_t* insn)
 
 static bool gxf_try_emulate(GXFStore* st, GXFPage* p)
 {
+    uint64_t t0 = vr_ns(), t1, t2, t3;
     uint64_t pc = st->live ? virt.ops->get_reg(st->cs, APPLE_VIRT_REG_PC) : st->env->pc;
     uint32_t insn;
 
     st->lo = GXF_PAGE_SIZE;
     st->hi = 0;
-    if (!gxf_fetch_insn(st, pc, &insn) || !gxf_emulate_store(st, insn)) { return false; }
+    if (!gxf_fetch_insn(st, pc, &insn)) { return false; }
+    t1 = vr_ns();
+    if (!gxf_emulate_store(st, insn)) { return false; }
 
     if (st->live) { virt.ops->set_reg(st->cs, APPLE_VIRT_REG_PC, pc + 4); }
     else {
         st->env->pc = pc + 4;
     }
+    t2 = vr_ns();
     if (st->lo < st->hi) { gxf_page_updated(p->ipa, st->lo, st->hi - st->lo); }
+    t3 = vr_ns();
+    vr_tf.fetch += t1 - t0;
+    vr_tf.emul += t2 - t1;
+    vr_tf.upd += t3 - t2;
     return true;
 }
 
@@ -2184,8 +2227,10 @@ static GXFFaultResult gxf_write_fault(CPUState* cs, uint64_t va, hwaddr ipa)
     AppleVirtCPU* c   = virt_cpu(cs);
     GXFPage*      p;
     GXFStore      st;
+    uint64_t      t0 = vr_ns();
 
     QEMU_LOCK_GUARD(&virt.lock);
+    vr_tf.lock += vr_ns() - t0;
 
     p = gxf_page(ipa);
     // The page stopped being a table and became writable after the store faulted, so it is retried.
@@ -2239,9 +2284,27 @@ static GXFFaultResult gxf_write_fault(CPUState* cs, uint64_t va, hwaddr ipa)
 
 bool apple_virt_handle_write_fault(CPUState* cs, uint64_t va, hwaddr ipa)
 {
+    uint64_t       t0 = vr_ns();
+    GXFFaultResult r;
+
     if (!virt_cpu(cs)->managed) { return false; }
 
-    switch (gxf_write_fault(cs, va, ipa)) {
+    r = gxf_write_fault(cs, va, ipa);
+    if (VR_ENV("VR_TIME_FAULT")) {
+        static QemuMutex m;
+        static bool      init;
+
+        if (!init) { qemu_mutex_init(&m); init = true; }
+        qemu_mutex_lock(&m);
+        vr_tf.total += vr_ns() - t0;
+        if (++vr_tf.n % 20000 == 0) {
+            fprintf(stderr, "VR-TF n=%" PRIu64 " us/store: total %.2f lock %.2f fetch %.2f emul %.2f upd %.2f\n", vr_tf.n,
+                    vr_tf.total / 1e3 / vr_tf.n, vr_tf.lock / 1e3 / vr_tf.n, vr_tf.fetch / 1e3 / vr_tf.n,
+                    vr_tf.emul / 1e3 / vr_tf.n, vr_tf.upd / 1e3 / vr_tf.n);
+        }
+        qemu_mutex_unlock(&m);
+    }
+    switch (r) {
         case GXF_FAULT_NOT_TABLE : return false;
         case GXF_FAULT_HANDLED   : return true;
         case GXF_FAULT_NEEDS_SYNC: break;

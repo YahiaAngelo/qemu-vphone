@@ -559,6 +559,10 @@ int kvm_set_one_reg(CPUState *cs, uint64_t id, void *source);
  */
 int kvm_get_one_reg(CPUState *cs, uint64_t id, void *target);
 
+/* vphone-linux: answers a KVM_GET_ONE_REG from a copy, or is told of a KVM_SET_ONE_REG. */
+extern bool (*kvm_one_reg_get_hook)(CPUState *cs, uint64_t id, void *target);
+extern void (*kvm_one_reg_set_hook)(CPUState *cs, uint64_t id, const void *source);
+
 /* Notify resamplefd for EOI of specific interrupts. */
 void kvm_resample_fd_notify(int gsi);
 
