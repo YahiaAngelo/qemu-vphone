@@ -2012,7 +2012,8 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     // World switches (genter, gexit) where both worlds' shadow tables are current and nothing else is pending:
     // the world that doesn't run filled now, as `gxf_update_world_regs` would fill it at the switch.
     f->ws_ok = 0;
-    if (c->shadowed && !c->flushing && c->nr_step_pages == 0 && !VR_ENV("VR_NO_KERNEL_WS")
+    // Opt-in (VR_KERNEL_WS=1): with it, two iOS boots stalled with the UI frozen, cause not found yet.
+    if (c->shadowed && !c->flushing && c->nr_step_pages == 0 && VR_ENV("VR_KERNEL_WS")
         && c->flushed_evictions == qatomic_read(&virt.evictions)) {
         bool     g = c->guarded;
         GXFWorld other = {
