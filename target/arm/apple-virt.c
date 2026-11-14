@@ -168,6 +168,11 @@ typedef struct
     // `virt.evictions` then.
     uint64_t ws_seen;
     uint64_t ws_evictions;
+    // VPHONE-DEBUG (VR_CHECK_WS=1): the live registers and the published bank as the last run started.
+    uint64_t dbg_live[7];
+    uint64_t dbg_bank[7];
+    uint64_t dbg_ttbr[2][2];
+    bool     dbg_guarded;
 } AppleVirtCPU;
 
 static struct
@@ -2047,6 +2052,14 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
             f->status_other = env->gxf.gxf_status_el[1] & ~1ULL;
             c->ws_seen      = f->switches;
             c->ws_evictions = qatomic_read(&virt.evictions);
+            if (VR_ENV("VR_CHECK_WS")) {
+                for (int i = 0; i < 7; i++) {
+                    c->dbg_live[i] = virt.ops->get_reg(cs, gxf_bank_regs[i]);
+                    c->dbg_bank[i] = f->bank[i];
+                }
+                memcpy(c->dbg_ttbr, f->ttbr, sizeof(c->dbg_ttbr));
+                c->dbg_guarded = g;
+            }
             f->ws_ok        = ws_mask;
         }
     }
@@ -2079,6 +2092,25 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
             c->hw_ttbr[idx] = c->worlds[g].hw_ttbr[idx];
         }
         c->flushed_evictions = c->ws_evictions;
+        // VPHONE-DEBUG: after one genter, TPIDR and VBAR (which neither world changes often) are the guarded
+        // world's live and the unguarded world's in the bank, and the tables are the guarded world's.
+        if (VR_ENV("VR_CHECK_WS") && f->switches == c->ws_seen + 1 && g && !c->dbg_guarded) {
+            static int told;
+            uint64_t   live[3] = { virt.ops->get_reg(cs, APPLE_VIRT_REG_TPIDR_EL1),
+                                   virt.ops->get_reg(cs, APPLE_VIRT_REG_VBAR_EL1),
+                                   virt.ops->get_reg(cs, APPLE_VIRT_REG_TTBR1_EL1) };
+
+            if ((live[0] != c->dbg_bank[1] || live[1] != c->dbg_bank[2] || f->bank[1] != c->dbg_live[1]
+                 || f->bank[2] != c->dbg_live[2] || live[2] != c->dbg_ttbr[1][1])
+                && told++ < 20) {
+                fprintf(stderr,
+                        "WS-CHECK cpu%d genter: live tpidr %" PRIx64 " vbar %" PRIx64 " ttbr1 %" PRIx64
+                        " | expected gl tpidr %" PRIx64 " vbar %" PRIx64 " ttbr1 %" PRIx64
+                        " | bank tpidr %" PRIx64 " vbar %" PRIx64 " expected %" PRIx64 " %" PRIx64 "\n",
+                        cs->cpu_index, live[0], live[1], live[2], c->dbg_bank[1], c->dbg_bank[2],
+                        c->dbg_ttbr[1][1], f->bank[1], f->bank[2], c->dbg_live[1], c->dbg_live[2]);
+            }
+        }
         c->ws_seen           = f->switches;
     }
     // The kernel resumed from the flush stub.
