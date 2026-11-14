@@ -164,6 +164,10 @@ typedef struct
     uint32_t step_pstate;
     // The machine was reset during a step, so debug exceptions still exit to the host.
     bool untrap_debug;
+    // vphone-linux: the kernel's world switches as of the last run's start (`apple_virt_fast_publish`), and
+    // `virt.evictions` then.
+    uint64_t ws_seen;
+    uint64_t ws_evictions;
 } AppleVirtCPU;
 
 static struct
@@ -1910,6 +1914,15 @@ typedef struct {
     uint32_t pad3;
     uint32_t el0_insn[4];
     uint16_t el0_insn_imm[4];
+    uint64_t ws_ok;
+    uint64_t bank[7];
+    uint64_t ttbr[2][2];
+    uint64_t enter_pc;
+    uint64_t genter_pstate;
+    uint64_t genter_esr;
+    uint64_t aspsr;
+    uint64_t status_other;
+    uint64_t switches;
 } AppleVirtFast;
 
 
@@ -1996,6 +2009,42 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     // VR_NO_KERNEL_M1=1 keeps them here. (VR_NO_M1_FAST is this side's switch to its own slow path, not this one.)
     f->m1_bank_ok = apple_virt_m1_gl_names && !VR_ENV("VR_NO_KERNEL_M1");
     f->pac_el      = c->pac_loaded ? c->pac_el : 2;
+    // World switches (genter, gexit) where both worlds' shadow tables are current and nothing else is pending:
+    // the world that doesn't run filled now, as `gxf_update_world_regs` would fill it at the switch.
+    f->ws_ok = 0;
+    if (c->shadowed && !c->flushing && c->nr_step_pages == 0 && !VR_ENV("VR_NO_KERNEL_WS")
+        && c->flushed_evictions == qatomic_read(&virt.evictions)) {
+        bool     g = c->guarded;
+        GXFWorld other = {
+            .sctlr   = env->cp15.sctlr_el[1],
+            .tcr     = env->cp15.tcr_el[1],
+            .guarded = !g,
+        };
+        GXFWorld cur = other;
+
+        cur.guarded = g;
+        if (gxf_world_current(env, &c->worlds[g], &cur)) {
+            if (!gxf_world_current(env, &c->worlds[!g], &other)) {
+                QEMU_LOCK_GUARD(&virt.lock);
+                gxf_world_fill(env, &c->worlds[!g], &other);
+            }
+            for (int w = 0; w < 2; w++) {
+                for (int idx = 0; idx < 2; idx++) { f->ttbr[w][idx] = c->worlds[w].hw_ttbr[idx]; }
+            }
+            for (int i = 0; i < 7; i++) { f->bank[i] = *gxf_bank_field(env, !g, i); }
+            f->enter_pc      = env->gxf.gxf_enter_el[1];
+            f->genter_pstate = PSTATE_DAIF | PSTATE_MODE_EL1h | (other.sctlr & SCTLR_SPAN ? 0 : PSTATE_PAN);
+            if (cpu_isar_feature(aa64_ssbs, env_archcpu(env)) && (other.sctlr & SCTLR_DSSBS_64)) {
+                f->genter_pstate |= PSTATE_SSBS;
+            }
+            f->genter_esr   = syn_aa64_genter(0);
+            f->aspsr        = env->gxf.aspsr_gl[1];
+            f->status_other = env->gxf.gxf_status_el[1] & ~1ULL;
+            c->ws_seen      = f->switches;
+            c->ws_evictions = qatomic_read(&virt.evictions);
+            f->ws_ok        = 1;
+        }
+    }
     f->magic       = APPLE_VIRT_FAST_MAGIC;
 }
 
@@ -2009,6 +2058,23 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
     if (f->pac_el < 2) {
         c->pac_loaded = true;
         c->pac_el     = f->pac_el;
+    }
+    // The kernel switched worlds: its guarded state, the bank of the world that doesn't run, and the tables of the
+    // one that does (it flushed the TLB as it switched).
+    if (f->ws_ok == 1 && f->switches != c->ws_seen) {
+        CPUARMState* env = cpu_env(cs);
+        bool         g   = f->guarded;
+
+        env->gxf.gxf_status_el[1] = f->status_other | g;
+        env->gxf.aspsr_gl[1]      = f->aspsr;
+        for (int i = 0; i < 7; i++) { *gxf_bank_field(env, !g, i) = f->bank[i]; }
+        c->guarded = g;
+        for (int idx = 0; idx < 2; idx++) {
+            c->cur[idx]     = c->worlds[g].roots[idx];
+            c->hw_ttbr[idx] = c->worlds[g].hw_ttbr[idx];
+        }
+        c->flushed_evictions = c->ws_evictions;
+        c->ws_seen           = f->switches;
     }
     // The kernel resumed from the flush stub.
     if (c->flushing && f->pad && !f->resume_valid) {
