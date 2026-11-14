@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockable.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "hw/intc/arm_gicv3.h"
@@ -380,6 +381,7 @@ static void gicv3_set_irq(void *opaque, int irq, int level)
      */
     GICv3State *s = opaque;
 
+    QEMU_LOCK_GUARD(&s->lock);
     if (irq < (s->num_irq - GIC_INTERNAL)) {
         /* external interrupt (SPI) */
         gicv3_dist_set_irq(s, irq + GIC_INTERNAL, level);
@@ -413,10 +415,47 @@ static void arm_gicv3_post_load(GICv3State *s)
     gicv3_cache_all_target_cpustates(s);
 }
 
+/* vphone-linux: the MMIO under the GIC's lock (GICv3State.lock). */
+static MemTxResult gicv3_dist_read_locked(void *opaque, hwaddr offset, uint64_t *data,
+                                          unsigned size, MemTxAttrs attrs)
+{
+    GICv3State *s = opaque;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    return gicv3_dist_read(opaque, offset, data, size, attrs);
+}
+
+static MemTxResult gicv3_dist_write_locked(void *opaque, hwaddr offset, uint64_t data,
+                                           unsigned size, MemTxAttrs attrs)
+{
+    GICv3State *s = opaque;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    return gicv3_dist_write(opaque, offset, data, size, attrs);
+}
+
+static MemTxResult gicv3_redist_read_locked(void *opaque, hwaddr offset, uint64_t *data,
+                                            unsigned size, MemTxAttrs attrs)
+{
+    GICv3RedistRegion *region = opaque;
+
+    QEMU_LOCK_GUARD(&region->gic->lock);
+    return gicv3_redist_read(opaque, offset, data, size, attrs);
+}
+
+static MemTxResult gicv3_redist_write_locked(void *opaque, hwaddr offset, uint64_t data,
+                                             unsigned size, MemTxAttrs attrs)
+{
+    GICv3RedistRegion *region = opaque;
+
+    QEMU_LOCK_GUARD(&region->gic->lock);
+    return gicv3_redist_write(opaque, offset, data, size, attrs);
+}
+
 static const MemoryRegionOps gic_ops[] = {
     {
-        .read_with_attrs = gicv3_dist_read,
-        .write_with_attrs = gicv3_dist_write,
+        .read_with_attrs = gicv3_dist_read_locked,
+        .write_with_attrs = gicv3_dist_write_locked,
         .endianness = DEVICE_NATIVE_ENDIAN,
         .valid.min_access_size = 1,
         .valid.max_access_size = 8,
@@ -424,8 +463,8 @@ static const MemoryRegionOps gic_ops[] = {
         .impl.max_access_size = 8,
     },
     {
-        .read_with_attrs = gicv3_redist_read,
-        .write_with_attrs = gicv3_redist_write,
+        .read_with_attrs = gicv3_redist_read_locked,
+        .write_with_attrs = gicv3_redist_write_locked,
         .endianness = DEVICE_NATIVE_ENDIAN,
         .valid.min_access_size = 1,
         .valid.max_access_size = 8,

@@ -372,6 +372,8 @@ static void arm_gicv3_common_realize(DeviceState *dev, Error **errp)
     GICv3State *s = ARM_GICV3_COMMON(dev);
     int i, rdist_capacity, cpuidx;
 
+    qemu_rec_mutex_init(&s->lock);
+
     /*
      * This GIC device supports only revisions 3 and 4. The GICv1/v2
      * is a separate device.

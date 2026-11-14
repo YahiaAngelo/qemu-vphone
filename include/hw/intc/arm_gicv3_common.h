@@ -28,6 +28,7 @@
 #include "hw/intc/arm_gic_common.h"
 #include "qom/object.h"
 #include "qemu/notify.h"
+#include "qemu/thread.h"
 
 /*
  * Maximum number of possible interrupts, determined by the GIC architecture.
@@ -232,6 +233,11 @@ struct GICv3State {
     uint32_t num_cpu;
     /* The CPUs this GIC serves are first_cpu_index .. + num_cpu - 1 */
     uint32_t first_cpu_index;
+    /*
+     * vphone-linux: the GIC's state, so a KVM vCPU's CPU interface access doesn't wait on the
+     * BQL. Taken inside the BQL by the input lines and the MMIO, alone by the CPU interface.
+     */
+    QemuRecMutex lock;
     uint32_t num_irq;
     uint32_t revision;
     uint32_t maint_irq;

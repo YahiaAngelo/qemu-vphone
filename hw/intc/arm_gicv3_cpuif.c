@@ -36,6 +36,12 @@ static GICv3CPUState *icc_cs_from_env(CPUARMState *env)
     return env->gicv3state;
 }
 
+/* vphone-linux: the lock of the GIC whose CPU interface `env` has, if any (GICv3State.lock). */
+QemuRecMutex *gicv3_cpuif_lock(CPUARMState *env)
+{
+    return env->gicv3state ? &icc_cs_from_env(env)->gic->lock : NULL;
+}
+
 static bool gicv3_use_ns_bank(CPUARMState *env)
 {
     /* Return true if we should use the NonSecure bank for a banked GIC
@@ -1051,7 +1057,7 @@ void gicv3_cpuif_update(GICv3CPUState *cs)
     ARMCPU *cpu = ARM_CPU(cs->cpu);
     CPUARMState *env = &cpu->env;
 
-    assert(bql_locked());
+    /* vphone-linux: or the GIC's own lock (GICv3State.lock), which a KVM vCPU takes alone. */
 
     trace_gicv3_cpuif_update(gicv3_redist_affid(cs), cs->hppi.irq,
                              cs->hppi.grp, cs->hppi.prio);

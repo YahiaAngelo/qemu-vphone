@@ -551,6 +551,7 @@ static bool kvm_apple_virt;
 /* The host kernel takes apple-virt's exception entries and returns (linux-aurora-kvm's
  * kvm_arm_apple_fast): a kernel without it ignores the area, and every trap still exits. */
 static bool kvm_apple_fast = true;
+QemuRecMutex *gicv3_cpuif_lock(CPUARMState *env);
 void apple_virt_fast_publish(CPUState *cs, void *area);
 void apple_virt_fast_collect(CPUState *cs, void *area);
 
@@ -2436,8 +2437,27 @@ static int kvm_arm_handle_sysreg(CPUState *cs, uint64_t iss)
         return 0;
     }
 
-    if (ri->type & ARM_CP_IO) {
+    /* VPHONE-DEBUG (VR_TIME_GIC=1): the BQL wait and the work of a GIC CPU interface access. */
+    static struct { uint64_t n, wait, work; QemuMutex m; bool init; } vr_tg;
+    bool vr_tg_on = gic_cpuif && VR_ENV("VR_TIME_GIC");
+    struct timespec vr_t0, vr_t1, vr_t2;
+
+    /*
+     * vphone-linux: a GIC CPU interface access under the GIC's own lock rather than the BQL
+     * (GICv3State.lock), which it waited on for longer than it took. VR_GIC_BQL=1 takes the BQL.
+     */
+    QemuRecMutex *gic_lock = gic_cpuif && !VR_ENV("VR_GIC_BQL") ? gicv3_cpuif_lock(env) : NULL;
+
+    if (vr_tg_on) {
+        clock_gettime(CLOCK_MONOTONIC, &vr_t0);
+    }
+    if (gic_lock) {
+        qemu_rec_mutex_lock(gic_lock);
+    } else if (ri->type & ARM_CP_IO) {
         bql_lock();
+    }
+    if (vr_tg_on) {
+        clock_gettime(CLOCK_MONOTONIC, &vr_t1);
     }
     if (read) {
         if (ri->type & ARM_CP_CONST) {
@@ -2456,8 +2476,24 @@ static int kvm_arm_handle_sysreg(CPUState *cs, uint64_t iss)
             raw_write(env, ri, value);
         }
     }
-    if (ri->type & ARM_CP_IO) {
+    if (gic_lock) {
+        qemu_rec_mutex_unlock(gic_lock);
+    } else if (ri->type & ARM_CP_IO) {
         bql_unlock();
+    }
+    if (vr_tg_on) {
+        clock_gettime(CLOCK_MONOTONIC, &vr_t2);
+        if (qatomic_xchg(&vr_tg.init, true) == false) {
+            qemu_mutex_init(&vr_tg.m);
+        }
+        qemu_mutex_lock(&vr_tg.m);
+        vr_tg.wait += (vr_t1.tv_sec - vr_t0.tv_sec) * 1000000000LL + vr_t1.tv_nsec - vr_t0.tv_nsec;
+        vr_tg.work += (vr_t2.tv_sec - vr_t1.tv_sec) * 1000000000LL + vr_t2.tv_nsec - vr_t1.tv_nsec;
+        if (++vr_tg.n % 20000 == 0) {
+            fprintf(stderr, "VR-TG n=%" PRIu64 " us/access: bql wait %.2f work %.2f\n", vr_tg.n,
+                    vr_tg.wait / 1e3 / vr_tg.n, vr_tg.work / 1e3 / vr_tg.n);
+        }
+        qemu_mutex_unlock(&vr_tg.m);
     }
     if (!read && apple_virt_sysreg_written(cs, op0, op1, crn, crm, op2)) {
         return 0;
