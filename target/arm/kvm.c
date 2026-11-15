@@ -552,6 +552,7 @@ static bool kvm_apple_virt;
  * kvm_arm_apple_fast): a kernel without it ignores the area, and every trap still exits. */
 static bool kvm_apple_fast = true;
 QemuRecMutex *gicv3_cpuif_lock(CPUARMState *env);
+void apple_virt_pt_resync(CPUState *cs, void *area);
 void apple_virt_fast_publish(CPUState *cs, void *area);
 void apple_virt_fast_collect(CPUState *cs, void *area);
 
@@ -2541,6 +2542,12 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
 
     switch (run->exit_reason) {
     case KVM_EXIT_HYPERCALL:
+        /* vphone-linux: the kernel stored to a leaf page table and left a shadow entry to us. */
+        if (kvm_apple_virt && run->hypercall.nr == 0x13f0) {
+            apple_virt_pt_resync(cs, run->s.padding + 64);
+            ret = 0;
+            break;
+        }
         ret = kvm_arm_handle_hvc(cs, run->hypercall.nr);
         break;
     case KVM_EXIT_ARM_SYSREG:
@@ -4017,6 +4024,7 @@ struct GICv3State;
 void gicv3_debug_dump(struct GICv3State *s, FILE *f);
 struct GICv3State *gicv3_cpuif_gic(CPUARMState *env);
 void vpiop_debug_dump(FILE *f);
+void apple_virt_fast_debug(void *area, FILE *f);
 void virtio_pci_debug_dump(FILE *f);
 static QemuThread vr_dump_thread;
 
@@ -4047,6 +4055,9 @@ static void *vr_dump_main(void *opaque)
                     " fast_handled %" PRIu64 " gic %p\n", cs->cpu_index, run ? run->exit_reason : 0,
                     run ? (unsigned long long)run->s.regs.device_irq_level : 0ULL, env->irq_line_state,
                     cs->halted, handled, gic);
+            if (run) {
+                apple_virt_fast_debug(run->s.padding + 64, stderr);
+            }
             for (int i = 0; i < ARRAY_SIZE(gics); i++) {
                 if (gics[i] == gic) {
                     break;

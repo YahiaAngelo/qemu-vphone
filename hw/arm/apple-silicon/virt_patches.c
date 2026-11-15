@@ -282,11 +282,12 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
         }
         if (vreg < 0 || !(impdef || (flags & ck_virt_vreg_flags(vreg)))) { continue; }
 
-        // vphone-linux, VR_NATIVE_M1_GL=1: a guarded monitor's own exception registers as the native instruction,
-        // the vCPU's EL1 registers, which they are while it runs guarded (`virt_m1_bank_fast`'s live case). Not
-        // the default: some of SPTM's accesses run unguarded too (an iOS guest's Safari icon lost its needle),
-        // which the trap tells apart; the host kernel's fast path takes the live ones (`apple_virt_fast_publish`).
-        if ((flags & CK_VIRT_M1_MONITOR) && getenv("VR_NATIVE_M1_GL")) {
+        // vphone-linux: a guarded monitor's own exception registers as the native instruction, the vCPU's EL1
+        // registers, which they are while it runs guarded (`virt_m1_bank_fast`'s live case; the host kernel's world
+        // switch keeps them there). VR_LOG_M1_UNGUARDED=1 logged no access made unguarded (once QEMU switched worlds,
+        // and an iOS guest's Safari icon lost its needle). guestbench: -24% total, -36% mmap. VR_TRAP_M1_GL=1 traps
+        // them.
+        if ((flags & CK_VIRT_M1_MONITOR) && !getenv("VR_TRAP_M1_GL")) {
             uint32_t native = ck_virt_m1_gl_native(vreg, read);
 
             if (native != 0) {
@@ -294,6 +295,16 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
                 ++natives;
                 continue;
             }
+        }
+
+        // vphone-linux: a guarded monitor (SPTM, TXM) only runs guarded, where GXF_STATUS reads 1 (logged at every
+        // site with VR_LOG_GXF_STATUS: only the kernel ever reads anything else), so its reads are `movz xN, #1`,
+        // with no trap. guestbench mmap -13%. VR_TRAP_GXF_STATUS=1 traps them.
+        if ((flags & CK_VIRT_M1_MONITOR) && read && vreg == APPLE_VIRT_VREG_GXF_STATUS_EL1
+            && !getenv("VR_TRAP_GXF_STATUS")) {
+            stl_le_p(ptr, rt == 31 ? NOP : 0xD2800020u | rt);
+            ++natives;
+            continue;
         }
 
         // `mrs xzr, ?` only serialises.
@@ -304,6 +315,10 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
         ++sysregs;
     }
 
+    if ((flags & CK_VIRT_M1_MONITOR) && getenv("VR_LOG_M1_RANGES")) {
+        info_report("vphone-linux: M1 monitor range `%s` at 0x%" PRIx64 "-0x%" PRIx64, range->name, (uint64_t)va,
+                    (uint64_t)(va + range->length));
+    }
     if (unindexed != 0) {
         warn_report("`trap to the hypervisor` left %u IMPLEMENTATION DEFINED register accesses in `%s`: out of vregs.",
                     unindexed, range->name);

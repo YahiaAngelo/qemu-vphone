@@ -119,6 +119,8 @@ typedef struct
     bool       protected;
     uint32_t   steppers;
     GPtrArray* mirrors;
+    // vphone-linux: its slot in the kernel's table of leaf page tables (`gxf_pt_publish`), or -1.
+    int32_t pt_slot;
 } GXFPage;
 
 // The trees a world last ran on, which it holds active, and what they were loaded for.
@@ -137,6 +139,9 @@ typedef struct
 {
     // The vCPU runs the patched images; others (like the SEP's) are left alone.
     bool          managed;
+    // vphone-linux: its struct kvm_arm_apple_fast, and the reset whose decoded instructions it dropped.
+    void*         fast_area;
+    uint32_t      pt_reset_seen;
     bool          shadowed;
     bool          guarded;
     GXFWorldCache worlds[2];
@@ -181,6 +186,10 @@ static struct
     QemuMutex           lock;
     hwaddr              pool_base;
     hwaddr              pool_end;
+    // vphone-linux: the kernel's table of leaf page tables (`gxf_pt_publish`), past the pool's end.
+    uint8_t*            pt_host;
+    hwaddr              pt_ipa;
+    uint32_t            pt_reset_gen;
     hwaddr              pool_cursor;
     uint8_t*            pool_host;
     // Freed shadow tables, reused oldest first once enough have aged, so that the guest's TLB maintenance for them has
@@ -245,6 +254,112 @@ static uint8_t* gxf_host_ptr(hwaddr pa, hwaddr size)
 static void gxf_evict_root(void);
 static bool gxf_live_translate(CPUState* cs, uint64_t va, hwaddr* pa);
 
+/*
+ * vphone-linux: the table the host kernel takes stores to leaf page tables from (linux-aurora-kvm's
+ * struct kvm_arm_apple_pt_header and kvm_arm_apple_pt_slot, at struct kvm_arm_apple_fast's pt_table):
+ * each page whose mirrors are all whole leaf tables, with their shadow pages and permission sets. Only
+ * this side writes it, under virt.lock; a slot's sequence number is odd while it does.
+ */
+#define GXF_PT_SIZE        (8 * MiB)
+#define GXF_PT_SLOTS       32768
+#define GXF_PT_SLOT_BITS   15
+#define GXF_PT_MIRRORS     8
+#define GXF_PT_SLOTS_OFF   65536
+#define GXF_PT_MAGIC       0x3154504154534146ULL
+#define GXF_PT_KEY_VALID   1ULL
+#define GXF_PT_KEY_TOMB    2ULL
+#define GXF_PT_MAX_PERMS   32
+
+typedef struct
+{
+    uint64_t magic;
+    uint32_t nperms;
+    uint32_t pad;
+    uint64_t perms[GXF_PT_MAX_PERMS][16];
+} GXFPtHeader;
+
+typedef struct
+{
+    uint32_t seq;
+    uint32_t n;
+    uint64_t key;
+    uint64_t shadow[GXF_PT_MIRRORS];
+    uint8_t  perm[GXF_PT_MIRRORS];
+    uint8_t  pad[40];
+} GXFPtSlot;
+
+QEMU_BUILD_BUG_ON(sizeof(GXFPtSlot) != 128);
+QEMU_BUILD_BUG_ON(GXF_PT_SLOTS_OFF + GXF_PT_SLOTS * sizeof(GXFPtSlot) > GXF_PT_SIZE);
+
+static GXFPtSlot* gxf_pt_slot(uint32_t i) { return (GXFPtSlot*)(virt.pt_host + GXF_PT_SLOTS_OFF) + i; }
+
+static uint32_t gxf_pt_hash(hwaddr page)
+{
+    return ((page >> 14) * 0x9e3779b97f4a7c15ULL) >> (64 - GXF_PT_SLOT_BITS);
+}
+
+static void gxf_pt_write(GXFPtSlot* s, uint64_t key, uint32_t n, const uint64_t* shadow, const uint8_t* perm)
+{
+    qatomic_set(&s->seq, s->seq + 1);
+    smp_wmb();
+    s->key = key;
+    s->n   = n;
+    for (int k = 0; k < GXF_PT_MIRRORS; k++) {
+        s->shadow[k] = k < n ? shadow[k] : 0;
+        s->perm[k]   = k < n ? perm[k] : 0;
+    }
+    smp_wmb();
+    qatomic_set(&s->seq, s->seq + 1);
+}
+
+static int gxf_pt_perm_index(const GXFPerms* perms);
+
+// Publishes the page's slot, or takes it back when the page no longer qualifies.
+static void gxf_pt_publish(GXFPage* p)
+{
+    uint64_t shadow[GXF_PT_MIRRORS];
+    uint8_t  perm[GXF_PT_MIRRORS];
+    uint32_t n  = p->mirrors->len;
+    bool     ok = virt.pt_host != NULL && n >= 1 && n <= GXF_PT_MIRRORS;
+
+    for (uint32_t k = 0; ok && k < n; k++) {
+        GXFMirror* m = g_ptr_array_index(p->mirrors, k);
+        int        i = gxf_pt_perm_index(m->perms);
+
+        ok        = m->level == 3 && m->nents == GXF_PT_ENTRIES && m->ipa == p->ipa && i >= 0;
+        shadow[k] = m->shadow_host != NULL ? m->shadow : 0;
+        perm[k]   = i;
+    }
+    if (!ok) {
+        if (p->pt_slot >= 0) { gxf_pt_write(gxf_pt_slot(p->pt_slot), GXF_PT_KEY_TOMB, 0, NULL, NULL); }
+        p->pt_slot = -1;
+        return;
+    }
+    if (p->pt_slot < 0) {
+        uint32_t h = gxf_pt_hash(p->ipa);
+
+        for (int probe = 0; probe < 32; probe++, h = (h + 1) & (GXF_PT_SLOTS - 1)) {
+            uint64_t key = gxf_pt_slot(h)->key;
+
+            if (key == 0 || key == GXF_PT_KEY_TOMB) {
+                p->pt_slot = h;
+                break;
+            }
+        }
+        if (p->pt_slot < 0) { return; }
+    }
+    gxf_pt_write(gxf_pt_slot(p->pt_slot), p->ipa | GXF_PT_KEY_VALID, n, shadow, perm);
+}
+
+static void gxf_pt_unpublish(GXFPage* p)
+{
+    if (p->pt_slot >= 0) { gxf_pt_write(gxf_pt_slot(p->pt_slot), GXF_PT_KEY_TOMB, 0, NULL, NULL); }
+    p->pt_slot = -1;
+}
+
+// Before a freed shadow page is reused: no vCPU's kernel is still storing to it (`pt_op`).
+static void gxf_pt_quiesce(void);
+
 static hwaddr gxf_pool_alloc(void)
 {
     hwaddr pa;
@@ -264,6 +379,7 @@ static hwaddr gxf_pool_alloc(void)
     else {
         while (g_queue_is_empty(&virt.pool_free)) { gxf_evict_root(); }
         pa = virt.pool_base + GPOINTER_TO_UINT(g_queue_pop_head(&virt.pool_free)) * GXF_PAGE_SIZE;
+        gxf_pt_quiesce();
     }
 
     virt.pool_used += 1;
@@ -307,14 +423,17 @@ static void gxf_track(GXFMirror* m)
         p          = g_new0(GXFPage, 1);
         p->ipa     = m->ipa & ~(hwaddr)(GXF_PAGE_SIZE - 1);
         p->mirrors = g_ptr_array_new();
+        p->pt_slot = -1;
         g_hash_table_insert(virt.pages, &p->ipa, p);
         g_hash_table_remove(virt.unprotected, GSIZE_TO_POINTER(p->ipa));
     }
     g_ptr_array_add(p->mirrors, m);
+    gxf_pt_publish(p);
 }
 
 static void gxf_page_free(GXFPage* p)
 {
+    gxf_pt_unpublish(p);
     if (p->protected) {
         gxf_protect(p->ipa, true);
         g_hash_table_add(virt.unprotected, GSIZE_TO_POINTER(p->ipa));
@@ -335,6 +454,7 @@ static void gxf_untrack(GXFMirror* m)
     GXFPage* p = gxf_page(m->ipa);
 
     g_ptr_array_remove_fast(p->mirrors, m);
+    gxf_pt_publish(p);
     gxf_page_put(p);
 }
 
@@ -382,6 +502,7 @@ static void gxf_mirror_materialise(GXFMirror* m)
 
     m->shadow      = gxf_pool_alloc();
     m->shadow_host = (uint64_t*)(virt.pool_host + (m->shadow - virt.pool_base));
+    if (gxf_page(m->ipa) != NULL) { gxf_pt_publish(gxf_page(m->ipa)); }
     if (m->children != NULL) {
         for (uint32_t i = 0; i < m->nents; i++) {
             if (m->children[i] != NULL) { m->shadow_host[i] = cpu_to_le64(gxf_mirror_table_desc(m->children[i])); }
@@ -460,7 +581,9 @@ static void gxf_mirror_sync_range(GXFMirror* m, uint32_t first, uint32_t count)
         uint64_t d = le64_to_cpu(qatomic_read(&m->host[i]));
         uint64_t shadow;
 
-        if (d == m->seen[i]) { continue; }
+        // A leaf entry is always recomputed: the host kernel stores to leaf tables too (`gxf_pt_publish`),
+        // without updating `seen`. Tables keep it, which spares their subtrees.
+        if (m->level < 3 && d == m->seen[i]) { continue; }
         m->seen[i] = d;
         shadow     = gxf_mirror_desc(m, i, d);
         if (shadow != 0 && m->shadow_host == NULL) { gxf_mirror_materialise(m); }
@@ -565,7 +688,22 @@ static const GXFPerms* gxf_get_perms(bool guarded, uint64_t perm_el0, uint64_t p
 
     p = g_memdup2(&want, sizeof(want));
     g_ptr_array_add(virt.perms, p);
+    if (virt.pt_host != NULL && virt.perms->len <= GXF_PT_MAX_PERMS) {
+        GXFPtHeader* h = (GXFPtHeader*)virt.pt_host;
+
+        memcpy(h->perms[virt.perms->len - 1], p->leaf, sizeof(p->leaf));
+        smp_wmb();
+        qatomic_set(&h->nperms, virt.perms->len);
+    }
     return p;
+}
+
+static int gxf_pt_perm_index(const GXFPerms* perms)
+{
+    for (guint i = 0; i < virt.perms->len && i < GXF_PT_MAX_PERMS; i++) {
+        if (g_ptr_array_index(virt.perms, i) == perms) { return i; }
+    }
+    return -1;
 }
 
 static GXFRoot* gxf_get_root(uint64_t ttbr, uint32_t va_bits, const GXFPerms* perms)
@@ -1214,6 +1352,22 @@ static bool virt_m1_bank_fast(CPUState* cs, CPUARMState* env, int vreg, bool rea
     }
     field = live ? NULL : gxf_bank_field(env, gl, i);
 
+    // VPHONE-DEBUG (VR_LOG_M1_UNGUARDED=1): each instruction address that reaches a _GL1 register unguarded,
+    // which a native rewrite of it would get wrong (VR_NATIVE_M1_GL).
+    if (gl && !live && VR_ENV("VR_LOG_M1_UNGUARDED")) {
+        static uint64_t seen[64];
+        static int      nseen;
+        uint64_t        pc = virt.ops->get_reg(cs, APPLE_VIRT_REG_PC);
+        int             k;
+
+        for (k = 0; k < nseen && seen[k] != pc; k++) { }
+        if (k == nseen && nseen < ARRAY_SIZE(seen)) {
+            seen[nseen++] = pc;
+            fprintf(stderr, "M1-UNGUARDED pc 0x%" PRIx64 " vreg %d %s cpsr 0x%" PRIx64 "\n", pc, vreg,
+                    read ? "read" : "write", virt.ops->get_reg(cs, APPLE_VIRT_REG_CPSR));
+        }
+    }
+
     if (read) {
         value = live ? virt.ops->get_reg(cs, gxf_bank_regs[i]) : *field;
         if (VR_ENV("VR_CHECK_M1")) {
@@ -1297,6 +1451,19 @@ static bool virt_handle_sysreg_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU
 
     field = virt_vreg_field(env, vreg);
     if (read) {
+        // VPHONE-DEBUG (VR_LOG_GXF_STATUS=1): each address that reads GXF_STATUS as anything but 1 (guarded).
+        if (vreg == APPLE_VIRT_VREG_GXF_STATUS_EL1 && *field != 1 && VR_ENV("VR_LOG_GXF_STATUS")) {
+            static uint64_t seen[128];
+            static int      nseen;
+            uint64_t        pc = virt.ops->get_reg(cs, APPLE_VIRT_REG_PC);
+            int             k;
+
+            for (k = 0; k < nseen && seen[k] != pc; k++) { }
+            if (k == nseen && nseen < ARRAY_SIZE(seen)) {
+                seen[nseen++] = pc;
+                fprintf(stderr, "GXF-STATUS pc 0x%" PRIx64 " value 0x%" PRIx64 "\n", pc, *field);
+            }
+        }
         if (rt != 31) { virt.ops->set_xreg(cs, rt, *field); }
         return true;
     }
@@ -1935,6 +2102,17 @@ typedef struct {
     AppleVirtSnap snap;
     uint64_t keys_ok;
     uint64_t mkey[2];
+    uint64_t pt_ok;
+    uint64_t pt_table;
+    uint64_t pt_nslots;
+    uint64_t pt_op;
+    uint64_t pt_handled;
+    uint64_t pt_resync;
+    uint64_t pt_icache_pc[8];
+    uint32_t pt_icache_insn[8];
+    uint32_t pt_icache_next;
+    uint32_t pad4;
+    uint32_t pt_why[16];
 } AppleVirtFast;
 
 
@@ -2083,12 +2261,57 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     f->snap.valid = 0;
     // PAC key writes (`virt_vreg_write_value`, then `pac_key`); VR_NO_KERNEL_KEYS=1 keeps them here.
     f->keys_ok = !VR_ENV("VR_NO_KERNEL_KEYS");
+    // Stores to leaf page tables (`gxf_pt_publish`), but while a store is being stepped over here.
+    // VR_NO_KERNEL_PT=1 keeps them here.
+    c->fast_area = area;
+    if (c->pt_reset_seen != virt.pt_reset_gen) {
+        memset(f->pt_icache_pc, 0, sizeof(f->pt_icache_pc));
+        c->pt_reset_seen = virt.pt_reset_gen;
+    }
+    f->pt_table  = virt.pt_ipa;
+    f->pt_nslots = GXF_PT_SLOTS;
+    f->pt_ok     = virt.pt_host != NULL && c->nr_step_pages == 0 && !VR_ENV("VR_NO_KERNEL_PT");
     f->mkey[0] = env->keys.m.lo;
     f->mkey[1] = env->keys.m.hi;
     f->magic      = APPLE_VIRT_FAST_MAGIC;
 }
 
 AppleVirtSnap* apple_virt_fast_snap(void* area) { return &((AppleVirtFast*)area)->snap; }
+
+// VPHONE-DEBUG (VR_HANG_DUMP): the kernel's leaf page-table store counters.
+void apple_virt_fast_debug(void* area, FILE* f);
+void apple_virt_fast_debug(void* area, FILE* f)
+{
+    AppleVirtFast* fa = area;
+
+    fprintf(f, "    pt_ok %" PRIu64 " handled %" PRIu64 " why", fa->pt_ok, fa->pt_handled);
+    for (int w = 0; w < 16; w++) {
+        if (fa->pt_why[w]) { fprintf(f, " %d=%u", w, fa->pt_why[w]); }
+    }
+    fprintf(f, "\n");
+}
+
+static void gxf_pt_quiesce(void)
+{
+    CPUState* cs;
+
+    smp_mb();
+    CPU_FOREACH(cs)
+    {
+        AppleVirtFast* f = virt_cpu(cs)->fast_area;
+
+        while (f != NULL && qatomic_read(&f->pt_op) != 0) { sched_yield(); }
+    }
+}
+
+// The kernel stored to a leaf page table but left a shadow entry to this side (KVM_ARM_APPLE_PT_RESYNC).
+void apple_virt_pt_resync(CPUState* cs, void* area)
+{
+    hwaddr entry = ((AppleVirtFast*)area)->pt_resync;
+
+    QEMU_LOCK_GUARD(&virt.lock);
+    gxf_page_updated(entry & ~(hwaddr)(GXF_PAGE_SIZE - 1), entry & (GXF_PAGE_SIZE - 1) & ~7, 8);
+}
 
 // After the vCPU ran: the key set the kernel left it holding.
 void apple_virt_fast_collect(CPUState* cs, void* area)
@@ -2238,6 +2461,44 @@ static GXFFaultResult gxf_write_fault(CPUState* cs, uint64_t va, hwaddr ipa)
         return g_hash_table_contains(virt.unprotected, GSIZE_TO_POINTER(ipa & ~(hwaddr)(GXF_PAGE_SIZE - 1))) ?
                    GXF_FAULT_HANDLED :
                    GXF_FAULT_NOT_TABLE;
+    }
+
+    // VPHONE-DEBUG (VR_LOG_PT=1): the first stores the kernel left here, and why their page wasn't its.
+    if (VR_ENV("VR_LOG_PT")) {
+        static int told, unpub;
+
+        if (p->pt_slot < 0 && unpub++ < 30) {
+            fprintf(stderr, "PT-UNPUB ipa 0x%" HWADDR_PRIx " mirrors %u:", ipa, p->mirrors->len);
+            for (guint k = 0; k < p->mirrors->len; k++) {
+                GXFMirror* m = g_ptr_array_index(p->mirrors, k);
+
+                fprintf(stderr, " [L%u n%u ipa%s perm %d]", m->level, m->nents, m->ipa == p->ipa ? "=" : "!=",
+                        gxf_pt_perm_index(m->perms));
+            }
+            fprintf(stderr, "\n");
+        }
+        if (told++ < 20) {
+            AppleVirtFast* fa = c->fast_area;
+
+            fprintf(stderr, "PT-STORE pc 0x%" PRIx64 " ipa 0x%" HWADDR_PRIx " pt_ok %" PRIu64 " handled %" PRIu64
+                    " op %" PRIu64 " slot %d mirrors %u:", virt.ops->get_reg(cs, APPLE_VIRT_REG_PC), ipa,
+                    fa ? fa->pt_ok : 9, fa ? fa->pt_handled : 9, fa ? fa->pt_op : 9, p->pt_slot, p->mirrors->len);
+            for (int w = 0; fa && w < 16; w++) {
+                if (fa->pt_why[w]) { fprintf(stderr, " why%d=%u", w, fa->pt_why[w]); }
+            }
+            for (guint k = 0; k < p->mirrors->len; k++) {
+                GXFMirror* m = g_ptr_array_index(p->mirrors, k);
+
+                fprintf(stderr, " [L%u n%u ipa%s shadow 0x%" HWADDR_PRIx " perm %d]", m->level, m->nents,
+                        m->ipa == p->ipa ? "=" : "!=", m->shadow_host ? m->shadow : 0, gxf_pt_perm_index(m->perms));
+            }
+            if (p->pt_slot >= 0) {
+                GXFPtSlot* sl = gxf_pt_slot(p->pt_slot);
+
+                fprintf(stderr, " | slot seq %u n %u key 0x%" PRIx64, sl->seq, sl->n, sl->key);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 
     st = (GXFStore){
@@ -2450,6 +2711,11 @@ static void gxf_reset(void)
     g_hash_table_foreach_remove(virt.pages, gxf_page_drop, NULL);
     g_hash_table_remove_all(virt.unprotected);
     g_ptr_array_set_size(virt.perms, 0);
+    if (virt.pt_host != NULL) {
+        memset(virt.pt_host, 0, GXF_PT_SIZE);
+        ((GXFPtHeader*)virt.pt_host)->magic = GXF_PT_MAGIC;
+    }
+    virt.pt_reset_gen++;
     g_queue_clear(&virt.pool_free);
     virt.pool_cursor = virt.pool_base + 2 * GXF_PAGE_SIZE;
     virt.pool_used   = 0;
@@ -2483,7 +2749,10 @@ void apple_virt_set_ops(const AppleVirtOps* ops, hwaddr ipa_end)
 
     virt.pool_host = qemu_memalign(GXF_PAGE_SIZE, GXF_POOL_SIZE);
     virt.pool_base = ipa_end - GXF_POOL_SIZE;
-    virt.pool_end  = ipa_end;
+    // The kernel's table of leaf page tables takes the pool's last GXF_PT_SIZE (`gxf_pt_publish`).
+    virt.pool_end  = ipa_end - GXF_PT_SIZE;
+    virt.pt_host   = virt.pool_host + GXF_POOL_SIZE - GXF_PT_SIZE;
+    virt.pt_ipa    = virt.pool_end;
     virt.stub      = virt.pool_base;
     virt.empty     = virt.pool_base + GXF_PAGE_SIZE;
     memset(virt.pool_host, 0, 2 * GXF_PAGE_SIZE);
