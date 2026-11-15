@@ -2284,6 +2284,15 @@ void apple_virt_fast_debug(void* area, FILE* f)
 {
     AppleVirtFast* fa = area;
 
+    static bool sites_told;
+
+    if (!sites_told) {
+        sites_told = true;
+        for (uint32_t i = 0; i < qatomic_read(&apple_virt_el0_sites.n); i++) {
+            fprintf(f, "  el0 site 0x%" PRIx64 " imm 0x%x rt %u\n", apple_virt_el0_sites.va[i],
+                    apple_virt_el0_sites.imm[i], apple_virt_el0_sites.rt[i]);
+        }
+    }
     fprintf(f, "    pt_ok %" PRIu64 " handled %" PRIu64 " why", fa->pt_ok, fa->pt_handled);
     for (int w = 0; w < 16; w++) {
         if (fa->pt_why[w]) { fprintf(f, " %d=%u", w, fa->pt_why[w]); }
