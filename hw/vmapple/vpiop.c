@@ -132,6 +132,32 @@ static void vpiop_update_irq(VPIOPState *s)
                  (sep->irq_en & IRQ_EN_OUTBOX) && sep_out->count == 0);
 }
 
+/* VPHONE-DEBUG: the mailbox's state, for a hung guest (target/arm/kvm.c VR_HANG_DUMP). */
+static VPIOPState *vpiop_debug;
+
+void vpiop_debug_dump(FILE *f);
+void vpiop_debug_dump(FILE *f)
+{
+    VPIOPState *s = vpiop_debug;
+
+    if (!s) {
+        return;
+    }
+    for (int i = 0; i < SIDE_COUNT; i++) {
+        VPIOPSide *d = &s->side[i];
+
+        fprintf(f, "  vpiop %s: ctrl 0x%x status 0x%x irq_en 0x%x inbox count %u head %u\n",
+                side_name(i), d->ctrl, d->status, d->irq_en, d->inbox.count, d->inbox.head);
+        for (uint32_t m = 0; m < d->inbox.count; m++) {
+            uint8_t *msg = d->inbox.msg[(d->inbox.head + m) % VPIOP_FIFO_DEPTH];
+
+            fprintf(f, "    msg %u: %016" PRIx64 " %016" PRIx64 "\n", m, ldq_le_p(msg), ldq_le_p(msg + 8));
+        }
+    }
+    fprintf(f, "  vpiop ap edge state: inbox_pending %d outbox_pending %d inbox_seen %u\n",
+            s->ap_inbox_pending, s->ap_outbox_pending, s->ap_inbox_seen);
+}
+
 #define QUEUE_LEVEL_SHIFT    20
 
 static uint32_t queue_level(VPIOPQueue *q)
@@ -296,6 +322,7 @@ static void vpiop_reset(DeviceState *dev)
 
 static void vpiop_init(Object *obj)
 {
+    vpiop_debug = VPIOP(obj);
     VPIOPState *s = VPIOP(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     int i;

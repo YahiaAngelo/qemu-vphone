@@ -415,6 +415,38 @@ static void arm_gicv3_post_load(GICv3State *s)
     gicv3_cache_all_target_cpustates(s);
 }
 
+/*
+ * VPHONE-DEBUG: the GIC's state, for a hung guest (target/arm/kvm.c VR_HANG_DUMP): every
+ * interrupt pending, active or asserted, and each CPU interface's priorities.
+ */
+void gicv3_debug_dump(GICv3State *s, FILE *f)
+{
+    QEMU_LOCK_GUARD(&s->lock);
+    fprintf(f, "GIC %p: ctlr 0x%x num_irq %u cpus %u (first %u)\n", s, s->gicd_ctlr, s->num_irq,
+            s->num_cpu, s->first_cpu_index);
+    for (int irq = GIC_INTERNAL; irq < s->num_irq; irq++) {
+        bool pend = gicv3_gicd_pending_test(s, irq), act = gicv3_gicd_active_test(s, irq);
+        bool lvl = gicv3_gicd_level_test(s, irq);
+
+        if (pend || act || lvl) {
+            fprintf(f, "  SPI %d: pend %d act %d level %d enabled %d edge %d prio 0x%x route 0x%" PRIx64 "\n",
+                    irq, pend, act, lvl, gicv3_gicd_enabled_test(s, irq), gicv3_gicd_edge_trigger_test(s, irq),
+                    s->gicd_ipriority[irq], s->gicd_irouter[irq]);
+        }
+    }
+    for (int i = 0; i < s->num_cpu; i++) {
+        GICv3CPUState *cs = &s->cpu[i];
+
+        fprintf(f, "  cpu%d (vcpu %d): pend0 0x%x en0 0x%x act0 0x%x level 0x%x pmr 0x%" PRIx64
+                " grpen %" PRIx64 "/%" PRIx64 " apr1 %" PRIx64 " apr0 %" PRIx64 " hppi %d prio 0x%x grp %d"
+                " waker 0x%x\n",
+                i, cs->cpu ? cs->cpu->cpu_index : -1, cs->gicr_ipendr0, cs->gicr_ienabler0, cs->gicr_iactiver0,
+                cs->level, cs->icc_pmr_el1, cs->icc_igrpen[GICV3_G0], cs->icc_igrpen[GICV3_G1NS],
+                cs->icc_apr[GICV3_G1NS][0], cs->icc_apr[GICV3_G0][0], cs->hppi.irq, cs->hppi.prio, cs->hppi.grp,
+                cs->gicr_waker);
+    }
+}
+
 /* vphone-linux: the MMIO under the GIC's lock (GICv3State.lock). */
 static MemTxResult gicv3_dist_read_locked(void *opaque, hwaddr offset, uint64_t *data,
                                           unsigned size, MemTxAttrs attrs)

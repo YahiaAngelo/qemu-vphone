@@ -2652,3 +2652,51 @@ static void virtio_pci_register_types(void)
 }
 
 type_init(virtio_pci_register_types)
+
+/*
+ * VPHONE-DEBUG: every virtio-pci device's queues (the ring indexes in guest memory) and their
+ * MSI-X vectors, for a hung guest (target/arm/kvm.c VR_HANG_DUMP).
+ */
+static int virtio_pci_debug_dump_one(Object *obj, void *opaque)
+{
+    FILE *f = opaque;
+    VirtIOPCIProxy *proxy;
+    VirtIODevice *vdev;
+    PCIDevice *pci;
+
+    if (!object_dynamic_cast(obj, TYPE_VIRTIO_PCI)) {
+        return 0;
+    }
+    proxy = VIRTIO_PCI(obj);
+    pci = PCI_DEVICE(proxy);
+    vdev = virtio_bus_get_device(&proxy->bus);
+    if (!vdev) {
+        return 0;
+    }
+    fprintf(f, "  virtio %s: status 0x%x isr 0x%x config vector %u msix enabled %d masked-all %d\n",
+            vdev->name, vdev->status, qatomic_read(&vdev->isr), vdev->config_vector, msix_enabled(pci),
+            pci->msix_function_masked);
+    for (int n = 0; n < VIRTIO_QUEUE_MAX && virtio_queue_get_num(vdev, n); n++) {
+        hwaddr avail = virtio_queue_get_avail_addr(vdev, n), used = virtio_queue_get_used_addr(vdev, n);
+        uint16_t vec = virtio_queue_vector(vdev, n);
+        uint16_t aflags = 0, aidx = 0, uflags = 0, uidx = 0;
+
+        if (avail && used) {
+            aflags = lduw_le_phys(&address_space_memory, avail);
+            aidx = lduw_le_phys(&address_space_memory, avail + 2);
+            uflags = lduw_le_phys(&address_space_memory, used);
+            uidx = lduw_le_phys(&address_space_memory, used + 2);
+        }
+        fprintf(f, "    vq %d: num %d avail idx %u flags 0x%x | used idx %u flags 0x%x | vector %u masked %d"
+                " pending %d\n", n, virtio_queue_get_num(vdev, n), aidx, aflags, uidx, uflags, vec,
+                vec < pci->msix_entries_nr ? msix_is_masked(pci, vec) : -1,
+                vec < pci->msix_entries_nr ? msix_is_pending(pci, vec) : -1);
+    }
+    return 0;
+}
+
+void virtio_pci_debug_dump(FILE *f);
+void virtio_pci_debug_dump(FILE *f)
+{
+    object_child_foreach_recursive(object_get_root(), virtio_pci_debug_dump_one, f);
+}

@@ -4009,6 +4009,64 @@ static bool vr_steptrace_step(CPUState *cs)
     return true;
 }
 
+/*
+ * VPHONE-DEBUG (VR_HANG_DUMP=1): while $TMPDIR/vr-dump exists, once a second, what a hung guest's
+ * interrupts look like: each vCPU's lines and last exit, and each GIC's state.
+ */
+struct GICv3State;
+void gicv3_debug_dump(struct GICv3State *s, FILE *f);
+struct GICv3State *gicv3_cpuif_gic(CPUARMState *env);
+void vpiop_debug_dump(FILE *f);
+void virtio_pci_debug_dump(FILE *f);
+static QemuThread vr_dump_thread;
+
+static void *vr_dump_main(void *opaque)
+{
+    g_autofree char *path = g_strdup_printf("%s/vr-dump", g_get_tmp_dir());
+
+    for (;;) {
+        struct GICv3State *gics[4] = { 0 };
+        CPUState *cs;
+
+        g_usleep(1000000);
+        if (access(path, F_OK) != 0) {
+            continue;
+        }
+        unlink(path);
+        fprintf(stderr, "VR-DUMP at %" PRId64 " ms\n", qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+        CPU_FOREACH(cs) {
+            CPUARMState *env = cpu_env(cs);
+            struct kvm_run *run = cs->kvm_run;
+            uint64_t handled = 0;
+            struct GICv3State *gic = gicv3_cpuif_gic(env);
+
+            if (run) {
+                memcpy(&handled, run->s.padding + 64 + 200 /* kvm_arm_apple_fast.handled */, sizeof(handled));
+            }
+            fprintf(stderr, "  vcpu %d: exit_reason %u device_irq_level 0x%llx irq_line_state 0x%x halted %u"
+                    " fast_handled %" PRIu64 " gic %p\n", cs->cpu_index, run ? run->exit_reason : 0,
+                    run ? (unsigned long long)run->s.regs.device_irq_level : 0ULL, env->irq_line_state,
+                    cs->halted, handled, gic);
+            for (int i = 0; i < ARRAY_SIZE(gics); i++) {
+                if (gics[i] == gic) {
+                    break;
+                }
+                if (!gics[i]) {
+                    gics[i] = gic;
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < ARRAY_SIZE(gics) && gics[i]; i++) {
+            gicv3_debug_dump(gics[i], stderr);
+        }
+        vpiop_debug_dump(stderr);
+        virtio_pci_debug_dump(stderr);
+        fflush(stderr);
+    }
+    return NULL;
+}
+
 /* The kernel's copy of the registers from the vCPU's last exit, while it holds them. */
 static AppleVirtSnap *kvm_virt_snap(CPUState *cs)
 {
@@ -4107,4 +4165,7 @@ void kvm_arch_init_memory(MachineState *ms, KVMState *s)
                        MIN(1ULL << kvm_arm_get_max_vm_ipa_size(ms, &fixed_ipa),
                            1ULL << 36));    kvm_one_reg_get_hook = kvm_virt_snap_get;
     kvm_one_reg_set_hook = kvm_virt_snap_set;
+    if (VR_ENV("VR_HANG_DUMP")) {
+        qemu_thread_create(&vr_dump_thread, "vr-dump", vr_dump_main, NULL, QEMU_THREAD_DETACHED);
+    }
 }

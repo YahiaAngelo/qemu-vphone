@@ -42,6 +42,11 @@ QemuRecMutex *gicv3_cpuif_lock(CPUARMState *env)
     return env->gicv3state ? &icc_cs_from_env(env)->gic->lock : NULL;
 }
 
+GICv3State *gicv3_cpuif_gic(CPUARMState *env)
+{
+    return env->gicv3state ? icc_cs_from_env(env)->gic : NULL;
+}
+
 static bool gicv3_use_ns_bank(CPUARMState *env)
 {
     /* Return true if we should use the NonSecure bank for a banked GIC

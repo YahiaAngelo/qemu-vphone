@@ -735,6 +735,9 @@ void gicv3_init_cpuif(GICv3State *s);
 void gicv3_cpuif_update(GICv3CPUState *cs);
 /* vphone-linux: the lock of the GIC whose CPU interface `env` has, or NULL (target/arm/kvm.c). */
 QemuRecMutex *gicv3_cpuif_lock(CPUArchState *env);
+/* VPHONE-DEBUG: the GIC's state (arm_gicv3.c), and the GIC of a CPU interface's `env`. */
+void gicv3_debug_dump(GICv3State *s, FILE *f);
+GICv3State *gicv3_cpuif_gic(CPUArchState *env);
 
 /*
  * gicv3_cpuif_virt_irq_fiq_update:
