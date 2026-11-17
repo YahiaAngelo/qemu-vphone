@@ -40,6 +40,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qemu/lockable.h"
+#include "qemu/timer.h"
 #include "qemu/memalign.h"
 #include "qemu/thread.h"
 #include "qemu/units.h"
@@ -1189,6 +1190,9 @@ static void apple_virt_el0_site(uint64_t va, int vreg, uint32_t rt)
 }
 
 // An EL0 SPRR access, which the vCPU UNDEFs to EL1, emulated as `sprr_uperm_br0_write` does it.
+static uint8_t* apple_virt_el0_mirror[4];
+static int      apple_virt_n_el0_mirror;
+
 static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
 {
     uint64_t elr;
@@ -1210,7 +1214,8 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
     {
         uint64_t off = virt.ops->get_reg(cs, APPLE_VIRT_REG_PC) - virt.ops->get_reg(cs, APPLE_VIRT_REG_VBAR_EL1);
 
-        // vphone-linux debug: 0x408 with VR_VECTOR_ISB's `isb` in front of the `hvc`.
+        // vphone-linux: 0x408 when the trap is the slot's second instruction: VR_VECTOR_ISB's `isb` or the
+        // guest's own fast path's branch (ck_virt_el0_stub_patch) in front of it.
         if (off != 0x404 && off != 0x408) { return false; }
     }
     spsr = virt.ops->get_reg(cs, APPLE_VIRT_REG_SPSR_EL1);
@@ -1218,6 +1223,22 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
     if ((spsr & (PSTATE_nRW | PSTATE_M)) != PSTATE_MODE_EL0t || !gxf_live_translate(cs, elr, &pa)) { return false; }
 
     insn = address_space_ldl_le(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED, NULL);
+    // VPHONE-DEBUG (VR_LOG_EL0_SLOW=1): the first EL0 reads the guest's own fast path left here.
+    if (VR_ENV("VR_LOG_EL0_SLOW")) {
+        static int told;
+
+        static uint64_t hist[3];
+
+        hist[insn == 0xd53ef1a8 ? 0 : insn == 0xd51ef1a0 ? 1 : 2]++;
+        if ((hist[0] + hist[1] + hist[2]) % 200000 == 0) {
+            fprintf(stderr, "EL0-SLOW-HIST x8-read %" PRIu64 " write-x0 %" PRIu64 " other %" PRIu64 "\n", hist[0],
+                    hist[1], hist[2]);
+        }
+        if (told++ < 12) {
+            fprintf(stderr, "EL0-SLOW elr 0x%" PRIx64 " pa 0x%" HWADDR_PRIx " insn 0x%08x esr 0x%" PRIx64 " cpu %d\n",
+                    elr, pa, insn, virt.ops->get_reg(cs, APPLE_VIRT_REG_ESR_EL1), cs->cpu_index);
+        }
+    }
     if ((insn & 0xFFD00000) != 0xD5100000) { return false; }
     vreg = apple_virt_vreg(2 + extract32(insn, 19, 1), extract32(insn, 16, 3), extract32(insn, 12, 4),
                            extract32(insn, 8, 4), extract32(insn, 5, 3));
@@ -1228,6 +1249,24 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
     }
 
     virt.ops->set_reg(cs, APPLE_VIRT_REG_ELR_EL1, elr + 4);
+    // VPHONE-DEBUG (VR_LOG_EL0_SLOW=1): the guest fast path's value for this vCPU against this side's.
+    if (read && VR_ENV("VR_LOG_EL0_SLOW") && apple_virt_n_el0_mirror > 0) {
+        static int told;
+        uint64_t   aff0 = ARM_CPU(cs)->mp_affinity & 0xFF;
+        uint64_t   mv   = 0;
+
+        for (int i = 0; i < apple_virt_n_el0_mirror; i++) {
+            if (ldl_le_p(apple_virt_el0_mirror[i] - 8) == ~0xd53ef1a8u && aff0 < 8) {
+                mv = ldq_le_p(apple_virt_el0_mirror[i] + aff0 * 8);
+            }
+        }
+
+        if (told < 20 && mv != *virt_vreg_field(env, vreg)) {
+            told++;
+            fprintf(stderr, "EL0-MIRROR cpu %d aff0 %" PRIu64 " vreg %d mirror 0x%" PRIx64 " env 0x%" PRIx64 "\n",
+                    cs->cpu_index, aff0, vreg, mv, *virt_vreg_field(env, vreg));
+        }
+    }
     if (read) {
         if (rt != 31) { virt.ops->set_xreg(cs, rt, *virt_vreg_field(env, vreg)); }
         // The kernel answers the next ones at this address (`apple_virt_fast_publish`).
@@ -2128,6 +2167,8 @@ static const int apple_virt_fast_reads[] = {
 
 // Before the vCPU runs: what an entry or a return installs, or nothing for a vCPU whose entries and
 // returns need this side (unmanaged, single-stepping, flushing, the corruption catcher's).
+static void apple_virt_el0_mirror_publish(CPUState* cs, CPUARMState* env);
+
 void apple_virt_fast_publish(CPUState* cs, void* area)
 {
     AppleVirtFast* f   = area;
@@ -2256,6 +2297,7 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     f->apctl      = env->cp15.apctl_el1;
     f->kernkey[0] = env->keys.kernel.lo;
     f->kernkey[1] = env->keys.kernel.hi;
+    if (c->managed) { apple_virt_el0_mirror_publish(cs, env); }
     // The registers at the next exit, for `get_reg` without an ioctl each; VR_NO_SNAP=1 reads them one by one.
     f->snap.ok    = !VR_ENV("VR_NO_SNAP");
     f->snap.valid = 0;
@@ -2274,6 +2316,70 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     f->mkey[0] = env->keys.m.lo;
     f->mkey[1] = env->keys.m.hi;
     f->magic      = APPLE_VIRT_FAST_MAGIC;
+}
+
+// vphone-linux: the tables patched vector slots read EL0's SPRR_UPERM_BR0 from (ck_virt_el0_stub_patch).
+
+void apple_virt_set_el0_mirror(uint8_t* host)
+{
+    if (apple_virt_n_el0_mirror < ARRAY_SIZE(apple_virt_el0_mirror)) {
+        apple_virt_el0_mirror[apple_virt_n_el0_mirror++] = host;
+    }
+}
+
+// The vector table XNU runs: the page VBAR_EL1 names, once it holds the stub (XNU runs a copy of the patched image's
+// table). Looked for while the vCPU runs XNU's own EL1 (unguarded: the monitor's VBAR is its own).
+static void apple_virt_el0_mirror_find(CPUState* cs, CPUARMState* env)
+{
+    static bool found;
+    uint64_t    vbar;
+    hwaddr      pa;
+    uint8_t*    host;
+
+    if (found || cs->vcpu_dirty || (env->gxf.gxf_status_el[1] & 1)) { return; }
+    vbar = virt.ops->get_reg(cs, APPLE_VIRT_REG_VBAR_EL1);
+    if ((vbar & 0x7FF) || !gxf_live_translate(cs, vbar + 0x780, &pa) || (host = gxf_host_ptr(pa, 0x80)) == NULL) {
+        return;
+    }
+    if (ldl_le_p(host) != ~0xd53ef1a8u) { return; }
+    found = true;
+    for (int i = 0; i < apple_virt_n_el0_mirror; i++) {
+        if (apple_virt_el0_mirror[i] == host + 8) { return; }
+    }
+    apple_virt_set_el0_mirror(host + 8);
+    fprintf(stderr, "vphone-linux: XNU's vector table (VBAR 0x%" PRIx64 ") at 0x%" HWADDR_PRIx "\n", vbar, pa - 0x780);
+}
+
+// This vCPU's value, before it runs: the guest only changes it through traps that come here.
+static void apple_virt_el0_mirror_publish(CPUState* cs, CPUARMState* env)
+{
+    uint64_t aff0 = ARM_CPU(cs)->mp_affinity & 0xFF;
+
+    if (aff0 >= 8) { return; }
+    if (apple_virt_n_el0_mirror > 0) { apple_virt_el0_mirror_find(cs, env); }
+    for (int i = 0; i < apple_virt_n_el0_mirror; i++) {
+        uint8_t* m = apple_virt_el0_mirror[i];
+
+        // Only a table that still holds the stub: the patcher also patches a copy of the kernelcache that XNU
+        // reuses once it has started, where these words would be its memory. VBAR + 0x788 is m.
+        if (ldl_le_p(m - 8) != ~0xd53ef1a8u || ldl_le_p(m - 0x188) != 0xa9bf07e0u) { continue; }
+
+        qatomic_set((uint64_t*)(m + aff0 * 8), cpu_to_le64(env->sprr.sprr_el_br_el1[0][0]));
+        // The guest's fast path on, at once or VR_EL0_STUB_ENABLE_AT seconds after start (debug).
+        if (ldl_le_p(m - 4) == 0) {
+            static int64_t start, at = -1;
+
+            if (at < 0) {
+                at    = getenv("VR_EL0_STUB_ENABLE_AT") ? atoll(getenv("VR_EL0_STUB_ENABLE_AT")) : 0;
+                start = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            }
+            if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start >= at * 1000) {
+                smp_wmb();
+                qatomic_set((uint32_t*)(m - 4), cpu_to_le32(1));
+                if (at) { fprintf(stderr, "vphone-linux: guest EL0 SPRR fast path on\n"); }
+            }
+        }
+    }
 }
 
 AppleVirtSnap* apple_virt_fast_snap(void* area) { return &((AppleVirtFast*)area)->snap; }

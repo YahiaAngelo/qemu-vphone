@@ -138,6 +138,10 @@ extern bool apple_virt_trap_sysreg;
 #define VR_ENV(name) ({ static int vr_env_; if (!vr_env_) { vr_env_ = getenv(name) ? 1 : 2; } vr_env_ == 1; })
 
 /// The instruction that traps with `imm`: an `hvc`, or its system register form.
+/* vphone-linux: the per-vCPU SPRR_UPERM_BR0_EL0 values of a patched vector table (ck_virt_el0_stub_patch):
+ * 8 64-bit values by MPIDR Aff0, after a 32-bit enable word at host - 4. */
+void apple_virt_set_el0_mirror(uint8_t* host);
+
 static inline uint32_t apple_virt_trap_insn(uint16_t imm)
 {
     if (!apple_virt_trap_sysreg) { return 0xD4000002u | ((uint32_t)imm << 5); }

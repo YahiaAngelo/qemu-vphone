@@ -156,6 +156,101 @@ static uint32_t ck_virt_m1_gl_native(int vreg, bool read)
     }
 }
 
+/*
+ * vphone-linux: XNU's lower-EL synchronous vector slot (VBAR_EL1 + 0x400) answering an EL0 read of
+ * SPRR_UPERM_BR0_EL0 itself (`mrs x8, S3_6_C15_C1_5`, which UNDEFs on the host and which libsystem's TPRO and
+ * JIT helpers run ~500k times a second under CoreFoundation), from this vCPU's value, which QEMU keeps current
+ * (`apple_virt_fast_publish`); no trap to the host. Anything else takes the slot's trap as before. The code is in
+ * slots 12-13 and the data in slot 15 (lower-EL AArch32, never taken on arm64-only XNU, all NOPs); slot 8 is
+ * `b slot12; <trap>; b <XNU's handler>`. Assembled from (GNU as):
+ *
+ *     stp x0, x1, [sp, #-16]!   // the exception stack, as XNU's own entry does
+ *     stp x2, x3, [sp, #-16]!
+ *     mrs x0, esr_el1
+ *     lsr w1, w0, #26
+ *     cbnz w1, slow             // not an unknown instruction
+ *     ldr w2, enable            // VBAR + 0x784: nonzero once QEMU turns it on (apple_virt_el0_mirror_publish)
+ *     cbz w2, slow
+ *     mrs x0, elr_el1
+ *     at s1e0r, x0              // readable at EL0: an unprivileged load
+ *     isb
+ *     mrs x1, par_el1
+ *     tbnz w1, #0, priv
+ *     ldtr w1, [x0]
+ *   check:
+ *     ldr w2, ninsn             // VBAR + 0x780: ~0xd53ef1a8 (the patcher rewrites the instruction itself)
+ *     eor w1, w1, w2
+ *     cmn w1, #1
+ *     b.ne slow
+ *     mrs x2, mpidr_el1         // Aff0: the vCPU (vresearch101: 0-5)
+ *     and x2, x2, #7
+ *     adr x3, mirror            // VBAR + 0x788: 8 values
+ *     ldr x8, [x3, x2, lsl #3]
+ *     add x0, x0, #4
+ *     msr elr_el1, x0
+ *     ldp x2, x3, [sp], #16
+ *     ldp x0, x1, [sp], #16
+ *     eret
+ *   slow:
+ *     ldp x2, x3, [sp], #16
+ *     ldp x0, x1, [sp], #16
+ *     b VBAR + 0x404            // the trap
+ *   priv:
+ *     at s1e1r, x0              // execute-only at EL0: a privileged load (PAN doesn't cover it)
+ *     isb
+ *     mrs x1, par_el1
+ *     tbnz w1, #0, slow
+ *     ldr w1, [x0]
+ *     b check
+ */
+static const uint32_t ck_virt_el0_stub[] = {
+    0xa9bf07e0, 0xa9bf0fe2, 0xd5385200, 0x531a7c01, 0x350002c1, 0x18000b82, 0x34000282, 0xd5384020,
+    0xd5087840, 0xd5033fdf, 0xd5387401, 0x37000241, 0xb8400801, 0x18000a62, 0x4a020021, 0x3100043f,
+    0x54000141, 0xd53800a2, 0x92400842, 0x100009e3, 0xf8627868, 0x91001000, 0xd5184020, 0xa8c10fe2,
+    0xa8c107e0, 0xd69f03e0, 0xa8c10fe2, 0xa8c107e0, 0x17ffff65, 0xd5087800, 0xd5033fdf, 0xd5387401,
+    0x3707ff41, 0xb9400001, 0x17ffffeb,
+};
+
+// The stubs written, which the rewrite of the range around them leaves as they are (their eret returns to EL0
+// with EL0's keys, which never changed, and their constants aren't instructions).
+static uint8_t* ck_virt_el0_stubs[4];
+static int      ck_virt_n_el0_stubs;
+
+static bool ck_virt_in_el0_stub(const uint8_t* ptr)
+{
+    for (int i = 0; i < ck_virt_n_el0_stubs; i++) {
+        if (ptr >= ck_virt_el0_stubs[i] && ptr < ck_virt_el0_stubs[i] + 0x200) { return true; }
+    }
+    return false;
+}
+
+static bool ck_virt_el0_stub_patch(uint8_t* table, CKVirtFlags flags)
+{
+    uint8_t* slot = table + 0x400;
+    uint32_t b    = ldl_le_p(slot);
+
+    if ((flags & (CK_VIRT_UNMANAGED | CK_VIRT_MONITOR)) || getenv("VR_NO_EL0_STUB") || getenv("VR_CATCH_CORRUPT")
+        || (b & 0xFC000000) != 0x14000000) {
+        return false;
+    }
+    for (int i = 1; i < 32; i++) {
+        if ((uint32_t)ldl_le_p(slot + i * 4) != NOP) { return false; }
+    }
+    for (uint32_t off = 0x600; off < 0x800; off += 4) {
+        if ((uint32_t)ldl_le_p(table + off) != NOP) { return false; }
+    }
+    stl_le_p(slot, 0x14000080);                                          // b VBAR + 0x600
+    stl_le_p(slot + 4, CK_VIRT_HVC(APPLE_VIRT_HVC_LOWER_ENTRY));
+    stl_le_p(slot + 8, 0x14000000 | ((b - 2) & 0x3FFFFFF));
+    for (int i = 0; i < ARRAY_SIZE(ck_virt_el0_stub); i++) { stl_le_p(table + 0x600 + i * 4, ck_virt_el0_stub[i]); }
+    memset(table + 0x780, 0, 0x80);
+    stl_le_p(table + 0x780, ~0xd53ef1a8u);
+    apple_virt_set_el0_mirror(table + 0x788);
+    if (ck_virt_n_el0_stubs < ARRAY_SIZE(ck_virt_el0_stubs)) { ck_virt_el0_stubs[ck_virt_n_el0_stubs++] = table + 0x600; }
+    info_report("vphone-linux: EL0 SPRR_UPERM_BR0 reads answered in the guest's vector table");
+    return true;
+}
+
 static uint32_t ck_virt_vectors(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
 {
     uint32_t entries = 0;
@@ -214,6 +309,10 @@ static uint32_t ck_virt_vectors(CKPatcherRange* range, vaddr va, CKVirtFlags fla
                 ++entries;
                 continue;
             }
+            if (slot == 8 && ck_virt_el0_stub_patch(range->ptr + off, flags)) {
+                ++entries;
+                continue;
+            }
             stl_le_p(insn + 4, 0x14000000 | ((ldl_le_p(insn) - 1) & 0x3FFFFFF));
             stl_le_p(insn, CK_VIRT_HVC(APPLE_VIRT_HVC_LOWER_ENTRY));
             ++entries;
@@ -236,6 +335,8 @@ static void ck_virt_range(CKPatcherRange* range, vaddr va, CKVirtFlags flags)
     for (vaddr i = 0; i + sizeof(uint32_t) <= range->length; i += sizeof(uint32_t)) {
         uint8_t* ptr  = range->ptr + i;
         uint32_t insn = ldl_le_p(ptr);
+
+        if (ck_virt_in_el0_stub(ptr)) { continue; }
         bool     read = extract32(insn, 21, 1);
         uint32_t rt   = extract32(insn, 0, 5);
         uint32_t op0  = 2 + extract32(insn, 19, 1);
