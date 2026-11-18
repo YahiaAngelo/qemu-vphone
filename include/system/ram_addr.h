@@ -469,6 +469,12 @@ bool cpu_physical_memory_test_and_clear_dirty(ram_addr_t start,
 DirtyBitmapSnapshot *cpu_physical_memory_snapshot_and_clear_dirty
     (MemoryRegion *mr, hwaddr offset, hwaddr length, unsigned client);
 
+/* As physical_memory_take_dirty, at any target page size, @bitmap a bit a 4 KiB page. */
+void physical_memory_take_dirty_4k(ram_addr_t start, ram_addr_t length,
+                                   unsigned client, uint64_t *bitmap);
+/* Moves @client's dirty bits into @bitmap a word at a time, not KVM's. */
+void physical_memory_take_dirty(ram_addr_t start, ram_addr_t length,
+                                unsigned client, unsigned long *bitmap);
 bool cpu_physical_memory_snapshot_get_dirty(DirtyBitmapSnapshot *snap,
                                             ram_addr_t start,
                                             ram_addr_t length);

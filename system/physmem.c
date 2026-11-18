@@ -981,6 +981,65 @@ DirtyBitmapSnapshot *cpu_physical_memory_snapshot_and_clear_dirty
     return snap;
 }
 
+void physical_memory_take_dirty(ram_addr_t start, ram_addr_t length,
+                                unsigned client, unsigned long *bitmap)
+{
+    unsigned long page = start >> TARGET_PAGE_BITS;
+    unsigned long end = (start + length) >> TARGET_PAGE_BITS;
+
+    assert(QEMU_IS_ALIGNED(page | end, BITS_PER_LONG));
+    WITH_RCU_READ_LOCK_GUARD() {
+        DirtyMemoryBlocks *blocks =
+            qatomic_rcu_read(&ram_list.dirty_memory[client]);
+
+        for (; page < end; page += BITS_PER_LONG, bitmap++) {
+            unsigned long i = page / DIRTY_MEMORY_BLOCK_SIZE;
+            unsigned long *word =
+                &blocks->blocks[i][BIT_WORD(page % DIRTY_MEMORY_BLOCK_SIZE)];
+
+            if (qatomic_read(word)) {
+                *bitmap |= qatomic_xchg(word, 0);
+            }
+        }
+    }
+}
+
+void physical_memory_take_dirty_4k(ram_addr_t start, ram_addr_t length,
+                                   unsigned client, uint64_t *bitmap)
+{
+    unsigned long page = start >> TARGET_PAGE_BITS;
+    unsigned long end = (start + length + TARGET_PAGE_SIZE - 1) >> TARGET_PAGE_BITS;
+    uint64_t per = TARGET_PAGE_SIZE >> 12;
+
+    WITH_RCU_READ_LOCK_GUARD() {
+        DirtyMemoryBlocks *blocks =
+            qatomic_rcu_read(&ram_list.dirty_memory[client]);
+
+        for (; page < end; page++) {
+            unsigned long i = page / DIRTY_MEMORY_BLOCK_SIZE;
+            unsigned long off = page % DIRTY_MEMORY_BLOCK_SIZE;
+            unsigned long *word = &blocks->blocks[i][BIT_WORD(off)];
+            unsigned long mask = BIT_MASK(off);
+            uint64_t first, k;
+
+            if (!(qatomic_read(word) & mask) ||
+                !(qatomic_fetch_and(word, ~mask) & mask)) {
+                continue;
+            }
+            /* The page's 4 KiB pages within the range, a bit each. */
+            for (k = 0; k < per; k++) {
+                ram_addr_t at = ((ram_addr_t)page << TARGET_PAGE_BITS) + (k << 12);
+
+                if (at < start || at >= start + length) {
+                    continue;
+                }
+                first = (at - start) >> 12;
+                bitmap[first / 64] |= 1ULL << (first % 64);
+            }
+        }
+    }
+}
+
 bool cpu_physical_memory_snapshot_get_dirty(DirtyBitmapSnapshot *snap,
                                             ram_addr_t start,
                                             ram_addr_t length)

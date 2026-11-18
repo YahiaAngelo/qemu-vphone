@@ -574,6 +574,15 @@ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
          */
         handled_dirty = (1 << DIRTY_MEMORY_MIGRATION) |
             (1 << DIRTY_MEMORY_CODE);
+        /*
+         * vphone: apple-gfx logs the guest's RAM for DIRTY_MEMORY_VGA so that
+         * reims-vgpu reads KVM's dirty log (its dirty source). Dropping the RAM
+         * from vhost-vsock's table for that broke its rings ("vhost vring
+         * error"). vhost's own writes into the RAM (socket buffers) are not in
+         * that log; the GPU never reads them in place, and a later CPU write to
+         * such a page is.
+         */
+        handled_dirty |= 1 << DIRTY_MEMORY_VGA;
 
         if (dirty_mask & ~handled_dirty) {
             trace_vhost_reject_section(mr->name, 1);
