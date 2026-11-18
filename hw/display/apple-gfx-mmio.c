@@ -113,7 +113,9 @@ static bool apple_gfx_mmio_create_iosurface_device(AppleGFXMMIOState *s,
         .struct_size = sizeof(config),
         .memory_map = &memory_map,
         .callbacks = &callbacks,
+#ifdef CONFIG_RVG_GUEST_PAGE_SHIFT
         .guest_page_shift = s->guest_page_shift,
+#endif
     };
     RvgStatus status;
 
@@ -154,7 +156,9 @@ static void apple_gfx_mmio_realize(DeviceState *dev, Error **errp)
         .use_iosurface_mapper = true,
         .process_isolation = s->process_isolation,
         .callbacks = &callbacks,
+#ifdef CONFIG_RVG_GUEST_PAGE_SHIFT
         .guest_page_shift = s->guest_page_shift,
+#endif
     };
 
     if (!apple_gfx_common_realize(&s->common, dev, &config, errp)) {

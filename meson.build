@@ -2150,6 +2150,15 @@ endif
 
 config_host_data = configuration_data()
 
+# vphone-linux: a libreims_vgpu that takes the guest's page size per device (vphone-linux's
+# reims-vgpu fork; the upstream one assumes the host's).
+if pvg.found()
+  config_host_data.set('CONFIG_RVG_GUEST_PAGE_SHIFT',
+                       cc.has_member('RvgDeviceConfig', 'guest_page_shift',
+                                     prefix: '#include <reims_vgpu.h>',
+                                     dependencies: pvg))
+endif
+
 audio_drivers_selected = []
 if have_system
   audio_drivers_available = {
