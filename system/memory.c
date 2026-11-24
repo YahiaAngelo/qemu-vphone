@@ -2491,6 +2491,12 @@ void memory_region_enable_lockless_io(MemoryRegion *mr)
     mr->disable_reentrancy_guard = true;
 }
 
+void memory_region_enable_tcg_lockless_io(MemoryRegion *mr)
+{
+    memory_region_enable_lockless_io(mr);
+    mr->tcg_lockless_io = true;
+}
+
 void memory_region_add_eventfd(MemoryRegion *mr,
                                hwaddr addr,
                                unsigned size,

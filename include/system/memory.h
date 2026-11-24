@@ -811,6 +811,7 @@ struct MemoryRegion {
     bool rom_device;
     bool flush_coalesced_mmio;
     bool lockless_io;
+    bool tcg_lockless_io;
     bool unmergeable;
     uint8_t dirty_log_mask;
     bool is_iommu;
@@ -2253,6 +2254,18 @@ void memory_region_clear_flush_coalesced(MemoryRegion *mr);
  * @mr: the memory region to be updated.
  */
 void memory_region_enable_lockless_io(MemoryRegion *mr);
+
+/**
+ * memory_region_enable_tcg_lockless_io: Opt a region into BQL-free TCG MMIO.
+ *
+ * Enables both lockless_io and tcg_lockless_io so accel/tcg/cputlb.c skips
+ * taking the BQL for accesses to @mr. Only use on regions whose MMIO callbacks
+ * are safe to run concurrently without the BQL under TCG (for example, they do
+ * not synchronously invoke BQL-requiring helpers such as cpu_interrupt()).
+ *
+ * @mr: the memory region to be updated.
+ */
+void memory_region_enable_tcg_lockless_io(MemoryRegion *mr);
 
 /**
  * memory_region_add_eventfd: Request an eventfd to be triggered when a word

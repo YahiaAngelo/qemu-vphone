@@ -396,11 +396,15 @@ static uint64_t *impdef_slot(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     int idx = MIN(env_cpu(env)->cpu_index, IMPDEF_MAX_CPUS - 1);
     int bit = (ri->opc1 * 16 + ri->crm) * 8 + ri->opc2;
+    unsigned long *word = &impdef_seen[BIT_WORD(bit)];
+    unsigned long mask = BIT_MASK(bit);
 
-    if (!test_and_set_bit(bit, impdef_seen)) {
-        qemu_log_mask(LOG_UNIMP, "vresearch101: impdef sysreg S3_%d_C15_C%d_%d"
-                      " first used by cpu%d at pc 0x%" PRIx64 "\n",
-                      ri->opc1, ri->crm, ri->opc2, idx, env->pc);
+    if (unlikely(!(qatomic_read(word) & mask))) {
+        if (!(qatomic_fetch_or(word, mask) & mask)) {
+            qemu_log_mask(LOG_UNIMP, "vresearch101: impdef sysreg S3_%d_C15_C%d_%d"
+                          " first used by cpu%d at pc 0x%" PRIx64 "\n",
+                          ri->opc1, ri->crm, ri->opc2, idx, env->pc);
+        }
     }
     return &impdef_val[idx][ri->opc1][ri->crm][ri->opc2];
 }
@@ -443,7 +447,7 @@ static void define_impdef_sink(ARMCPU *cpu)
                     .opc0 = 3, .opc1 = op1, .crn = 15, .crm = crm,
                     .opc2 = op2,
                     .access = PL1_RW,
-                    .type = ARM_CP_IO | ARM_CP_NO_RAW,
+                    .type = ARM_CP_NO_RAW | ARM_CP_SUPPRESS_TB_END,
                     .readfn = impdef_read,
                     .writefn = impdef_write,
                 };
