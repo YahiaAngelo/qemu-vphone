@@ -160,6 +160,12 @@ static void vusb_pci_handle_to_guest(VUSBVirtIODevice *s)
         virtqueue_push(vq, elem, copied);
         if (msg->len >= 6) {
             uint32_t head0 = 0, head1 = 0;
+
+            if (trace_event_get_state_backends(TRACE_VUSB_PCI_RX_COMPLETE) &&
+                (!(msg->data[4] & 0x7f) || msg->data[5] == 2)) {
+                trace_vusb_pci_rx_complete(g_get_monotonic_time(), copied,
+                                          msg->data[4], msg->data[5]);
+            }
             for (unsigned int i = 0; i < 4 && i < msg->len; i++) {
                 head0 |= (uint32_t)msg->data[i] << (8 * i);
             }

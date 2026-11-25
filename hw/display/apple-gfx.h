@@ -73,6 +73,8 @@ struct AppleGFXState {
      * or "host" for the host screen's own modes; NULL is 1920x1080.
      */
     char *resolution;
+    /* Physical density of the first explicit display mode; 0 keeps defaults. */
+    uint32_t pixels_per_inch;
     /*
      * Each display has a window of the library's, which draws its frames
      * and sends its input (-display none, unless REIMS_VGPU_WINDOW=0).

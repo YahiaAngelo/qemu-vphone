@@ -134,7 +134,8 @@ static void memory_dump(Monitor *mon, int count, int format, int wsize,
     }
 
     if (format == 'i') {
-        assert_not_reached();
+        monitor_printf(mon, "Instruction disassembly is not supported\n");
+        return;
     }
 
     len = wsize * count;

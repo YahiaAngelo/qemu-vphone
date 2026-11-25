@@ -26,6 +26,17 @@ On the `vphone` branch:
 
 Build and usage instructions are in vphone-linux; this repository is consumed there as a submodule.
 
+For a panel with a known physical density, set `apple-gfx-mmio`'s optional
+`pixels-per-inch` property with an explicit `display-modes` list. The first mode
+defines the native panel size, for example
+`-global apple-gfx-mmio.pixels-per-inch=326` with `gfx-modes=1488x2266@60`.
+This applies in headless and window mode. Guest mode changes keep that panel
+size. Zero or an omitted property keeps the existing sizing behavior, including
+the 400 × 300 mm default for explicit modes. Conversion uses reims-vgpu's
+existing 25.46 divisor for guest compatibility, rather than the physical
+25.4 mm per inch.
+The window-only `resolution=...@ppi` option keeps its existing behavior.
+
 ## License
 
 QEMU as a whole is licensed under the GNU General Public License, version 2. The upstream project

@@ -142,6 +142,10 @@ static void msix_handle_mask_update(PCIDevice *dev, int vector, bool was_masked)
 
     if (!is_masked && msix_is_pending(dev, vector)) {
         msix_clr_pending(dev, vector);
+        if (trace_event_get_state_backends(TRACE_MSIX_PENDING_REPLAY)) {
+            trace_msix_pending_replay(g_get_monotonic_time(),
+                                     object_get_typename(OBJECT(dev)), vector);
+        }
         msix_notify(dev, vector);
     }
 }
@@ -544,17 +548,32 @@ void msix_notify(PCIDevice *dev, unsigned vector)
     assert(vector < dev->msix_entries_nr);
 
     if (!dev->msix_entry_used[vector]) {
+        if (trace_event_get_state_backends(TRACE_MSIX_NOTIFY_DECISION)) {
+            trace_msix_notify_decision(g_get_monotonic_time(),
+                                       object_get_typename(OBJECT(dev)), vector,
+                                       false, -1, "unused");
+        }
         return;
     }
 
     if (msix_is_masked(dev, vector)) {
         msix_set_pending(dev, vector);
+        if (trace_event_get_state_backends(TRACE_MSIX_NOTIFY_DECISION)) {
+            trace_msix_notify_decision(g_get_monotonic_time(),
+                                       object_get_typename(OBJECT(dev)), vector,
+                                       true, 1, "pending-set");
+        }
         return;
     }
 
     msg = msix_get_message(dev, vector);
 
     msi_send_message(dev, msg);
+    if (trace_event_get_state_backends(TRACE_MSIX_NOTIFY_DECISION)) {
+        trace_msix_notify_decision(g_get_monotonic_time(),
+                                   object_get_typename(OBJECT(dev)), vector,
+                                   true, 0, "send-returned");
+    }
 }
 
 void msix_reset(PCIDevice *dev)
