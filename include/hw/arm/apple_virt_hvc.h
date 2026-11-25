@@ -135,6 +135,14 @@ extern bool apple_virt_trap_sysreg;
 
 /* vphone-linux: whether debug variable `name` is set, read once per call site (the exit paths run
  * hundreds of thousands of times a second). */
+/*
+ * The layout of the area the kernel and target/arm/apple-virt.c share (struct kvm_arm_apple_fast,
+ * AppleVirtFast). KVM_CHECK_EXTENSION(KVM_CAP_ARM_APPLE_FAST) returns the kernel's; the magic
+ * carries it too. Bump both sides with every change to the struct.
+ */
+#define APPLE_VIRT_FAST_VERSION 2
+#define KVM_CAP_ARM_APPLE_FAST 258
+
 #define VR_ENV(name) ({ static int vr_env_; if (!vr_env_) { vr_env_ = getenv(name) ? 1 : 2; } vr_env_ == 1; })
 
 /// The instruction that traps with `imm`: an `hvc`, or its system register form.

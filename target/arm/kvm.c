@@ -590,10 +590,21 @@ static int kvm_arm_apple_virt_init(KVMState *s)
     for (int i = 0; i < ARRAY_SIZE(kvm_apple_virt_caps); i++) {
         if (!kvm_check_extension(s, kvm_apple_virt_caps[i].cap)) {
             error_report("KVM: the host kernel lacks KVM_CAP_ARM_%s; boot "
-                         "linux-aurora-kvm (vphone-kvm-tools)",
+                         "linux-aurora-kvm (docs/KVM.md)",
                          kvm_apple_virt_caps[i].name);
             return -ENOTSUP;
         }
+    }
+    /*
+     * The kernel's fast paths share a layout with apple-virt.c; another kernel's would misread it.
+     * VR_NO_FAST=1 runs without them (much slower).
+     */
+    int fast = kvm_check_extension(s, KVM_CAP_ARM_APPLE_FAST);
+    if (fast != APPLE_VIRT_FAST_VERSION && !VR_ENV("VR_NO_FAST")) {
+        error_report("KVM: the host kernel's fast-path layout is version %d, this QEMU "
+                     "needs %d: rebuild linux-aurora-kvm from this vphone-linux commit "
+                     "and boot it (docs/KVM.md)", fast, APPLE_VIRT_FAST_VERSION);
+        return -ENOTSUP;
     }
     /* GXF emulation write-protects 16 KiB guest pages. */
     if (qemu_real_host_page_size() > 16 * KiB) {

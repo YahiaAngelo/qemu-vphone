@@ -2319,7 +2319,9 @@ static const int apple_virt_fast_reads[] = {
     APPLE_VIRT_VREG_TTBR1_EL1,          APPLE_VIRT_VREG_TCR_EL1,
 };
 
-#define APPLE_VIRT_FAST_MAGIC 0x3130545341464150ULL
+// The layout of AppleVirtFast, which must match the kernel's struct kvm_arm_apple_fast: the magic
+// carries `APPLE_VIRT_FAST_VERSION`, which `kvm_arm_apple_virt_init` checks against the kernel's.
+#define APPLE_VIRT_FAST_MAGIC 0x3230545341464150ULL /* "PAFAST02" */
 
 // Before the vCPU runs: what an entry or a return installs, or nothing for a vCPU whose entries and
 // returns need this side (unmanaged, single-stepping, flushing, the corruption catcher's).
