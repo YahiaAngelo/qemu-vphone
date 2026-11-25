@@ -112,6 +112,8 @@ typedef struct
     uint32_t   va_bits;
     uint32_t   active;
     uint64_t   lru;
+    // vphone-linux: its address space is gone (a TLBI by its ASID) while a vCPU held it; freed once none does.
+    bool doomed;
 } GXFRoot;
 
 typedef struct
@@ -179,6 +181,20 @@ typedef struct
     uint64_t dbg_bank[7];
     uint64_t dbg_ttbr[2][2];
     bool     dbg_guarded;
+    // vphone-linux: the tables the kernel switches TTBR0_EL1 to itself (`apple_virt_ttbr0_publish`), each with
+    // its roots for both worlds held active, and the kernel's count of those switches as of the last run's start.
+    struct
+    {
+        uint64_t        base;
+        uint64_t        tcr;
+        const GXFPerms* perms[2];
+        GXFRoot*        roots[2];
+        uint64_t        lru;
+    } ttbr0_cache[8];
+    uint32_t n_ttbr0;
+    uint32_t doom_seen;
+    uint64_t ttbr0_lru;
+    uint64_t ttbr0_seen;
 } AppleVirtCPU;
 
 static struct
@@ -197,6 +213,8 @@ static struct
     // likely happened and the host only backs about as many tables as were ever live at once.
     GQueue   pool_free;
     uint32_t pool_used;
+    // vphone-linux: bumped whenever `gxf_drop_asid` dooms a held root, for each vCPU's TTBR0 cache to let go of it.
+    uint32_t doom_gen;
     // Untracked pages that were write-protected, whose stores could still fault on another vCPU.
     GHashTable* unprotected;
     // Evicted trees, whose stale walks a vCPU must flush before it runs on new shadows.
@@ -717,8 +735,9 @@ static GXFRoot* gxf_get_root(uint64_t ttbr, uint32_t va_bits, const GXFPerms* pe
     for (guint i = 0; i < virt.roots->len; i++) {
         r = g_ptr_array_index(virt.roots, i);
         if ((r->ttbr & GXF_TTBR_BADDR) == base && r->va_bits == va_bits && r->top->perms == perms) {
-            r->ttbr = ttbr;
-            r->lru  = ++virt.lru_clock;
+            r->ttbr   = ttbr;
+            r->lru    = ++virt.lru_clock;
+            r->doomed = false;
             return r;
         }
     }
@@ -744,16 +763,31 @@ static GXFRoot* gxf_get_root(uint64_t ttbr, uint32_t va_bits, const GXFPerms* pe
     return r;
 }
 
+// Lets go of a hold on `r`, freeing it if its address space is gone (`GXFRoot.doomed`).
+static void gxf_root_put(GXFRoot* r)
+{
+    if (--r->active == 0 && r->doomed) { gxf_root_free(r); }
+}
+
 static void gxf_world_drop(GXFWorldCache* wc)
 {
     for (int idx = 0; idx < 2; idx++) {
-        if (wc->roots[idx] != NULL) { wc->roots[idx]->active -= 1; }
+        if (wc->roots[idx] != NULL) { gxf_root_put(wc->roots[idx]); }
     }
     *wc = (GXFWorldCache){0};
 }
 
+static void gxf_ttbr0_unpin(AppleVirtCPU* c, uint32_t i)
+{
+    for (int w = 0; w < 2; w++) {
+        if (c->ttbr0_cache[i].roots[w] != NULL) { gxf_root_put(c->ttbr0_cache[i].roots[w]); }
+    }
+    c->ttbr0_cache[i] = c->ttbr0_cache[--c->n_ttbr0];
+}
+
 static void gxf_release(AppleVirtCPU* c)
 {
+    while (c->n_ttbr0 != 0) { gxf_ttbr0_unpin(c, 0); }
     gxf_world_drop(&c->worlds[0]);
     gxf_world_drop(&c->worlds[1]);
     c->cur[0]   = NULL;
@@ -923,9 +957,15 @@ static void gxf_drop_asid(uint16_t asid)
     for (guint i = 0; i < virt.roots->len;) {
         GXFRoot* r = g_ptr_array_index(virt.roots, i);
 
-        if (r->active == 0 && (r->ttbr >> 48) == asid) {
-            gxf_root_free(r);
-            continue;
+        if ((r->ttbr >> 48) == asid) {
+            if (r->active == 0) {
+                gxf_root_free(r);
+                continue;
+            }
+            if (!r->doomed) {
+                r->doomed = true;
+                virt.doom_gen++;
+            }
         }
         i++;
     }
@@ -2152,6 +2192,14 @@ typedef struct {
     uint32_t pt_icache_next;
     uint32_t pad4;
     uint32_t pt_why[16];
+    // TTBR0_EL1 writes to tables whose shadows both worlds' are published (`apple_virt_ttbr0_publish`).
+    uint64_t ttbr0_ok;
+    uint32_t nttbr0;
+    uint32_t pad5;
+    uint64_t ttbr0_base[8];
+    uint64_t ttbr0_shadow[2][8];
+    uint64_t ttbr0_guest;
+    uint64_t ttbr0_writes;
 } AppleVirtFast;
 
 
@@ -2168,6 +2216,123 @@ static const int apple_virt_fast_reads[] = {
 // Before the vCPU runs: what an entry or a return installs, or nothing for a vCPU whose entries and
 // returns need this side (unmanaged, single-stepping, flushing, the corruption catcher's).
 static void apple_virt_el0_mirror_publish(CPUState* cs, CPUARMState* env);
+
+/*
+ * vphone-linux: TTBR0_EL1 writes the kernel takes itself (struct kvm_arm_apple_fast's ttbr0_*), to tables this
+ * vCPU ran on before: each table's roots for both worlds, under the TCR and SPRR permissions they were made for,
+ * held active by the vCPU (`ttbr0_cache`, 8 at most, the least recently added let go), and published while both
+ * worlds' trees are current and those match. A switch there is the one `gxf_world_fill` would make, without a TLB
+ * flush (the shadow keeps the guest's ASID). VR_NO_KERNEL_TTBR0=1 keeps them here.
+ */
+static void apple_virt_ttbr0_publish(CPUState* cs, CPUARMState* env, AppleVirtCPU* c, AppleVirtFast* f)
+{
+    uint64_t tcr  = env->cp15.tcr_el[1];
+    uint64_t base = env->cp15.ttbr0_el[1] & GXF_TTBR_BADDR;
+    uint32_t n    = 0;
+
+    f->ttbr0_ok    = 0;
+    f->nttbr0      = 0;
+    c->ttbr0_seen  = f->ttbr0_writes;
+    // Tables whose address space is gone, let go of here while the kernel can't switch to them (the vCPU doesn't run).
+    if (c->doom_seen != qatomic_read(&virt.doom_gen)) {
+        QEMU_LOCK_GUARD(&virt.lock);
+
+        c->doom_seen = virt.doom_gen;
+        for (uint32_t i = 0; i < c->n_ttbr0;) {
+            if (c->ttbr0_cache[i].roots[0]->doomed || c->ttbr0_cache[i].roots[1]->doomed) {
+                gxf_ttbr0_unpin(c, i);
+                continue;
+            }
+            i++;
+        }
+    }
+    if (f->ws_ok == 0 || VR_ENV("VR_NO_KERNEL_TTBR0") || extract64(tcr, 7, 1) || !c->worlds[0].mmu
+        || c->worlds[0].roots[0] == NULL || c->worlds[1].roots[0] == NULL || c->worlds[0].roots[0]->doomed
+        || c->worlds[1].roots[0]->doomed) {
+        return;
+    }
+    // The current table, held from now on if it isn't yet.
+    {
+        bool found = false;
+
+        for (uint32_t i = 0; i < c->n_ttbr0 && !found; i++) {
+            found = c->ttbr0_cache[i].base == base && c->ttbr0_cache[i].tcr == tcr
+                    && c->ttbr0_cache[i].roots[0] == c->worlds[0].roots[0]
+                    && c->ttbr0_cache[i].roots[1] == c->worlds[1].roots[0];
+        }
+        if (!found) {
+            QEMU_LOCK_GUARD(&virt.lock);
+            uint32_t i;
+
+            if (c->n_ttbr0 == ARRAY_SIZE(c->ttbr0_cache)) {
+                uint32_t oldest = 0;
+
+                for (i = 1; i < c->n_ttbr0; i++) {
+                    if (c->ttbr0_cache[i].lru < c->ttbr0_cache[oldest].lru) { oldest = i; }
+                }
+                gxf_ttbr0_unpin(c, oldest);
+            }
+            i                        = c->n_ttbr0++;
+            c->ttbr0_cache[i].base   = base;
+            c->ttbr0_cache[i].tcr    = tcr;
+            c->ttbr0_cache[i].lru    = ++c->ttbr0_lru;
+            for (int w = 0; w < 2; w++) {
+                c->ttbr0_cache[i].roots[w] = c->worlds[w].roots[0];
+                c->ttbr0_cache[i].perms[w] = c->worlds[w].perms[0];
+                c->ttbr0_cache[i].roots[w]->active += 1;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < c->n_ttbr0; i++) {
+        if (c->ttbr0_cache[i].tcr != tcr || c->ttbr0_cache[i].perms[0] != c->worlds[0].perms[0]
+            || c->ttbr0_cache[i].perms[1] != c->worlds[1].perms[0]) {
+            continue;
+        }
+        f->ttbr0_base[n] = c->ttbr0_cache[i].base;
+        for (int w = 0; w < 2; w++) { f->ttbr0_shadow[w][n] = c->ttbr0_cache[i].roots[w]->top->shadow; }
+        n++;
+    }
+    f->nttbr0   = n;
+    f->ttbr0_ok = n != 0;
+}
+
+// After the vCPU ran: the table the kernel last switched TTBR0_EL1 to, as `gxf_world_fill` would have switched.
+static void apple_virt_ttbr0_collect(CPUState* cs, AppleVirtCPU* c, AppleVirtFast* f)
+{
+    CPUARMState* env  = cpu_env(cs);
+    uint64_t     v    = f->ttbr0_guest;
+    uint64_t     base = v & GXF_TTBR_BADDR;
+
+    if (f->ttbr0_ok != 1 || f->ttbr0_writes == c->ttbr0_seen) { return; }
+    c->ttbr0_seen          = f->ttbr0_writes;
+    env->cp15.ttbr0_el[1]  = v;
+    for (uint32_t i = 0; i < c->n_ttbr0; i++) {
+        if (c->ttbr0_cache[i].base != base || c->ttbr0_cache[i].tcr != env->cp15.tcr_el[1]
+            || c->ttbr0_cache[i].perms[0] != c->worlds[0].perms[0] || c->ttbr0_cache[i].perms[1] != c->worlds[1].perms[0]) {
+            continue;
+        }
+        QEMU_LOCK_GUARD(&virt.lock);
+        c->ttbr0_cache[i].lru = ++c->ttbr0_lru;
+        for (int w = 0; w < 2; w++) {
+            GXFWorldCache* wc = &c->worlds[w];
+            GXFRoot*       r  = c->ttbr0_cache[i].roots[w];
+
+            if (wc->roots[0] != r) {
+                r->active += 1;
+                if (wc->roots[0] != NULL) { gxf_root_put(wc->roots[0]); }
+                wc->roots[0] = r;
+            }
+            wc->ttbr[0]    = v;
+            wc->hw_ttbr[0] = (v & ~(GXF_TTBR_BADDR | GXF_TTBR_CNP)) | r->top->shadow;
+        }
+        c->cur[0]     = c->worlds[c->guarded].roots[0];
+        c->hw_ttbr[0] = c->worlds[c->guarded].hw_ttbr[0];
+        return;
+    }
+    // The kernel only switches to a published table, which stays held until the next run starts.
+    error_report("apple-virt: the kernel switched TTBR0_EL1 to 0x%" PRIx64 ", which isn't held", v);
+    abort();
+}
 
 void apple_virt_fast_publish(CPUState* cs, void* area)
 {
@@ -2292,6 +2457,7 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
             f->stub_pc      = virt.stub;
         }
     }
+    apple_virt_ttbr0_publish(cs, env, c, f);
     // APCTL at EL1 (its KernKeyEn changes the keys above EL0, `pac_key`); VR_NO_KERNEL_APCTL=1 keeps it here.
     f->apctl_ok   = !VR_ENV("VR_NO_KERNEL_APCTL");
     f->apctl      = env->cp15.apctl_el1;
@@ -2482,6 +2648,7 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
         }
         c->ws_seen           = f->switches;
     }
+    apple_virt_ttbr0_collect(cs, c, f);
     // A flush the kernel started at a world switch (VR_KERNEL_WS bit 8) that the run left in the stub: this side's
     // own from now on, as `gxf_flush_tlb` would have started it.
     if (f->resume_valid == 1 && !f->pad && !c->flushing) {
