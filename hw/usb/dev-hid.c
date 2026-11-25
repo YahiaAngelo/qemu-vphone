@@ -1041,7 +1041,12 @@ static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len)
         }
         if (on) {
             struct timespec ts;
+#ifdef CLOCK_BOOTTIME
             clock_gettime(CLOCK_BOOTTIME, &ts);
+#else
+            /* Darwin: CLOCK_MONOTONIC includes the time spent asleep. */
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
             fprintf(stderr, "touchrep %" PRIu64 " btn %d x %d y %d\n",
                     (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec, tablet[0],
                     tablet[1] | (tablet[2] << 8), tablet[3] | (tablet[4] << 8));

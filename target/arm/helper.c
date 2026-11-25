@@ -2724,9 +2724,12 @@ static void vphone_asid_trace(CPUARMState *env, uint64_t value)
  * change into or out of the tracked ASID, the thread adds the interval to the
  * global totals. Work of every thread of the process, on any vCPU, kernel
  * work on its behalf included, is counted; other processes are not.
+ * Only Linux hosts have perf_event_open: elsewhere ins and cyc are 0.
  */
+#ifdef CONFIG_LINUX
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
+#endif
 
 static int vphone_mark_tracked = -1;    /* ASID, or -1 */
 static uint32_t vphone_mark_gen;
@@ -2756,6 +2759,7 @@ bool vphone_mark_on(void)
     return on;
 }
 
+#ifdef CONFIG_LINUX
 static int vphone_mark_open(uint64_t pmu, uint64_t config, int group)
 {
     struct perf_event_attr a = {
@@ -2768,6 +2772,7 @@ static int vphone_mark_open(uint64_t pmu, uint64_t config, int group)
     };
     return syscall(SYS_perf_event_open, &a, 0, -1, group, 0);
 }
+#endif
 
 static void vphone_mark_read(uint64_t v[3])
 {
@@ -2775,6 +2780,7 @@ static void vphone_mark_read(uint64_t v[3])
     struct timespec ts;
     uint64_t buf[3];
 
+#ifdef CONFIG_LINUX
     if (t->fd == -1) {
         /* a hybrid CPU's P-core PMU (QEMU runs on P-cores), else the default */
         static uint64_t pmu = ~0ULL;
@@ -2792,6 +2798,7 @@ static void vphone_mark_read(uint64_t v[3])
             t->fd = -2;
         }
     }
+#endif
     v[0] = v[1] = 0;
     if (t->fd >= 0 && read(t->fd, buf, sizeof(buf)) == sizeof(buf) && buf[0] == 2) {
         v[0] = buf[1];
