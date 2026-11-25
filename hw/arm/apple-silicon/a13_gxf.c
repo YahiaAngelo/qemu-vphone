@@ -164,7 +164,8 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                                 : env->sprr.mprr_el_br_el1[0][0];
     static unsigned logged;
 
-    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
+    if (unlikely(__atomic_load_n(&logged, __ATOMIC_RELAXED) < 64) &&
+        __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sprr: C1_5 write cpu%d el=%d pc=%016" PRIx64
                       " value=%016" PRIx64 " old=%016" PRIx64
@@ -231,7 +232,8 @@ static void sprr_c1_6_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     static unsigned logged;
 
-    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
+    if (unlikely(__atomic_load_n(&logged, __ATOMIC_RELAXED) < 64) &&
+        __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sprr: C1_6 write cpu%d pc=%016" PRIx64
                       " value=%016" PRIx64 " unified=%d guarded=%d\n",
@@ -275,7 +277,8 @@ static void sprr_c3_0_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     static unsigned logged;
 
-    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
+    if (unlikely(__atomic_load_n(&logged, __ATOMIC_RELAXED) < 64) &&
+        __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sprr: C3_0 write cpu%d pc=%016" PRIx64
                       " value=%016" PRIx64 " unified=%d guarded=%d\n",
@@ -613,9 +616,8 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 1,
         .opc2 = 0,
         .access = PL1_RW,
+        .type = ARM_CP_SUPPRESS_TB_END,
         .resetvalue = 0,
-        .readfn = raw_read,
-        .writefn = raw_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_config_el[1]),
     },
     {
@@ -628,9 +630,8 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 1,
         .opc2 = 1,
         .access = PL1_RW,
+        .type = ARM_CP_SUPPRESS_TB_END,
         .resetvalue = 0,
-        .readfn = raw_read,
-        .writefn = raw_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_config_el[0]),
     },
     {
@@ -643,11 +644,9 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 1,
         .opc2 = 5,
         .access = PL0_RW,
+        .type = ARM_CP_SUPPRESS_TB_END,
         .resetvalue = 0,
-        .readfn = raw_read,
         .writefn = sprr_perm_el0_write,
-        // is that actually not needed?
-        // .raw_readfn = raw_read,
         .raw_writefn = raw_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[0][0]),
     },
@@ -661,7 +660,7 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 1,
         .opc2 = 6,
         .access = PL1_RW | PL0_R,
-        .type = ARM_CP_NO_RAW,
+        .type = ARM_CP_NO_RAW | ARM_CP_SUPPRESS_TB_END,
         .readfn = sprr_c1_6_read,
         .writefn = sprr_c1_6_write,
         .resetfn = sprr_c1_6_reset,
@@ -676,6 +675,7 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 1,
         .opc2 = 7,
         .access = PL1_RW,
+        .type = ARM_CP_SUPPRESS_TB_END,
         .resetvalue = 0,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[1][0]),
     },
@@ -689,7 +689,7 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .crm = 3,
         .opc2 = 0,
         .access = PL1_RW,
-        .type = ARM_CP_NO_RAW,
+        .type = ARM_CP_NO_RAW | ARM_CP_SUPPRESS_TB_END,
         .readfn = sprr_c3_0_read,
         .writefn = sprr_c3_0_write,
         .resetfn = sprr_c3_0_reset,

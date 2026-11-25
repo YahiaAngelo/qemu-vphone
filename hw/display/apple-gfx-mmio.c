@@ -177,6 +177,11 @@ static void apple_gfx_mmio_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->common.iomem_gfx);
     memory_region_init_io(&s->iomem_iosfc, obj, &apple_iosfc_ops, s,
                           TYPE_APPLE_GFX_MMIO, 0x10000);
+    /*
+     * IOSurface MMIO reads are atomic loads and writes synchronize on the
+     * library's own queue/locks; raise_interrupt only schedules a BH.
+     */
+    memory_region_enable_tcg_lockless_io(&s->iomem_iosfc);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem_iosfc);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq_gfx);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq_iosfc);

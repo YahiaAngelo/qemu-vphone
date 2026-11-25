@@ -46,6 +46,9 @@ typedef struct AppleGFXDisplay {
     bool frame_dirty;
     /* Until then, on QEMU_CLOCK_REALTIME, a listener shows the surface */
     int64_t watched_until_ms;
+    /* Reused pixel readback buffer (owned by the single in-flight render job) */
+    uint8_t *readback_buf;
+    size_t readback_buf_size;
     bool cursor_show;
 } AppleGFXDisplay;
 

@@ -23,7 +23,10 @@ jobs:
           pip3 install --user --upgrade meson
       - name: Build nettle 3.10.2
         run: |
-          wget https://ftpmirror.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz
+          # ftpmirror.gnu.org may redirect to a mirror with a bad certificate.
+          for base in https://ftp.gnu.org/gnu https://mirrors.kernel.org/gnu https://ftpmirror.gnu.org/gnu; do
+            wget --tries=3 --timeout=30 -O nettle-3.10.2.tar.gz "$base/nettle/nettle-3.10.2.tar.gz" && break
+          done
           echo "fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5 nettle-3.10.2.tar.gz" | sha256sum -c - || exit 1
           tar -xvf nettle-3.10.2.tar.gz
           cd nettle-3.10.2
