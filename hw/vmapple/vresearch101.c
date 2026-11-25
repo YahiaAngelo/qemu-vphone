@@ -1487,7 +1487,7 @@ static int vresearch_kvm_type(MachineState *ms, const char *type_str)
     bool fixed_ipa;
     int ipa = kvm_arm_get_max_vm_ipa_size(ms, &fixed_ipa);
 
-    return fixed_ipa ? 0 : KVM_VM_TYPE_ARM_IPA_SIZE(ipa);
+    return fixed_ipa ? 0 : ipa;   /* KVM_VM_TYPE_ARM_IPA_SIZE(ipa), as hw/arm/virt.c: the macro is undefined without CONFIG_KVM */
 }
 
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)

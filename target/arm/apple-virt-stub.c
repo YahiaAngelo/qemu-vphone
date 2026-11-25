@@ -31,3 +31,5 @@ int apple_virt_impdef_vreg(uint32_t sysreg) { assert_not_reached(); }
 
 bool apple_virt_m1_gl_names;
 bool apple_virt_trap_sysreg;
+
+void apple_virt_set_el0_mirror(uint8_t* host) { assert_not_reached(); }
