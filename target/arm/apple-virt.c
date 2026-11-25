@@ -190,11 +190,27 @@ typedef struct
         const GXFPerms* perms[2];
         GXFRoot*        roots[2];
         uint64_t        lru;
-    } ttbr0_cache[8];
+    } ttbr0_cache[6];    // as many as the kernel's struct takes (`AppleVirtFast.ttbr0_base`)
     uint32_t n_ttbr0;
     uint32_t doom_seen;
     uint64_t ttbr0_lru;
     uint64_t ttbr0_seen;
+    // vphone-linux: the EL0 SPRR permissions the kernel switches to itself (`apple_virt_perm_publish`): each value
+    // with the tables, TCR and EL1 permissions it was seen with and both worlds' roots of both tables, held active.
+    struct
+    {
+        uint64_t        perm_el0;
+        uint64_t        perm_el1;
+        uint64_t        ttbr[2];
+        uint64_t        tcr;
+        const GXFPerms* perms[2];
+        GXFRoot*        roots[2][2];
+        uint64_t        lru;
+    } perm_cache[4];
+    uint32_t n_perm;
+    uint64_t perm_seen;
+    // An EL0 permission write switched this side: the state it left is held at the next run's start.
+    bool perm_hint;
 } AppleVirtCPU;
 
 static struct
@@ -785,9 +801,20 @@ static void gxf_ttbr0_unpin(AppleVirtCPU* c, uint32_t i)
     c->ttbr0_cache[i] = c->ttbr0_cache[--c->n_ttbr0];
 }
 
+static void gxf_perm_unpin(AppleVirtCPU* c, uint32_t i)
+{
+    for (int w = 0; w < 2; w++) {
+        for (int idx = 0; idx < 2; idx++) {
+            if (c->perm_cache[i].roots[w][idx] != NULL) { gxf_root_put(c->perm_cache[i].roots[w][idx]); }
+        }
+    }
+    c->perm_cache[i] = c->perm_cache[--c->n_perm];
+}
+
 static void gxf_release(AppleVirtCPU* c)
 {
     while (c->n_ttbr0 != 0) { gxf_ttbr0_unpin(c, 0); }
+    while (c->n_perm != 0) { gxf_perm_unpin(c, 0); }
     gxf_world_drop(&c->worlds[0]);
     gxf_world_drop(&c->worlds[1]);
     c->cur[0]   = NULL;
@@ -811,6 +838,7 @@ static void virt_sprr_mirror(CPUARMState* env)
     env->sprr.sprr_el_br_el1[0][1] = env->sprr.sprr_el_br_el1[0][0];
     env->sprr.sprr_el_br_el1[1][0] = env->sprr.sprr_el_br_el1[1][1];
 }
+
 
 // The vCPU state a world switch reads and its TLB flush changes, taken from `env` or straight from the vCPU.
 typedef struct
@@ -836,6 +864,58 @@ static bool gxf_world_current(CPUARMState* env, const GXFWorldCache* wc, const G
         }
     }
     return true;
+}
+
+// Holds the current EL0 permissions with both worlds' current trees in `perm_cache`, if they are complete and not
+// held yet; the least recently added let go when it is full. Under `virt.lock`.
+static void gxf_perm_hold(AppleVirtCPU* c, CPUARMState* env)
+{
+    uint64_t perm0 = virt_sprr_perm_el0(env), perm1 = virt_sprr_perm_el1(env);
+    uint64_t ttbr[2] = { env->cp15.ttbr0_el[1], env->cp15.ttbr1_el[1] };
+    uint64_t tcr     = env->cp15.tcr_el[1];
+    uint32_t i;
+
+    for (int w = 0; w < 2; w++) {
+        GXFWorld wd = { .sctlr = env->cp15.sctlr_el[1], .tcr = tcr, .guarded = w };
+
+        // Both worlds' trees must be those of the current tables and permissions.
+        if (!gxf_world_current(env, &c->worlds[w], &wd)) { return; }
+        for (int idx = 0; idx < 2; idx++) {
+            if (c->worlds[w].roots[idx] == NULL || c->worlds[w].roots[idx]->doomed) { return; }
+        }
+    }
+    for (i = 0; i < c->n_perm; i++) {
+        if (c->perm_cache[i].perm_el0 == perm0 && c->perm_cache[i].perm_el1 == perm1 && c->perm_cache[i].tcr == tcr
+            && c->perm_cache[i].roots[0][0] == c->worlds[0].roots[0]
+            && c->perm_cache[i].roots[0][1] == c->worlds[0].roots[1]
+            && c->perm_cache[i].roots[1][0] == c->worlds[1].roots[0]
+            && c->perm_cache[i].roots[1][1] == c->worlds[1].roots[1]) {
+            c->perm_cache[i].lru = ++c->ttbr0_lru;
+            return;
+        }
+    }
+    if (c->n_perm == ARRAY_SIZE(c->perm_cache)) {
+        uint32_t oldest = 0;
+
+        for (i = 1; i < c->n_perm; i++) {
+            if (c->perm_cache[i].lru < c->perm_cache[oldest].lru) { oldest = i; }
+        }
+        gxf_perm_unpin(c, oldest);
+    }
+    i                         = c->n_perm++;
+    c->perm_cache[i].perm_el0 = perm0;
+    c->perm_cache[i].perm_el1 = perm1;
+    c->perm_cache[i].ttbr[0]  = ttbr[0] & GXF_TTBR_BADDR;
+    c->perm_cache[i].ttbr[1]  = ttbr[1] & GXF_TTBR_BADDR;
+    c->perm_cache[i].tcr      = tcr;
+    c->perm_cache[i].lru      = ++c->ttbr0_lru;
+    for (int w = 0; w < 2; w++) {
+        c->perm_cache[i].perms[w] = c->worlds[w].perms[0];
+        for (int idx = 0; idx < 2; idx++) {
+            c->perm_cache[i].roots[w][idx] = c->worlds[w].roots[idx];
+            c->worlds[w].roots[idx]->active += 1;
+        }
+    }
 }
 
 static void gxf_world_fill(CPUARMState* env, GXFWorldCache* wc, const GXFWorld* w)
@@ -1231,6 +1311,9 @@ static void apple_virt_el0_site(uint64_t va, int vreg, uint32_t rt)
 
 // An EL0 SPRR access, which the vCPU UNDEFs to EL1, emulated as `sprr_uperm_br0_write` does it.
 static uint8_t* apple_virt_el0_mirror[4];
+// vphone-linux: the table of those XNU's live vector page holds (`apple_virt_el0_mirror_find`), and its IPA.
+static hwaddr   apple_virt_el0_live_ipa;
+static uint8_t* apple_virt_el0_live_host;
 static int      apple_virt_n_el0_mirror;
 
 static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
@@ -1319,6 +1402,8 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
         for (int i = 0; i < 16; i++) { mask |= extract64(env->sprr.c3_0, i * 2, 2) << (i * 4); }
         value = (virt_sprr_perm_el0(env) & ~mask) | ((rt == 31 ? 0 : virt.ops->get_xreg(cs, rt)) & mask);
         if (value != virt_sprr_perm_el0(env)) {
+            uint64_t old_perm = virt_sprr_perm_el0(env);
+
             env->sprr.sprr_el_br_el1[0][0] = value;
             virt_sprr_mirror(env);
             if (c->shadowed && c->cur[0] != NULL
@@ -1331,6 +1416,18 @@ static bool virt_el0_sprr_fast(CPUState* cs, CPUARMState* env, AppleVirtCPU* c)
                     .tcr     = env->cp15.tcr_el[1],
                     .guarded = false,
                 };
+                // The state being left, which a later write may switch back to in the kernel
+                // (`apple_virt_perm_publish`); the new one is held at the next run's start.
+                if (!VR_ENV("VR_NO_KERNEL_PERM")) {
+                    uint64_t now = env->sprr.sprr_el_br_el1[0][0];
+
+                    env->sprr.sprr_el_br_el1[0][0] = old_perm;
+                    virt_sprr_mirror(env);
+                    WITH_QEMU_LOCK_GUARD(&virt.lock) { gxf_perm_hold(c, env); }
+                    env->sprr.sprr_el_br_el1[0][0] = now;
+                    virt_sprr_mirror(env);
+                    c->perm_hint = true;
+                }
                 gxf_switch_world_fast(cs, env, c, &w, true);
                 return true;
             }
@@ -2196,10 +2293,21 @@ typedef struct {
     uint64_t ttbr0_ok;
     uint32_t nttbr0;
     uint32_t pad5;
-    uint64_t ttbr0_base[8];
-    uint64_t ttbr0_shadow[2][8];
+    uint64_t ttbr0_base[6];
+    uint64_t ttbr0_shadow[2][6];
     uint64_t ttbr0_guest;
     uint64_t ttbr0_writes;
+    // EL0 SPRR_UPERM_BR0_EL0 writes, the JIT's toggles (`apple_virt_perm_publish`).
+    uint32_t perm_ok;
+    uint32_t nperm;
+    uint64_t perm_mask;
+    uint64_t perm_ttbr1;
+    uint64_t perm_mirror;
+    uint64_t perm_val[2];
+    uint64_t perm_ttbr0[2];
+    uint64_t perm_shadow[2][2][2];
+    uint64_t perm_guest;
+    uint64_t perm_writes;
 } AppleVirtFast;
 
 
@@ -2220,7 +2328,7 @@ static void apple_virt_el0_mirror_publish(CPUState* cs, CPUARMState* env);
 /*
  * vphone-linux: TTBR0_EL1 writes the kernel takes itself (struct kvm_arm_apple_fast's ttbr0_*), to tables this
  * vCPU ran on before: each table's roots for both worlds, under the TCR and SPRR permissions they were made for,
- * held active by the vCPU (`ttbr0_cache`, 8 at most, the least recently added let go), and published while both
+ * held active by the vCPU (`ttbr0_cache`, 6 at most, the least recently added let go), and published while both
  * worlds' trees are current and those match. A switch there is the one `gxf_world_fill` would make, without a TLB
  * flush (the shadow keeps the guest's ASID). VR_NO_KERNEL_TTBR0=1 keeps them here.
  */
@@ -2233,6 +2341,7 @@ static void apple_virt_ttbr0_publish(CPUState* cs, CPUARMState* env, AppleVirtCP
     f->ttbr0_ok    = 0;
     f->nttbr0      = 0;
     c->ttbr0_seen  = f->ttbr0_writes;
+
     // Tables whose address space is gone, let go of here while the kernel can't switch to them (the vCPU doesn't run).
     if (c->doom_seen != qatomic_read(&virt.doom_gen)) {
         QEMU_LOCK_GUARD(&virt.lock);
@@ -2241,6 +2350,18 @@ static void apple_virt_ttbr0_publish(CPUState* cs, CPUARMState* env, AppleVirtCP
         for (uint32_t i = 0; i < c->n_ttbr0;) {
             if (c->ttbr0_cache[i].roots[0]->doomed || c->ttbr0_cache[i].roots[1]->doomed) {
                 gxf_ttbr0_unpin(c, i);
+                continue;
+            }
+            i++;
+        }
+        for (uint32_t i = 0; i < c->n_perm;) {
+            bool doomed = false;
+
+            for (int w = 0; w < 2; w++) {
+                for (int idx = 0; idx < 2; idx++) { doomed |= c->perm_cache[i].roots[w][idx]->doomed; }
+            }
+            if (doomed) {
+                gxf_perm_unpin(c, i);
                 continue;
             }
             i++;
@@ -2288,6 +2409,7 @@ static void apple_virt_ttbr0_publish(CPUState* cs, CPUARMState* env, AppleVirtCP
             || c->ttbr0_cache[i].perms[1] != c->worlds[1].perms[0]) {
             continue;
         }
+        if (n == ARRAY_SIZE(f->ttbr0_base)) { break; }
         f->ttbr0_base[n] = c->ttbr0_cache[i].base;
         for (int w = 0; w < 2; w++) { f->ttbr0_shadow[w][n] = c->ttbr0_cache[i].roots[w]->top->shadow; }
         n++;
@@ -2322,6 +2444,9 @@ static void apple_virt_ttbr0_collect(CPUState* cs, AppleVirtCPU* c, AppleVirtFas
                 if (wc->roots[0] != NULL) { gxf_root_put(wc->roots[0]); }
                 wc->roots[0] = r;
             }
+            // With the ASID it now runs under, as a lookup (`gxf_get_root`) records it, for `gxf_drop_asid`.
+            r->ttbr        = v;
+            r->doomed      = false;
             wc->ttbr[0]    = v;
             wc->hw_ttbr[0] = (v & ~(GXF_TTBR_BADDR | GXF_TTBR_CNP)) | r->top->shadow;
         }
@@ -2331,6 +2456,116 @@ static void apple_virt_ttbr0_collect(CPUState* cs, AppleVirtCPU* c, AppleVirtFas
     }
     // The kernel only switches to a published table, which stays held until the next run starts.
     error_report("apple-virt: the kernel switched TTBR0_EL1 to 0x%" PRIx64 ", which isn't held", v);
+    abort();
+}
+
+/*
+ * vphone-linux: EL0 writes of SPRR_UPERM_BR0_EL0 the kernel takes itself (struct kvm_arm_apple_fast's perm_*),
+ * the JIT's write-protect toggles, which `virt_el0_sprr_fast` would take here with a world switch and a TLB flush:
+ * the values this vCPU ran under before with the current tables, TCR and EL1 permissions, each with both worlds'
+ * roots of both tables held active (`perm_cache`, 4 at most, the least recently added let go), published while
+ * both worlds' trees are current, as the kernel then switches worlds the same way (`ws_ok`). The guest's own copy of
+ * the value for this CPU (XNU's live vector page, `apple_virt_el0_mirror_find`) is written there too, so it must
+ * have been found. VR_NO_KERNEL_PERM=1 keeps them here.
+ */
+static void apple_virt_perm_publish(CPUState* cs, CPUARMState* env, AppleVirtCPU* c, AppleVirtFast* f)
+{
+    uint64_t perm0 = virt_sprr_perm_el0(env), perm1 = virt_sprr_perm_el1(env);
+    uint64_t ttbr[2] = { env->cp15.ttbr0_el[1], env->cp15.ttbr1_el[1] };
+    uint64_t tcr     = env->cp15.tcr_el[1];
+    uint64_t aff0    = ARM_CPU(cs)->mp_affinity & 0xFF;
+    uint64_t mask    = 0;
+    uint32_t n       = 0;
+
+    f->perm_ok    = 0;
+    f->nperm      = 0;
+    c->perm_seen  = f->perm_writes;
+    if (f->ws_ok == 0 || VR_ENV("VR_NO_KERNEL_PERM") || !c->worlds[0].mmu || aff0 >= 8
+        || apple_virt_el0_live_host == NULL || ldl_le_p(apple_virt_el0_live_host - 8) != ~0xd53ef1a8u) {
+        return;
+    }
+    for (int w = 0; w < 2; w++) {
+        for (int idx = 0; idx < 2; idx++) {
+            if (c->worlds[w].roots[idx] == NULL || c->worlds[w].roots[idx]->doomed) { return; }
+        }
+    }
+    // The permissions an EL0 write switched to (`perm_hint`), held from now on if they aren't yet.
+    if (c->perm_hint) {
+        QEMU_LOCK_GUARD(&virt.lock);
+
+        c->perm_hint = false;
+        gxf_perm_hold(c, env);
+    }
+    // The values seen with these tables, the current one among them: a write may switch to either, and back.
+    for (uint32_t i = 0; i < c->n_perm && n < ARRAY_SIZE(f->perm_val); i++) {
+        if (c->perm_cache[i].perm_el1 != perm1 || c->perm_cache[i].tcr != tcr
+            || c->perm_cache[i].ttbr[0] != (ttbr[0] & GXF_TTBR_BADDR)
+            || c->perm_cache[i].ttbr[1] != (ttbr[1] & GXF_TTBR_BADDR)) {
+            continue;
+        }
+        f->perm_val[n]   = c->perm_cache[i].perm_el0;
+        f->perm_ttbr0[n] = c->perm_cache[i].ttbr[0];
+        for (int w = 0; w < 2; w++) {
+            for (int idx = 0; idx < 2; idx++) {
+                f->perm_shadow[n][w][idx] = c->perm_cache[i].roots[w][idx]->top->shadow;
+            }
+        }
+        n++;
+    }
+    // EL0 only changes the bits SPRR_UMPRR_BR0_EL1 lets it (`virt_el0_sprr_fast`).
+    for (int i = 0; i < 16; i++) { mask |= extract64(env->sprr.c3_0, i * 2, 2) << (i * 4); }
+    f->perm_mask   = mask;
+    f->perm_ttbr1  = ttbr[1];
+    f->perm_mirror = apple_virt_el0_live_ipa + aff0 * 8;
+    f->nperm       = n;
+    f->perm_ok     = 1;
+}
+
+// After the vCPU ran: the permissions the kernel last switched to, as `virt_el0_sprr_fast` would have switched.
+static void apple_virt_perm_collect(CPUState* cs, AppleVirtCPU* c, AppleVirtFast* f)
+{
+    CPUARMState* env = cpu_env(cs);
+    uint64_t     v   = f->perm_guest;
+
+    if (f->perm_ok != 1 || f->perm_writes == c->perm_seen) { return; }
+    c->perm_seen                   = f->perm_writes;
+    env->sprr.sprr_el_br_el1[0][0] = v;
+    virt_sprr_mirror(env);
+    for (uint32_t i = 0; i < c->n_perm; i++) {
+        if (c->perm_cache[i].perm_el0 != v || c->perm_cache[i].perm_el1 != virt_sprr_perm_el1(env)
+            || c->perm_cache[i].tcr != env->cp15.tcr_el[1]
+            || c->perm_cache[i].ttbr[0] != (env->cp15.ttbr0_el[1] & GXF_TTBR_BADDR)
+            || c->perm_cache[i].ttbr[1] != (env->cp15.ttbr1_el[1] & GXF_TTBR_BADDR)) {
+            continue;
+        }
+        QEMU_LOCK_GUARD(&virt.lock);
+        c->perm_cache[i].lru = ++c->ttbr0_lru;
+        for (int w = 0; w < 2; w++) {
+            GXFWorldCache* wc = &c->worlds[w];
+
+            for (int idx = 0; idx < 2; idx++) {
+                GXFRoot* r    = c->perm_cache[i].roots[w][idx];
+                uint64_t ttbr = gxf_env_ttbr(env, idx);
+
+                if (wc->roots[idx] != r) {
+                    r->active += 1;
+                    if (wc->roots[idx] != NULL) { gxf_root_put(wc->roots[idx]); }
+                    wc->roots[idx] = r;
+                }
+                r->ttbr          = ttbr;
+                r->doomed        = false;
+                wc->perms[idx]   = c->perm_cache[i].perms[w];
+                wc->ttbr[idx]    = ttbr;
+                wc->hw_ttbr[idx] = (ttbr & ~(GXF_TTBR_BADDR | GXF_TTBR_CNP)) | r->top->shadow;
+            }
+        }
+        for (int idx = 0; idx < 2; idx++) {
+            c->cur[idx]     = c->worlds[c->guarded].roots[idx];
+            c->hw_ttbr[idx] = c->worlds[c->guarded].hw_ttbr[idx];
+        }
+        return;
+    }
+    error_report("apple-virt: the kernel switched EL0's SPRR permissions to 0x%" PRIx64 ", which aren't held", v);
     abort();
 }
 
@@ -2387,7 +2622,10 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
     }
     // And at any other address, by the instruction (`mrs Xt, S3_6_C15_C1_5` and `_6`, EL0's SPRR permission
     // registers), which the kernel reads through the vCPU's stage-1 tables.
-    f->n_el0_insn       = 2;
+    f->n_el0_insn       = 3;
+    // And EL0's writes of S3_6_C15_C1_5 (`msr`), which the kernel takes as `apple_virt_perm_publish` says.
+    f->el0_insn[2]      = 0xD51EF1A0;
+    f->el0_insn_imm[2]  = APPLE_VIRT_HVC_SYSREG | (APPLE_VIRT_VREG_SPRR_UPERM_BR0_EL0 << 6);
     f->el0_insn[0]      = 0xD53EF1A0;
     f->el0_insn_imm[0]  = APPLE_VIRT_HVC_SYSREG | (APPLE_VIRT_VREG_SPRR_UPERM_BR0_EL0 << 6) | (1 << 5);
     f->el0_insn[1]      = 0xD53EF1C0;
@@ -2458,6 +2696,7 @@ void apple_virt_fast_publish(CPUState* cs, void* area)
         }
     }
     apple_virt_ttbr0_publish(cs, env, c, f);
+    apple_virt_perm_publish(cs, env, c, f);
     // APCTL at EL1 (its KernKeyEn changes the keys above EL0, `pac_key`); VR_NO_KERNEL_APCTL=1 keeps it here.
     f->apctl_ok   = !VR_ENV("VR_NO_KERNEL_APCTL");
     f->apctl      = env->cp15.apctl_el1;
@@ -2509,6 +2748,8 @@ static void apple_virt_el0_mirror_find(CPUState* cs, CPUARMState* env)
     }
     if (ldl_le_p(host) != ~0xd53ef1a8u) { return; }
     found = true;
+    apple_virt_el0_live_ipa  = pa + 8;
+    apple_virt_el0_live_host = host + 8;
     for (int i = 0; i < apple_virt_n_el0_mirror; i++) {
         if (apple_virt_el0_mirror[i] == host + 8) { return; }
     }
@@ -2649,6 +2890,7 @@ void apple_virt_fast_collect(CPUState* cs, void* area)
         c->ws_seen           = f->switches;
     }
     apple_virt_ttbr0_collect(cs, c, f);
+    apple_virt_perm_collect(cs, c, f);
     // A flush the kernel started at a world switch (VR_KERNEL_WS bit 8) that the run left in the stub: this side's
     // own from now on, as `gxf_flush_tlb` would have started it.
     if (f->resume_valid == 1 && !f->pad && !c->flushing) {
