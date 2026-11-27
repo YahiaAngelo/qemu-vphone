@@ -27,6 +27,7 @@
 #include "system/tcg.h"
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
+#include "qemu/vphone-ev.h"
 #ifdef CONFIG_TCG
 #include "accel/tcg/probe.h"
 #include "accel/tcg/getpc.h"
@@ -2925,7 +2926,39 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
             ri->crm == 0 && ri->opc2 <= 1) {
             uint64_t ttbr = (env->cp15.tcr_el[1] & TTBCR_A1)
                             ? env->cp15.ttbr1_el[1] : env->cp15.ttbr0_el[1];
-            tlb_flush_asid_switch(CPU(cpu), extract64(ttbr, 48, 16));
+            if (unlikely(vphone_ev_on)) {
+                /* diagnostic: is the new ASID (and ASID + EL0 SPRR) one of the last 8? */
+                static __thread uint64_t ring[8], kring[8];
+                static __thread unsigned ri;
+                static __thread unsigned kri;
+                uint64_t a = extract64(ttbr, 48, 16) + 1;
+                uint64_t k = a ^ (env->sprr.sprr_el_br_el1[0][0] * 0x9e3779b97f4a7c15ull);
+                bool hit = false, khit = false;
+
+                for (int i = 0; i < 8; i++) {
+                    hit |= ring[i] == a;
+                    khit |= kring[i] == k;
+                }
+                if (hit) {
+                    vphone_ev(VEV_ASID_RECENT8);
+                } else {
+                    ring[ri++ % 8] = a;
+                }
+                if (khit) {
+                    vphone_ev(VEV_ASID_KEY_RECENT8);
+                } else {
+                    kring[kri++ % 8] = k;
+                }
+            }
+            tlb_flush_asid_switch(CPU(cpu), extract64(ttbr, 48, 16),
+                                  ARMMMUIdxBit_E10_0 | ARMMMUIdxBit_E10_1 |
+                                  ARMMMUIdxBit_E10_1_PAN | ARMMMUIdxBit_GE10_1 |
+                                  ARMMMUIdxBit_GE10_1_PAN,
+                                  ARMMMUIdxBit_Stage2 | ARMMMUIdxBit_Stage2_S |
+                                  (1 << (ARMMMUIdx_Phys_S & ARM_MMU_IDX_COREIDX_MASK)) |
+                                  (1 << (ARMMMUIdx_Phys_NS & ARM_MMU_IDX_COREIDX_MASK)) |
+                                  (1 << (ARMMMUIdx_Phys_Root & ARM_MMU_IDX_COREIDX_MASK)) |
+                                  (1 << (ARMMMUIdx_Phys_Realm & ARM_MMU_IDX_COREIDX_MASK)));
         } else {
             tlb_flush(CPU(cpu));
         }
@@ -8873,6 +8906,44 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 
     if (arm_is_guarded(env)) {
         addr = env->gxf.vbar_gl[new_el];
+    }
+
+    if (unlikely(vphone_ev_on)) {
+        switch (cs->exception_index) {
+        case EXCP_SWI:
+            vphone_ev(cur_el == 0 ? VEV_SVC_EL0 : VEV_SVC_OTHER);
+            break;
+        case EXCP_HVC:
+        case EXCP_SMC:
+            vphone_ev(VEV_SVC_OTHER);
+            break;
+        case EXCP_IRQ:
+        case EXCP_VIRQ:
+            vphone_ev(VEV_IRQ);
+            break;
+        case EXCP_FIQ:
+        case EXCP_VFIQ:
+            vphone_ev(VEV_FIQ);
+            break;
+        case EXCP_DATA_ABORT:
+            vphone_ev(cur_el == 0 ? VEV_DABT_EL0 : VEV_DABT_EL1);
+            break;
+        case EXCP_PREFETCH_ABORT:
+            vphone_ev(VEV_IABT);
+            break;
+        case EXCP_UDEF:
+            vphone_ev(VEV_UDEF);
+            break;
+        case EXCP_GENTER:
+            vphone_ev(VEV_GENTER);
+            break;
+        case EXCP_GXF_ABORT:
+            vphone_ev(VEV_GXF_ABORT);
+            break;
+        default:
+            vphone_ev(VEV_EXC_OTHER);
+            break;
+        }
     }
 
     if (tcg_enabled()) {

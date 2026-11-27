@@ -26,6 +26,7 @@
 #include "target/arm/cpregs.h"
 #include "target/arm/cpu.h"
 #include "target/arm/internals.h"
+#include "qemu/vphone-ev.h"
 
 /*
  * vphone-linux: TCG's TLB only exists under TCG. Under KVM, GXF/PAC emulation
@@ -180,6 +181,7 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
          */
         if (raw_read(env, ri) != value) {
             raw_write(env, ri, value);
+            vphone_ev(VEV_SPRR_EL0_FLUSH);
             gxf_tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
         }
         return;
@@ -216,6 +218,7 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
         env->sprr.sprr_el_br_el1[0][1] = perm;
     }
 
+    vphone_ev(VEV_SPRR_EL0_FLUSH);
     gxf_tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
 }
 
@@ -252,6 +255,7 @@ static void sprr_c1_6_write(CPUARMState *env, const ARMCPRegInfo *ri,
         }
         env->sprr.sprr_el_br_el1[0][1] = value;
     }
+    vphone_ev(VEV_SPRR_EL1_FLUSH);
     gxf_tlb_flush(env_cpu(env));
 }
 
@@ -286,6 +290,7 @@ static void sprr_c3_0_write(CPUARMState *env, const ARMCPRegInfo *ri,
         env->sprr.c3_0 = value;
     } else if (env->sprr.sprr_el_br_el1[1][1] != value) {
         env->sprr.sprr_el_br_el1[1][1] = value;
+        vphone_ev(VEV_SPRR_EL1_FLUSH);
         gxf_tlb_flush(env_cpu(env));
     }
 }

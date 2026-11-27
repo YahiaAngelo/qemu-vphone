@@ -34,6 +34,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "system/runstate.h"
+#include "qemu/vphone-ev.h"
 
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
@@ -692,6 +693,7 @@ void tb_flush__exclusive_or_serial(void)
     tcg_region_reset_all();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
+    vphone_ev(VEV_TB_FLUSH);
 }
 
 static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
@@ -846,6 +848,7 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
  */
 static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 {
+    vphone_ev(VEV_TB_INVAL);
     uint32_t h;
     tb_page_addr_t phys_pc;
     uint32_t orig_cflags = tb_cflags(tb);

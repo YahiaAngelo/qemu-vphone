@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/vphone-ev.h"
 
 #include "trace.h"
 #include "tcg/tcg.h"
@@ -255,7 +256,98 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s);
+
+/*
+ * vphone diagnostic: has this guest physical PC been translated before, with
+ * the same flags (a translation thrown away and redone) or other ones (a
+ * variant)? Two open-addressing sets of 2^22 keys; full probes are not counted.
+ */
+#define VTB_BITS 22
+static uint64_t *vtb_pc, *vtb_key;
+
+static bool vtb_insert(uint64_t *tab, uint64_t key)
+{
+    uint64_t h = (key * 0x9e3779b97f4a7c15ull) >> (64 - VTB_BITS);
+
+    for (int i = 0; i < 32; i++, h = (h + 1) & ((1u << VTB_BITS) - 1)) {
+        uint64_t cur = qatomic_read(&tab[h]);
+
+        if (cur == key) {
+            return false;
+        }
+        if (cur == 0 && qatomic_cmpxchg(&tab[h], 0, key) == 0) {
+            return true;
+        }
+        if (qatomic_read(&tab[h]) == key) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void vtb_classify(TranslationBlock *tb, TCGTBCPUState s)
+{
+    tb_page_addr_t phys = tb_page_addr0(tb);
+    uint64_t k1, k2;
+
+    if (phys == -1) {
+        return;
+    }
+    if (unlikely(!qatomic_read(&vtb_pc))) {
+        uint64_t *a = g_new0(uint64_t, 1u << VTB_BITS);
+        uint64_t *b = g_new0(uint64_t, 1u << VTB_BITS);
+
+        if (qatomic_cmpxchg(&vtb_key, NULL, b) != NULL) {
+            g_free(b);
+        }
+        if (qatomic_cmpxchg(&vtb_pc, NULL, a) != NULL) {
+            g_free(a);
+        }
+        if (!qatomic_read(&vtb_key)) {
+            return;
+        }
+    }
+    k1 = ((uint64_t)phys | (s.pc & ~TARGET_PAGE_MASK)) + 1;
+    k2 = (k1 * 0xff51afd7ed558ccdull) ^ ((uint64_t)s.flags << 32 | s.cflags) ^
+         (s.cs_base * 0xc4ceb9fe1a85ec53ull);
+    k2 |= 1;
+    if (vtb_insert(vtb_pc, k1)) {
+        vtb_insert(vtb_key, k2);
+        vphone_ev(VEV_TB_FIRST);
+    } else if (vtb_insert(vtb_key, k2)) {
+        vphone_ev(VEV_TB_VARIANT);
+    } else {
+        vphone_ev(VEV_TB_SAMEKEY);
+        if (tb_page_addr1(tb) != -1) {
+            vphone_ev(VEV_TB_SAMEKEY_XPAGE);
+        }
+    }
+    if (tb_page_addr1(tb) != -1) {
+        vphone_ev(VEV_TB_XPAGE);
+    }
+}
+
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+{
+    if (unlikely(vphone_ev_on)) {
+        uint64_t t0 = __builtin_ia32_rdtsc();
+        TranslationBlock *tb = tb_gen_code_inner(cpu, s);
+
+        vphone_ev(VEV_TB_GEN);
+        vphone_ev_add(VEV_TB_GEN_KCYC, (__builtin_ia32_rdtsc() - t0) / 1000);
+        if (tb) {
+            vtb_classify(tb, s);
+            if ((s.cflags & CF_COUNT_MASK) == 1) {
+                vphone_ev(VEV_TB_ONEINSN);
+            }
+        }
+        return tb;
+    }
+    return tb_gen_code_inner(cpu, s);
+}
+
+static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s)
 {
     CPUArchState *env = cpu_env(cpu);
     TranslationBlock *tb, *existing_tb;
@@ -526,6 +618,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
         uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
+
+        vphone_ev(VEV_TB_RACE);
 
         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);

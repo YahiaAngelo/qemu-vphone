@@ -132,10 +132,15 @@ void tlb_flush(CPUState *cpu);
  * @cpu: CPU whose TLB should be flushed (the current one)
  * @asid: the address space it switches to
  *
- * tlb_flush() for a change of address space alone (vphone-linux): the
- * jump cache keeps the entries it filled under @asid in this epoch.
+ * @ng_map: ASID-tagged MMU indexes: only their non-global entries go
+ * @keep_map: MMU indexes no ASID applies to: left alone
+ *
+ * tlb_flush() for a change of address space alone (vphone-linux): every
+ * other MMU index is flushed, and the jump cache keeps the entries it filled
+ * under @asid in this epoch. VPHONE_ASID_NG=0 flushes every index.
  */
-void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid);
+void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid, MMUIdxMap ng_map,
+                           MMUIdxMap keep_map);
 
 /**
  * tlb_flush_all_cpus_synced:
@@ -247,7 +252,8 @@ static inline void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
 static inline void tlb_flush(CPUState *cpu)
 {
 }
-static inline void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid)
+static inline void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid,
+                                         MMUIdxMap ng_map, MMUIdxMap keep_map)
 {
 }
 static inline void tlb_flush_all_cpus_synced(CPUState *src_cpu)
